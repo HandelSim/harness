@@ -32,7 +32,7 @@ ITEM = "[cleanup] feature.txt:1: `hello feature` say it twice"   # the fake revi
 # The agent of every stage. Reads the stage from the prompt (the last argument)
 # and does what FAKE_* in its environment say.
 FAKE_AGENT = r'''
-import os, re, subprocess, sys
+import json, os, re, subprocess, sys
 ITEM = "[cleanup] feature.txt:1: `hello feature` say it twice"
 args = sys.argv[1:]
 vault = os.environ["FAKE_VAULT"]
@@ -73,10 +73,20 @@ if args and args[0] == "debug":   # the debug agent on a block: FAKE_DEBUG_* say
             "# harness issue: a test block\n\n**Summary:** found it\n\n"
             f"VERDICT: {v}\nHARNESS-CHANGE: {os.environ.get('FAKE_DEBUG_CHANGE', 'no')}\n")
     sys.exit(0)
+def panel_span(tag):
+    """FAKE_PANEL_SLEEP: a panel member takes that long; when it ran goes in .spans."""
+    if os.environ.get("FAKE_PANEL_SLEEP"):
+        import time
+        t0 = time.time()
+        time.sleep(float(os.environ["FAKE_PANEL_SLEEP"]))
+        open(os.environ["FAKE_CALLS"] + ".spans", "a").write(f"{tag} {t0} {time.time()}\n")
+
+
 prompt = args[-1]
 assert "--ticket" in args and "-p" in args and "--yolo" in args, args
 ticket = args[args.index("--ticket") + 1]
-task = os.path.join(vault, "wiki", "notes", "tickets", ticket + "-task.md")
+part = json.loads(os.environ.get("HARNESS_TASK_CARD") or "{}").get("part")   # a panel member's own task file
+task = os.path.join(vault, "wiki", "notes", "tickets", ticket + "-task" + ("-" + part if part else "") + ".md")
 pointer = re.search(r"Your full instructions for the \w+ stage of ticket \S+ are in (\S+?)\. Read it first", prompt)
 if pointer:   # the short prompt of a long one on Windows: the agent reads the task file
     open(os.environ["FAKE_CALLS"] + ".pointer", "a").write(prompt + "\n=====\n")
@@ -150,6 +160,7 @@ if stage == "planning":
     planner = re.search(r"You are planner (\d+) of (\d+)", prompt)   # one of the plan panel's planners
     if planner:
         open(os.environ["FAKE_CALLS"] + ".planners", "a").write(planner.group(1) + "\n")
+        panel_span("d" + planner.group(1))
         bad = os.environ.get("FAKE_BAD_DRAFTS", "").split(",")
         if planner.group(1) in bad:   # a draft that is not a plan
             open(path("Write the plan to"), "w").write("I looked at the code.\n")
@@ -163,10 +174,6 @@ if stage == "planning":
         if planner.group(1) == "2":   # the second planner finds an edge case the others miss
             crit += ("- AC2: GIVEN feature.txt already exists WHEN the change is in THEN it says hello feature once "
                      "(edge of AC1) [check: review]\n")
-        if os.environ.get("FAKE_PEEK_DRAFTS"):   # what another planner's draft looks like from here
-            d = os.path.dirname(path("Write the plan to"))
-            open(os.environ["FAKE_CALLS"] + ".peek", "a").write(
-                planner.group(1) + ":" + ",".join(sorted(f for f in os.listdir(d) if "draft" in f)) + "\n")
     plan = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n" + crit +
             "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
             "## Assumptions\n- None\n")
@@ -258,6 +265,7 @@ elif stage == "reviewing":
     lens = re.search(r"You are the (\w+)(?:-\w+)? reviewer", prompt)   # one of the review panel's reviewers
     if lens:
         open(os.environ["FAKE_CALLS"] + ".lenses", "a").write(lens.group(1) + "\n")
+        panel_span(lens.group(1))
         if lens.group(1) in os.environ.get("FAKE_BAD_LENSES", "").split(","):
             open(path("Write the review to"), "w").write("Looked.\n")
             sys.exit(0)
@@ -5565,22 +5573,32 @@ class PanelTest(Base):
         return sorted(f for f in os.listdir(self.notes()) if "-draft-" in f or re.search(r"-review-\w+\.md$", f))
 
     def test_three_planners_drafts_merged_into_the_plan(self):
-        os.environ["FAKE_PEEK_DRAFTS"] = "1"
+        os.environ["FAKE_PANEL_SLEEP"] = "3"
         self.add("ABC-1")
         rc, out = self.run_queue("--planners", "3", "--planner-models", "m-one,m-two", "--reviewers", "general")
         st = self.status()
         self.assertEqual((rc, st["status"]), (0, "done"), out)
-        self.assertEqual(cat(self.calls + ".planners").split(), ["1", "2", "3"])
-        # each planner alone: no other draft in the notes while it works
-        self.assertEqual(cat(self.calls + ".peek").split(), ["1:", "2:", "3:"])
+        self.assertEqual(sorted(cat(self.calls + ".planners").split()), ["1", "2", "3"])
+        # at once: every planner started before any of them ended
+        spans = [l.split() for l in cat(self.calls + ".spans").splitlines()]
+        self.assertEqual(sorted(t for t, _, _ in spans), ["d1", "d2", "d3"])
+        self.assertLess(max(float(a) for _, a, _ in spans), min(float(b) for _, _, b in spans), spans)
         # one model per planner, round the list; the planners' launches only (no 4th planner)
         plans = self.calls_of("planning")
         self.assertEqual(len(plans), 3, plans)
-        self.assertEqual([re.search(r"-m (\S+)", l).group(1) for l in plans],
-                         ["harness/m-one", "harness/m-two", "harness/m-one"])
         cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()[:3] if c.strip()]
+        self.assertEqual(sorted(c["part"] for c in cards), ["d1", "d2", "d3"])
+        self.assertEqual({c["part"]: re.search(r"-m (\S+)", l).group(1) for c, l in zip(cards, plans)},
+                         {"d1": "harness/m-one", "d2": "harness/m-two", "d3": "harness/m-one"})
         self.assertTrue(all("You are planner" in c["done"] for c in cards), cards)
-        self.assertIn("ABC-1-plan-draft-2.md", cards[1]["done"])
+        self.assertIn("ABC-1-plan-draft-2.md", next(c for c in cards if c["part"] == "d2")["done"])
+        # each its own prompt in its own task file (the card's part names it), gone after
+        self.assertEqual(cat(self.calls + ".task").split()[:6], ["ABC-1", "True"] * 3)
+        self.assertEqual([f for f in os.listdir(self.notes()) if "-task" in f], [])
+        prompts = cat(self.calls + ".planning").split("=====")
+        self.assertTrue(all("do not read theirs" in x for x in prompts[:3]), prompts[0][-800:])
+        self.assertEqual(sorted(re.search(r"append one bullet to (\S+)", x).group(1).rsplit("-", 1)[1]
+                                for x in prompts[:3]), ["d1.md", "d2.md", "d3.md"])   # its own findings file
         # the merge kept the edge case only planner 2 found
         plan = cat(os.path.join(self.notes(), "ABC-1-plan.md"))
         self.assertIn("AC2: GIVEN feature.txt already exists", plan)
@@ -5590,6 +5608,10 @@ class PanelTest(Base):
         self.assertEqual((pan["drafts"], pan["merged"], pan["unique"]), (3, True, {"d1": 0, "d2": 1, "d3": 0}))
         # files: the drafts out of the vault, in the ticket's panel folder, with the ledger
         self.assertEqual(self.drafts_in_vault(), [])
+        # what each planner found is in the ticket's findings file, theirs gone
+        found = cat(os.path.join(self.notes(), "ABC-1-findings.md"))
+        self.assertGreaterEqual(found.count("seen while planning ABC-1"), 3, found)
+        self.assertEqual([f for f in os.listdir(self.notes()) if re.search(r"-findings-\w+\.md$", f)], [])
         d = os.path.join(tq.Queue(self.state).dir("ABC-1"), "panel")
         self.assertEqual(sorted(os.listdir(d)), ["plan-d1.md", "plan-d2.md", "plan-d3.md", "plan-ledger.md",
                                                  "plan-merge-0.txt"])
@@ -5705,22 +5727,30 @@ class PanelTest(Base):
         self.assertEqual(len(tq.question(sectioned := tq.plan_questions(tq.sections(d1))[0], 1)["options"]), 3,
                          sectioned)
 
+    def members_done(self, *tags):
+        return lambda: sorted(((self.status() or {}).get("panel") or {}).get("members") or {}) == list(tags)
+
     def test_halted_during_the_second_planner_goes_on_with_it(self):
         os.environ.update(FAKE_DRAFT_SLEEP="2", FAKE_DRAFT_SLEEP_SECS="60")
         self.add("ABC-1")
         p = OwnerControlTest.run_bg(self, "--planners", "3", "--reviewers", "general")
         OwnerControlTest.wait_for(self, lambda: os.path.exists(self.calls + ".draftslept"), "planner 2", 60)
+        # the others ran beside it and ended; d2 is still at work, its agent on the ticket
+        OwnerControlTest.wait_for(self, self.members_done("d1", "d3"), "d1 and d3", 60)
+        self.assertEqual(sorted(self.status()["agents"]), ["d2"])
         rc, out = self.q("halt")
         self.assertEqual(rc, 0, out)
         self.assertEqual(p.wait(timeout=30), 0)
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("queued", "plan"))
-        self.assertEqual(sorted(st["panel"]["members"]), ["d1"])   # d1 done, d2 cut off
+        self.assertEqual(sorted(st["panel"]["members"]), ["d1", "d3"])   # kept; d2 cut off
+        self.assertNotIn("agents", st)
         self.assertEqual(self.drafts_in_vault(), [])   # the half draft is not left for the next one to read
         rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
         st = self.status()
         self.assertEqual(st["status"], "done", out)
-        self.assertEqual(cat(self.calls + ".planners").split(), ["1", "2", "2", "3"])   # d1 not again
+        self.assertEqual(sorted(cat(self.calls + ".planners").split()), ["1", "2", "2", "3"])   # d2 only, again
+        self.assertEqual(cat(self.calls + ".planners").split()[-1], "2")
         self.assertTrue(st["panels"]["plan"]["merged"])
 
     def test_killed_during_the_second_planner_goes_on_with_it(self):
@@ -5728,16 +5758,33 @@ class PanelTest(Base):
         self.add("ABC-1")
         p = OwnerControlTest.run_bg(self, "--planners", "3", "--reviewers", "general")
         OwnerControlTest.wait_for(self, lambda: os.path.exists(self.calls + ".draftslept"), "planner 2", 60)
+        OwnerControlTest.wait_for(self, self.members_done("d1", "d3"), "d1 and d3", 60)
         p.kill()
         p.wait()
+        self.assertEqual(sorted(self.status()["agents"]), ["d2"])   # what the next run ends, if it still runs
         time.sleep(9)   # the orphaned planner finishes on its own
         rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
         st = self.status()
         self.assertEqual(st["status"], "done", out)
-        self.assertEqual(cat(self.calls + ".planners").split()[:2], ["1", "2"])
-        self.assertEqual(cat(self.calls + ".planners").split().count("1"), 1, out)
+        self.assertEqual(sorted(cat(self.calls + ".planners").split()), ["1", "2", "2", "3"], out)
         self.assertTrue(st["panels"]["plan"]["merged"], st["panels"])
+        self.assertNotIn("agents", st)
         self.assertEqual(self.drafts_in_vault(), [])
+
+    def test_a_halt_stops_every_member_at_once(self):
+        os.environ.update(FAKE_PANEL_SLEEP="60")
+        self.add("ABC-1")
+        p = OwnerControlTest.run_bg(self, "--planners", "3", "--reviewers", "general")
+        OwnerControlTest.wait_for(self, lambda: len((self.status() or {}).get("agents") or {}) == 3, "3 planners", 60)
+        t0 = time.time()
+        rc, out = self.q("halt")
+        self.assertEqual(p.wait(timeout=40), 0)
+        self.assertLess(time.time() - t0, 30)   # not one after another
+        st = self.status()
+        self.assertEqual((st["status"], st["panel"]["members"]), ("queued", {}))
+        self.assertNotIn("agents", st)
+        self.assertEqual(self.drafts_in_vault(), [])
+        self.assertEqual([f for f in os.listdir(self.notes()) if "-task" in f], [])
 
     def test_three_reviewers_merged_and_the_unevidenced_dropped(self):
         os.environ["FAKE_MUSTFIX"] = "1"
@@ -5745,7 +5792,7 @@ class PanelTest(Base):
         rc, out = self.run_queue("--planners", "1", "--reviewers", "general,ux,standards")
         st = self.status()
         self.assertEqual(st["status"], "done", out)
-        self.assertEqual(cat(self.calls + ".lenses").split(), ["general", "ux", "standards"])
+        self.assertEqual(sorted(cat(self.calls + ".lenses").split()), ["general", "standards", "ux"])
         d = tq.Queue(self.state).dir("ABC-1")
         self.assertEqual(sorted(os.listdir(os.path.join(d, "panel"))),
                          ["review-general.md", "review-standards.md", "review-ux.md"])
@@ -5765,7 +5812,7 @@ class PanelTest(Base):
         self.assertIn("2. look at the greeting", fixes)
         self.assertNotIn("this may crash someday", fixes)
         # the second review (after the fix round) is one reviewer
-        self.assertEqual(cat(self.calls + ".lenses").split(), ["general", "ux", "standards"])
+        self.assertEqual(sorted(cat(self.calls + ".lenses").split()), ["general", "standards", "ux"])
         self.assertEqual(len(self.calls_of("reviewing")), 4)
         cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines() if c.strip()]
         self.assertTrue(any("You are the ux reviewer" in c.get("done", "") for c in cards))
@@ -5776,7 +5823,7 @@ class PanelTest(Base):
         rc, out = self.run_queue("--planners", "1", "--reviewers", "ux,general")
         st = self.status()
         self.assertEqual(st["status"], "done", out)
-        self.assertEqual(cat(self.calls + ".lenses").split(), ["general", "ux"])   # general first, whatever the order
+        self.assertEqual(sorted(cat(self.calls + ".lenses").split()), ["general", "ux"])   # general always
         self.assertEqual(len(self.calls_of("reviewing")), 3)
         self.assertFalse(st["panels"]["review"]["merged"])
 

@@ -2762,7 +2762,7 @@ def st_lock(ctx):
 
 def launch(ctx, st, cmd, out, since, card=None, member=None):
     """Run the agent to its end, a timeout (rc 124), or the owner's stop or halt (Interrupted).
-    member: a panel member's {"tag", "file", "task"} (run_panel), launched in a thread beside
+    member: a panel member's {"tag", "file", "task", "findings"} (run_panel), launched in a thread beside
     the others: its launch id is its own, its agent st["agents"][tag] (and run.json "agents"),
     st changes and saves under st_lock, and on a halt it drops only its own task file and
     file; run_panel copies the instructions and commits the vault once for all of them."""
@@ -2782,7 +2782,7 @@ def launch(ctx, st, cmd, out, since, card=None, member=None):
     t0 = time.monotonic()
     end = t0 + ctx.stage_timeout
     notes_at = mtime(ctx.q.notes_path(key))
-    extra = [member["file"]] if member else []
+    extra = [member["file"]] + ([member["findings"]] if member.get("findings") else []) if member else []
 
     def save():
         with lock:
@@ -3835,8 +3835,15 @@ def member_task(vault, key, tag):
     return os.path.join(vault, "wiki", "notes", "tickets", f"{key}-task-{tag}.md")
 
 
+def member_findings(vault, key, tag):
+    """A panel member's findings file: the members run at once, and two agents adding
+    to one file can each write over the other's line; run_panel adds each to KEY-findings.md."""
+    return os.path.join(vault, "wiki", "notes", "tickets", f"{key}-findings-{tag}.md")
+
+
 def run_panel(ctx, st, stage, members):
-    """Each member of members [{tag, path, model, prompt(), check(text) -> problems, done}]
+    """Each member of members [{tag, path, model, prompt(), check(text) -> problems, done,
+    findings (its own findings file)}]
     not done yet launched at once, each in a thread (launch's member mode): a new agent
     (not resumed, not the stage's own agent: the stage's session and result are left
     alone), its prompt in its own task file, its output DIR/<stage>-N-<tag>.out. As each
@@ -3901,7 +3908,7 @@ def launch_all(ctx, st, stage, pan, todo, lock):
         m = j["m"]
         try:
             rc = launch(ctx, st, j["cmd"], j["out"], since, j["card"],
-                        member={"tag": m["tag"], "file": m["path"], "task": j["task"]})
+                        member={"tag": m["tag"], "file": m["path"], "task": j["task"], "findings": m.get("findings")})
         except BaseException as e:  # noqa: BLE001 - handed to run_panel's thread
             drop(j["task"])
             ended[m["tag"]] = e
@@ -3948,10 +3955,17 @@ def launch_all(ctx, st, stage, pan, todo, lock):
         for a in live:
             stop_containers(ctx, st, a.get("launch"))
         raise
+    findings = note_paths(ctx.vault, key)["findings"]
     for j in jobs:   # one that did not end on its own (halt, failed launch) leaves nothing in the vault
         drop(j["task"])
         if ended.get(j["m"]["tag"]) is not None:
             drop(j["m"]["path"])
+        found = j["m"].get("findings")
+        if found and read(found).strip():   # what it found is the ticket's, however it ended
+            old = read(findings)
+            write_atomic(findings, old + ("\n" if old and not old.endswith("\n") else "") + read(found).strip() + "\n")
+        if found:
+            drop(found)
     with lock:
         if st.get("in_place"):
             st["launches"][-1][1] = int(time.time() * 1000)
@@ -4002,7 +4016,7 @@ PANEL_NOTE_PLAN = """
 <<<BEGIN_PANEL (how this plan is made)>>>
 You are planner {n} of {of}. Each planner drafts this plan on its own, from the ticket and the code; the queue then merges the drafts into the one plan the owner reads. An independent look is why there are several of you: look hard for what another planner could miss: edge cases, the existing callers and behaviours the change touches, other ways to build it, and risks.
 - Read the code as much as you need, but do not build, test, install or run the project: nothing in this stage changes a file but your draft.
-- Write only your draft, {{PLAN_FILE}}, and the findings file. There are no other drafts for you to read.
+- Write only your draft, {{PLAN_FILE}}, and your findings file. The other planners draft at the same time, each in its own file: do not read theirs (an independent look is the point).
 <<<END_PANEL>>>
 """
 
@@ -4036,11 +4050,11 @@ def plan_panel(ctx, st, v):
     members = []
     for i, model in enumerate(models, 1):
         path = os.path.join(notes_dir, f"{key}-plan-draft-{i}.md")
-        ap = agent_path(ctx, path)
-        members.append({"tag": f"d{i}", "path": path, "model": model,
-                        "prompt": (lambda ap=ap, i=i: render("plan", **dict(
-                            v, PLAN_FILE=ap, PANEL=PANEL_NOTE_PLAN.replace("{{PLAN_FILE}}", ap).format(
-                                n=i, of=len(models))))),
+        ap, found = agent_path(ctx, path), member_findings(ctx.vault, key, f"d{i}")
+        members.append({"tag": f"d{i}", "path": path, "model": model, "findings": found,
+                        "prompt": (lambda ap=ap, i=i, found=found: render("plan", **dict(
+                            v, PLAN_FILE=ap, FINDINGS_FILE=agent_path(ctx, found),
+                            PANEL=PANEL_NOTE_PLAN.replace("{{PLAN_FILE}}", ap).format(n=i, of=len(models))))),
                         "check": lambda text: check_plan(text)[0],
                         "done": CARD_DONE["plan"].format(KEY=key, PLAN_FILE=ap)
                         + f" You are planner {i} of {len(models)}: write only that draft, and run nothing."})
@@ -4193,7 +4207,7 @@ LENS_NOTES = {
 }
 PANEL_NOTE_REVIEW = """
 <<<BEGIN_PANEL (how this review is made)>>>
-{lens} The queue merges your Must fix items with the other reviewers' (each has its own focus) and drops every item that does not carry its evidence. Write only your review file, {{REVIEW_FILE}}, and the findings file.
+{lens} The queue merges your Must fix items with the other reviewers' (each has its own focus) and drops every item that does not carry its evidence. Write only your review file, {{REVIEW_FILE}}, and your findings file. The other reviewers work at the same time, each on its own file: do not read theirs, and change no file of the project.
 <<<END_PANEL>>>
 """
 
@@ -4220,10 +4234,10 @@ def review_panel(ctx, st, v, rounds):
     members = []
     for lens in names:
         path = os.path.join(os.path.dirname(p["review"]), f"{key}-review-{lens}.md")
-        ap = agent_path(ctx, path)
-        vals = dict(v, REVIEW_FILE=ap, PANEL=PANEL_NOTE_REVIEW.replace("{{REVIEW_FILE}}", ap).format(
-            lens=LENS_NOTES[lens]))
-        members.append({"tag": lens, "path": path, "model": ctx.model,
+        ap, found = agent_path(ctx, path), member_findings(ctx.vault, key, lens)
+        vals = dict(v, REVIEW_FILE=ap, FINDINGS_FILE=agent_path(ctx, found),
+                    PANEL=PANEL_NOTE_REVIEW.replace("{{REVIEW_FILE}}", ap).format(lens=LENS_NOTES[lens]))
+        members.append({"tag": lens, "path": path, "model": ctx.model, "findings": found,
                         "prompt": (lambda vals=vals: render("review", **vals)),
                         "check": lambda text: check_review(text)[0],
                         "done": CARD_DONE["review"].format(KEY=key, REVIEW_FILE=ap)
