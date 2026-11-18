@@ -362,18 +362,33 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
                          "set tracker_url to the address it points at")
 
 
+def charter(vault):
+    """The vault charter's (wiki/overview.md) frontmatter: tracker_url and the rest."""
+    return frontmatter(read_text(os.path.join(vault, "wiki", "overview.md")) or "")[0]
+
+
+def auth_header(token):
+    """TRACKER_TOKEN as Jira takes it: <email>:<api-token> (Cloud) as Basic, a
+    personal access token as Bearer."""
+    if ":" in token:
+        return "Basic " + base64.b64encode(token.encode("utf-8")).decode("ascii")
+    return "Bearer " + token
+
+
+def get_json(full_url, token, timeout=TIMEOUT):
+    """GET full_url (on tracker_url, url_problem checked first) with the token,
+    no redirect followed: the answer as JSON. Raises urllib.error.HTTPError,
+    Redirected, URLError or OSError, ValueError (not JSON)."""
+    req = urllib.request.Request(full_url, headers={"Authorization": auth_header(token),
+                                                    "Accept": "application/json"})
+    with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
 def fetch(url, key, token):
     """(issue dict, None) or (None, why it failed)."""
-    if ":" in token:
-        auth = "Basic " + base64.b64encode(token.encode("utf-8")).decode("ascii")
-    else:
-        auth = "Bearer " + token
-    req = urllib.request.Request(
-        f"{url.rstrip('/')}/rest/api/2/issue/{urllib.parse.quote(key)}?expand=names",
-        headers={"Authorization": auth, "Accept": "application/json"})
     try:
-        with urllib.request.build_opener(NoRedirect()).open(req, timeout=TIMEOUT) as r:
-            return json.loads(r.read().decode("utf-8", "replace")), None
+        return get_json(f"{url.rstrip('/')}/rest/api/2/issue/{urllib.parse.quote(key)}?expand=names", token), None
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return None, f"the tracker refused TRACKER_TOKEN (HTTP {e.code}; harness ticket login)"
@@ -398,7 +413,7 @@ def main(argv):
               file=sys.stderr)
         return 2
     vault, key = argv[1], argv[2]
-    meta, _ = frontmatter(read_text(os.path.join(vault, "wiki", "overview.md")) or "")
+    meta = charter(vault)
     url = (meta.get("tracker_url") or "").strip().rstrip("/")
     extra = [x.strip() for x in (meta.get("tracker_fields") or "").split(",") if x.strip()]
     ac = [x.strip() for x in (os.environ.get("TRACKER_AC_FIELDS") or meta.get("tracker_ac_fields") or "").split(",")

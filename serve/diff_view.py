@@ -18,14 +18,18 @@ any repository of the ticket's, and on the uncommitted view where its files are 
 ones fix works on, the owner clicks lines to comment on them, PR-review style; the
 comments wait in the browser (localStorage) and go to the fix stage all at once, one
 on a repository inside the project with its "repo", one on the uncommitted view with
-"view" (its old lines are numbered as at HEAD)."""
+"view" (its old lines are numbered as at HEAD).
+
+Above each hunk, and after a file's last, "Show 10 more lines" brings the lines around
+it (lines(), /runs/ticket/KEY/lines) into the diff as context, from the version the
+page diffed; they take comments like any other line."""
 
 import json
 import os
 import re
 import subprocess
 import threading
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import runs as runs_view
 from vault_view import SECRET
@@ -37,6 +41,9 @@ NEW_FILES_CAP = 100        # untracked files shown as new
 NEW_FILE_CAP = 200_000     # bytes of one untracked file shown
 LOG_CAP = 50               # commits listed
 GIT_TIMEOUT = 20           # s
+LINES_CAP = 500            # lines of a file sent at once to show more of it around a hunk
+FILE_CAP = 5_000_000       # bytes of a file read for them
+SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 VIEWS = {"work": "The ticket's work", "uncommitted": "Uncommitted changes", "unpushed": "Not pushed yet"}
 VIEW_SAYS = {"work": "the ticket's branch since the commit it started from: what review reads and push sends",
              "left": ("this repository's part of the ticket is left uncommitted: the files as they are now (new "
@@ -98,10 +105,12 @@ def repos(runs, st):
     out = [(".", "the project itself (" + (os.path.basename(st["project"].rstrip("/\\")) or st["project"]) + ")")]
     tq = runs_view._tq()
     if st.get("in_place") is True and tq and os.path.isdir(st["project"]):
-        try:
-            out += [(r, r) for r in tq.nested_repos(st["project"], skip=(runs.queue_dir,))]
-        except Exception:   # an odd folder: the project's own still shows
-            pass
+        def scan():   # a git call and a walk of the folder: kept 5 minutes, or until its top changes
+            try:
+                return tuple(tq.nested_repos(st["project"], skip=(runs.queue_dir,)))
+            except Exception:   # an odd folder: the project's own still shows
+                return ()
+        out += [(r, r) for r in runs.memo("nested_repos", st["project"], (st["project"],), scan, ttl=300)]
         have = {r for r, _ in out}
         out += [(r, r) for r in sorted(set(_dict(st, "nested")) | set(_dict(st, "baselines")))
                 if r not in have and isinstance(r, str) and os.path.isdir(os.path.join(st["project"], r))]
@@ -222,11 +231,27 @@ def uncommitted_takes_comments(runs, st, repo):
     return False, f"the folder is on {on or 'a detached HEAD'}, not the ticket's branch {got[1]}"
 
 
+def _sha(d, ref):
+    """The commit ref is in d (a full sha), or ""."""
+    out = (_git(d, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}", cap=200)[0] or "").strip()
+    return out if SHA_RE.match(out) else ""
+
+
+def _tip(st, repo, d, branch):
+    """(the folder, the commit) the ticket's branch is at in repo: the branch in d, or for the
+    top the ref push fetched into the project; (None, "") when it is gone."""
+    sha = _sha(d, f"refs/heads/{branch}") if d else ""
+    if sha:
+        return d, sha
+    sha = _sha(st["project"], f"refs/harness-queue/{st.get('key', '')}") if repo == "." else ""
+    return (st["project"], sha) if sha else (None, "")
+
+
 def changes(runs, st, repo, view):
     """{"diff", "says", "notes", "commits", "error"} for one repository and view."""
     key, project = st["key"] if isinstance(st.get("key"), str) else "", st["project"]
     d = folder(runs, st, repo)
-    res = {"diff": "", "says": "", "notes": [], "commits": [], "error": "", "kind": ""}
+    res = {"diff": "", "says": "", "notes": [], "commits": [], "error": "", "kind": "", "rev": ""}
     if view == "work":
         got = part(st, repo)
         res["kind"] = got[0] if got else ""
@@ -255,22 +280,20 @@ def changes(runs, st, repo, view):
             res["diff"], cut = _git(d, *DIFF, got[1], tree, "--")
         else:
             branch, base = got[1], got[2]
-            if d and _git(d, "rev-parse", "-q", "--verify", f"refs/heads/{branch}^{{commit}}", cap=200)[0]:
-                where, tip = d, f"refs/heads/{branch}"
-            elif repo == "." and _git(project, "rev-parse", "-q", "--verify",
-                                      f"refs/harness-queue/{key}^{{commit}}", cap=200)[0]:
-                where, tip = project, f"refs/harness-queue/{key}"
-            else:
+            where, tip = _tip(st, repo, d, branch)
+            if not tip:
                 res["error"] = f"the branch {branch} is not there any more"
                 return res
             res["says"] = f"{base[:12]}..{branch}"
+            res["rev"] = tip   # the commit diffed, not the branch: what more lines are read at
             res["commits"] = _log(where, f"{base}..{tip}")
             res["diff"], cut = _git(where, *DIFF, base, tip, "--")
     else:
         if not d or not os.path.isdir(d):
             res["error"] = "the separate copy is gone (the ticket finished or was reset), so there is nothing to show"
             return res
-        if not _git(d, "rev-parse", "-q", "--verify", "HEAD^{commit}", cap=200)[0]:
+        head = _sha(d, "HEAD")
+        if not head:
             res["error"] = "this repository has no commits yet"
             return res
         if view == "uncommitted":
@@ -287,8 +310,9 @@ def changes(runs, st, repo, view):
                                 "remote), so there is nothing to compare with")
                 return res
             res["says"] = f"{up}...HEAD, as of the last fetch"
-            res["commits"] = _log(d, f"{up}..HEAD")
-            res["diff"], cut = _git(d, *DIFF, f"{up}...HEAD", "--")
+            res["rev"] = head
+            res["commits"] = _log(d, f"{up}..{head}")
+            res["diff"], cut = _git(d, *DIFF, f"{up}...{head}", "--")
     if res["diff"] is None:
         res["diff"], res["error"] = "", "git could not read this repository"
         return res
@@ -300,6 +324,106 @@ def changes(runs, st, repo, view):
     if hid:
         res["notes"].append("left out because they look like secrets: " + ", ".join(hid[:10]))
     return res
+
+
+def _changed(d, *rng):
+    """{new name: old name} of the files git diff rng changes in place or moves (not the new,
+    deleted or retyped ones: they have no lines around their hunks), or None when git fails."""
+    raw, cut = _git(d, "diff", "--no-color", "--no-ext-diff", "--name-status", "-z", "-M", *rng, "--", cap=DIFF_CAP)
+    if raw is None or cut:
+        return None
+    out, it = {}, iter(raw.split("\0"))
+    for status in it:
+        if not status:
+            continue
+        names = [next(it, ""), next(it, "")] if status[0] in "RC" else [next(it, "")] * 2
+        if status[0] in "MRC" and names[1]:
+            out[names[1]] = names[0]
+    return out
+
+
+def lines(runs, key, query):
+    """(HTTP code, {"lines", "total"} or {"error"}) for /runs/ticket/KEY/lines: the lines from..to
+    (1-based, at most LINES_CAP) of a file in the diff the Changes page showed for repo and view,
+    as its new side has them: at rev (the commit the page diffed, or one it led to) for the
+    ticket's branch and the commits not pushed, else the file in the folder. Only a file that
+    diff changes (not one the page leaves out as a secret), in a repository of the ticket's;
+    "total" is the file's number of lines."""
+    st = _state(runs, key)
+    if st is None:
+        return 404, {"error": "no such ticket"}
+    st.setdefault("key", key)
+
+    def arg(k):
+        return (query.get(k) or [""])[0]
+    repo, view, path, rev = arg("repo") or ".", arg("view"), arg("path"), arg("rev")
+    known = repo == "." or any(repo in _dict(st, k) for k in ("nested", "baselines", "repos"))
+    if not known and repo not in dict(repos(runs, st)):
+        return 400, {"error": "not a repository of this ticket"}
+    if view not in VIEWS or (view == "work" and not has_work_view(st, repo)):
+        return 400, {"error": "no such view"}
+    try:
+        lo, hi = int(arg("from")), int(arg("to"))
+    except ValueError:
+        return 400, {"error": "from and to are line numbers"}
+    if lo < 1 or hi < lo or hi - lo >= LINES_CAP:
+        return 400, {"error": f"from..to is out of range (1 and up, at most {LINES_CAP} lines)"}
+    if not path or len(path) > 4096 or "\0" in path or SECRET.search(path):
+        return 400, {"error": "not a file this diff shows"}
+    d = folder(runs, st, repo)
+    if not d or not os.path.isdir(d):
+        return 400, {"error": "the repository's folder is gone"}
+    got = part(st, repo) if view == "work" else None
+    if view == "work" and (not got or not got[1] or (got[0] == "branch" and not got[2])):
+        return 400, {"error": "the ticket has no work to show here yet"}
+    if view == "uncommitted" or (got and got[0] == "left"):
+        base, where, tip = (got[1] if got else "HEAD"), d, ""
+        rng = (base,)
+    else:
+        if not SHA_RE.match(rev):
+            return 400, {"error": "rev is not a commit"}
+        if view == "work":
+            where, tip = _tip(st, repo, d, got[1])
+            rng = (got[2], rev)
+        else:
+            where, tip = d, _sha(d, "HEAD")
+            up = (_git(d, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", cap=500)[0]
+                  or "").strip()
+            rng = (f"{up}...{rev}",) if up else ()
+        # the commit the page diffed: the tip, or one between the base and it (the branch moved on since)
+        if not tip or not rng or (rev != tip and (
+                _git(where, "merge-base", "--is-ancestor", rev, tip, cap=200)[0] is None
+                or (view == "work" and (rev == got[2] or _git(where, "merge-base", "--is-ancestor", got[2], rev,
+                                                              cap=200)[0] is None)))):
+            return 400, {"error": "rev is not a commit of this view"}
+    names = _changed(where, *rng)
+    if names is None:
+        return 400, {"error": "git could not read this repository"}
+    if path not in names or SECRET.search(names[path]):
+        return 400, {"error": "not a file this diff shows"}
+    if tip:
+        data, cut = _git(where, "cat-file", "blob", f"{rev}:{path}", cap=FILE_CAP)
+        if data is None:
+            return 400, {"error": "git could not read the file"}
+    else:
+        p = os.path.join(d, *path.split("/"))
+        real, top = os.path.realpath(p), os.path.realpath(d)
+        if os.path.islink(p) or not real.startswith(top.rstrip(os.sep) + os.sep) or not os.path.isfile(real):
+            return 400, {"error": "not a file this diff shows"}
+        try:
+            with open(real, "rb") as f:
+                raw = f.read(FILE_CAP + 1)
+        except OSError:
+            return 400, {"error": "the file could not be read"}
+        cut, data = len(raw) > FILE_CAP, raw[:FILE_CAP].decode("utf-8", "replace")
+    if "\0" in data[:8000]:
+        return 400, {"error": "a binary file"}
+    rows = data.split("\n")
+    if rows[-1] == "" or cut:   # the end of the last line; one cut short is not shown
+        rows.pop()
+    if cut and hi > len(rows):
+        return 400, {"error": f"the file is over {FILE_CAP // 1_000_000} MB: no more of it is shown"}
+    return 200, {"lines": [x[:-1] if x.endswith("\r") else x for x in rows[lo - 1:hi]], "total": len(rows)}
 
 
 def _asset(name):
@@ -338,6 +462,15 @@ body:has(#d2h) .bar-in{max-width:none}
 #d2h tr.dv-c td{padding:8px 10px;background:var(--raised);border-left:3px solid var(--accent);white-space:normal;
   font-family:var(--sans);font-size:13px}
 #d2h tr.dv-pad td{padding:0;border-left:0}
+/* a hunk's header row with its Show more buttons wraps, so it never makes the diff wider than the window */
+#d2h td.d2h-info>div{white-space:normal;overflow-wrap:anywhere}
+#d2h .dv-mores{display:inline-flex;flex-wrap:wrap;gap:2px 10px;margin-right:12px;vertical-align:middle}
+#d2h button.dv-more{border:0;background:none;padding:2px 4px;height:auto;min-height:24px;color:var(--accent);
+  font:12px var(--sans);cursor:pointer;border-radius:4px;white-space:nowrap}
+#d2h button.dv-more:hover{text-decoration:underline;background:none}
+#d2h button.dv-more:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#d2h button.dv-more:disabled{opacity:.6;cursor:wait}
+#d2h .dv-why{color:var(--bad,#c33);font:12px var(--sans);margin-left:8px;white-space:normal}
 .dv-note{white-space:pre-wrap;overflow-wrap:anywhere}
 .dv-ed textarea,#dv-gen{width:100%;box-sizing:border-box;min-height:64px;font:inherit;color:var(--ink);
   background:var(--field);border:1px solid var(--line-2);border-radius:6px;padding:6px 8px}
@@ -345,6 +478,67 @@ body:has(#d2h) .bar-in{max-width:none}
 .dv-list{padding-left:20px}
 .dv-list li{margin:8px 0}
 .dv-list .txt{white-space:pre-wrap;overflow-wrap:anywhere}
+"""
+
+HUNKS_JS = r"""
+// A file's unified diff as hunks, and context lines added to them (the Changes page's "Show more
+// lines"): plain functions, so serve/test_diff_view.py runs them under node.
+var dvHunks = (function () {
+  var HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+  function cut(text) {   // the lines before the first hunk, and each hunk: its first lines (o, n), counts, lines
+    var ls = text.split('\n'), f = {head: [], hunks: []}, h = null;
+    if (ls[ls.length - 1] === '') ls.pop();
+    ls.forEach(function (l) {
+      var m = HUNK.exec(l);
+      if (m) {
+        var ol = m[2] === undefined ? 1 : +m[2], nl = m[4] === undefined ? 1 : +m[4];
+        // a hunk with no lines on a side names the line before it there
+        h = {o: +m[1] + (ol ? 0 : 1), ol: ol, n: +m[3] + (nl ? 0 : 1), nl: nl, tail: m[5], lines: []};
+        f.hunks.push(h);
+      } else (h ? h.lines : f.head).push(l);
+    });
+    return f;
+  }
+  function glue(f) {
+    var out = f.head.slice();
+    f.hunks.forEach(function (h) {
+      out.push('@@ -' + (h.ol ? h.o : h.o - 1) + ',' + h.ol + ' +' + (h.nl ? h.n : h.n - 1) + ',' + h.nl + ' @@' +
+               h.tail);
+      for (var i = 0; i < h.lines.length; i++) out.push(h.lines[i]);
+    });
+    return out.join('\n') + '\n';
+  }
+  function gap(f, k) {   // [first, last] new line above hunk k; past the last hunk, the lines after it
+    var h = f.hunks[k], p = f.hunks[k - 1];
+    return [p ? p.n + p.nl : 1, h ? h.n - 1 : Infinity];
+  }
+  // the new lines to read for n more above hunk k (the nearest ones), or after the last: [first, last]
+  function span(f, k, n) {
+    var g = gap(f, k);
+    return k < f.hunks.length ? [Math.max(g[0], g[1] - n + 1), g[1]] : [g[0], g[0] + n - 1];
+  }
+  // lines (the new side's, unchanged so the same on the old) added as context: right above hunk k,
+  // or after the last when k is past it; a hunk they bring to the one before joins it
+  function add(f, k, lines) {
+    var ctx = lines.map(function (x) { return ' ' + x; }), n = ctx.length, h = f.hunks[k], p = f.hunks[k - 1];
+    if (!h) {
+      p.lines = p.lines.concat(ctx);
+      p.ol += n;
+      p.nl += n;
+      return f;
+    }
+    h.lines = ctx.concat(h.lines);
+    h.o -= n; h.n -= n; h.ol += n; h.nl += n;
+    if (p && p.n + p.nl === h.n) {
+      p.lines = p.lines.concat(h.lines);
+      p.ol += h.ol;
+      p.nl += h.nl;
+      f.hunks.splice(k, 1);
+    }
+    return f;
+  }
+  return {cut: cut, glue: glue, gap: gap, span: span, add: add};
+})();
 """
 
 JS = r"""
@@ -366,6 +560,7 @@ JS = r"""
     document.querySelectorAll('.dv-lay button').forEach(function (b) {
       b.setAttribute('aria-pressed', b.dataset.lay === lay ? 'true' : 'false');
     });
+    el.querySelectorAll('.d2h-file-wrapper').forEach(deco);
     level();
     if (rv) rv();
   }
@@ -647,6 +842,111 @@ JS = r"""
     window.addEventListener('resize', even);
     return function () { index(); paint(); };
   }
+
+  // Show more lines: the lines above a hunk (and after a file's last) come from the server, the
+  // file as this diff has it, and go into the diff's text as context lines, the hunk's header
+  // moved to take them: diff2html numbers both sides (a context line's old number is its new one
+  // less the hunk's offset) and the reviewer takes comments on them as on any line. A hunk whose
+  // lines reach the one before joins it.
+  var more = el.dataset.lines, cut = dvHunks.cut, glue = dvHunks.glue, gap = dvHunks.gap;
+  var STEP = 10, ALL = 30, ends = {}, blocks = diff.split(/^(?=diff --git )/m);
+  try { if (Diff2Html.parse(diff).length !== blocks.length) more = ''; } catch (e) { more = ''; }
+  function moreBtn(label, i, k, n, aria) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'dv-more';
+    b.textContent = label;
+    b.setAttribute('aria-label', aria);
+    b.dataset.at = i + ':' + k + ':' + n;
+    return b;
+  }
+  function controls(i, f, k) {   // the buttons for the lines above hunk k (k past the last: after it)
+    var g = gap(f, k), size = g[1] - g[0] + 1, last = k === f.hunks.length, box = document.createElement('span');
+    var where = last ? 'below' : 'above', arrow = last ? '\u2193 ' : '\u2191 ';
+    box.className = 'dv-mores';
+    if (size <= 0 || (last && ends[i] !== undefined && ends[i] <= g[0] - 1)) return null;
+    if (last && ends[i] !== undefined) size = ends[i] - g[0] + 1;
+    if (size <= STEP) box.appendChild(moreBtn(arrow + 'Show ' + size + ' more line' + (size === 1 ? '' : 's'), i, k, size,
+                                              'Show the ' + size + ' line' + (size === 1 ? '' : 's') + ' ' + where));
+    else {
+      box.appendChild(moreBtn(arrow + 'Show ' + STEP + ' more lines', i, k, STEP, 'Show ' + STEP + ' more lines ' + where));
+      if (size < ALL) box.appendChild(moreBtn('Show all ' + size, i, k, size, 'Show all ' + size + ' lines ' + where));
+    }
+    return box;
+  }
+  function deco(w, i) {   // the buttons on file i's drawn diff: in its hunks' header rows, and a row after the last
+    if (!more) return;
+    var f = cut(blocks[i]);
+    if (!f.hunks.length || /^(new|deleted) file mode/m.test(f.head.join('\n'))) return;
+    var halves = w.querySelectorAll('.d2h-file-side-diff'), tables = halves.length ? [].slice.call(halves) : [w];
+    var infos = [].filter.call(tables[0].querySelectorAll('tbody > tr'), function (tr) {
+      return tr.querySelector('td.d2h-info');
+    });
+    if (infos.length !== f.hunks.length) return;
+    f.hunks.forEach(function (h, k) {
+      var c = controls(i, f, k), cell = c && infos[k].querySelector('td.d2h-info:last-child > div');
+      if (cell) cell.insertBefore(c, cell.firstChild);
+    });
+    var end = controls(i, f, f.hunks.length);
+    if (!end) return;
+    tables.forEach(function (t, j) {   // side by side, a row in each half, so the rows stay level
+      var tr = document.createElement('tr'), num = document.createElement('td'), td = document.createElement('td');
+      var div = document.createElement('div'), side = halves.length ? 'side-' : '';
+      tr.className = 'dv-end';
+      num.className = 'd2h-code-' + side + 'linenumber d2h-info';
+      td.className = 'd2h-info';
+      div.className = 'd2h-code-' + side + 'line';
+      if (j === 0) div.appendChild(end);
+      else div.innerHTML = '&nbsp;';
+      td.appendChild(div);
+      tr.appendChild(num);
+      tr.appendChild(td);
+      t.querySelector('tbody').appendChild(tr);
+    });
+  }
+  function grow(i, k, n, b) {
+    var f = cut(blocks[i]), last = k === f.hunks.length, s = dvHunks.span(f, k, n), lo = s[0], hi = s[1];
+    var box = b.parentNode, btns = box.querySelectorAll('button');
+    var files = Diff2Html.parse(blocks[i]), name = files[0] && files[0].newName;
+    btns.forEach(function (x) { x.disabled = true; });
+    var url = more + '&' + new URLSearchParams({path: name || '', from: lo, to: hi}).toString();
+    fetch(url, {credentials: 'same-origin', headers: {Accept: 'application/json'}}).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok || !Array.isArray(j.lines)) throw new Error(j.error || 'the lines could not be loaded (' + r.status + ')');
+        return j;
+      });
+    }).then(function (j) {
+      var got = j.lines;
+      ends[i] = j.total;
+      if (!last && got.length !== hi - lo + 1) throw new Error('the file changed since the page was drawn: reload it');
+      var joined = dvHunks.add(f, k, got).hunks.length < cut(blocks[i]).hunks.length;
+      blocks[i] = glue(f);
+      diff = blocks.join('');
+      var w = el.querySelectorAll('.d2h-file-wrapper')[i], y = window.scrollY, tmp = document.createElement('div');
+      tmp.innerHTML = Diff2Html.html(blocks[i], {drawFileList: false, outputFormat: lay, matching: 'lines',
+                                                 colorScheme: dark() ? 'dark' : 'light'});
+      var nw = tmp.querySelector('.d2h-file-wrapper');
+      w.parentNode.replaceChild(nw, w);
+      deco(nw, i);
+      level();
+      if (rv) rv();
+      window.scrollTo(window.scrollX, y);   // what is above the new lines stays where it was
+      var again = nw.querySelector('button.dv-more[data-at^="' + i + ':' + k + ':"]');
+      if (again && !joined) again.focus({preventScroll: true});
+    }).catch(function (e) {
+      btns.forEach(function (x) { x.disabled = false; });
+      var why = box.querySelector('.dv-why') || box.appendChild(document.createElement('span'));
+      why.className = 'dv-why';
+      why.textContent = String(e.message || e);
+    });
+  }
+  el.addEventListener('click', function (e) {
+    var b = e.target.closest ? e.target.closest('button.dv-more') : null;
+    if (!b) return;
+    e.stopPropagation();
+    var at = b.dataset.at.split(':').map(Number);
+    grow(at[0], at[1], at[2], b);
+  }, true);
   document.querySelectorAll('.dv-lay button').forEach(function (b) {
     b.addEventListener('click', function () {
       lay = b.dataset.lay;
@@ -693,8 +993,48 @@ def _review(runs, key, st, repo, view="work", hint_more=""):
             "<button type='submit' class='primary' disabled>Send 0 comments to the fixer</button></form></section>")
 
 
+# The Changes page paints its header at once and fetches the rest (?body=1): on a big
+# Windows project the git calls behind a diff take seconds, and a tab switch should not.
+LOADER = r"""
+(function () {
+  var b = document.getElementById('dv-body');
+  if (!b || !b.dataset.src) { window.dvInit(); return; }
+  fetch(b.dataset.src, {credentials: 'same-origin'}).then(function (r) {
+    return r.text().then(function (t) {   // a failure's first line says why (git's own words)
+      if (r.ok) return t;
+      var why = (t || '').replace(/<[^>]*>/g, ' ').trim().split('\n')[0].slice(0, 300);
+      throw new Error((why ? why + ', ' : '') + 'HTTP ' + r.status);
+    });
+  }).then(function (html) {
+    b.innerHTML = html;
+    b.removeAttribute('aria-busy');
+    window.dvInit();
+  }).catch(function (e) {
+    b.removeAttribute('aria-busy');
+    b.textContent = 'Could not load the changes (' + e.message + '). Reload the page to try again.';
+  });
+})();
+"""
+
+
 def page(runs, key, query):
-    """(title, parts, script) for /runs/ticket/KEY/diff, or None when there is no such ticket."""
+    """(title, parts, script) for /runs/ticket/KEY/diff, or None when there is no such
+    ticket: the tabs and a placeholder the script fills from body() (?body=1)."""
+    st = _state(runs, key)
+    if st is None:
+        return None
+    src = f"/runs/ticket/{quote(key)}/diff?" + urlencode(
+        [(k, v) for k, vs in query.items() if k != "body" for v in vs] + [("body", "1")])
+    parts = [f"<style>{_asset('diff2html.min.css')}{STYLE}</style>",
+             runs_view.ticket_tabs(runs, key, "changes"),
+             f"<div id='dv-body' aria-busy='true' data-src='{esc(src)}'>"
+             "<section class='panel muted'>Loading the changes\u2026</section></div>"]
+    return (f"{key} changes", parts, ";" + _asset("diff2html.min.js") + ";" + HUNKS_JS
+            + "window.dvInit = function () {" + JS + "};" + LOADER)
+
+
+def body(runs, key, query):
+    """The Changes page's content under its tabs (HTML), or None when there is no such ticket."""
     st = _state(runs, key)
     if st is None:
         return None
@@ -725,10 +1065,7 @@ def page(runs, key, query):
     only = ("" if st.get("in_place") is True else
             "<div class='muted'>This ticket works in a separate copy, which holds only the project's own repository; "
             "the repositories inside your project folder are not in it.</div>")
-    parts = [f"<style>{_asset('diff2html.min.css')}{STYLE}</style>",
-             "<header class='ph'><div class='crumbs'><a href='/runs/queue'>Queue</a><span>/</span>"
-             f"<a href='{href}'>{esc(key)}</a><span>/</span><b>Changes</b></div><h1>{esc(key)}: changes</h1></header>",
-             "<section class='panel'>"
+    parts = ["<section class='panel'>"
              f"<form id='dv-pick' class='dv-pick' method='get' action='{href}/diff'>"
              f"<label class='dv-repo'>Repository<select name='repo'>{opts}</select></label>"
              f"<div class='dv-pick dv-views' role='radiogroup' aria-label='What to show'>{''.join(radios)}</div>"
@@ -746,7 +1083,7 @@ def page(runs, key, query):
                      f"{work}.</p>")
     if res["error"]:
         parts.append(f"<section class='panel'><b>Nothing to show:</b> {esc(res['error'])}.</section>")
-        return f"{key} changes", parts, JS
+        return "".join(parts)
     if res["commits"]:
         parts.append(f"<section class='panel'><b>{len(res['commits'])}{'+' if len(res['commits']) >= LOG_CAP else ''}"
                      " commit(s)</b><ul class='dv-commits'>"
@@ -755,7 +1092,9 @@ def page(runs, key, query):
         parts.append(f"<p class='why'>{esc(n)}.</p>")
     if not res["diff"].strip():
         parts.append("<section class='panel'>No changes.</section>")
-        return f"{key} changes", parts, JS
+        return "".join(parts)
+    # where the lines around a hunk come from ("Show more lines"): the commit diffed, or the folder
+    more = f"{href}/lines?" + urlencode({"repo": repo, "view": view, "rev": res["rev"]})
     data = json.dumps(res["diff"]).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     if view == "work":
         hint, review = _review(runs, key, st, repo)
@@ -769,5 +1108,6 @@ def page(runs, key, query):
         hint, review = "", ""
     parts += [hint, "<div class='dv-lay'><button type='button' class='btn sm' data-lay='side-by-side'>Side by side</button>"
               "<button type='button' class='btn sm' data-lay='line-by-line'>One column</button></div>",
-              f"<script type='application/json' id='dv-data'>{data}</script><div id='d2h'></div>", review]
-    return f"{key} changes", parts, ";" + _asset("diff2html.min.js") + ";" + JS
+              f"<script type='application/json' id='dv-data'>{data}</script>"
+              f"<div id='d2h' data-lines='{esc(more)}'></div>", review]
+    return "".join(parts)

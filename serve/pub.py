@@ -56,6 +56,7 @@ import diff_view  # noqa: E402
 import findings_view  # noqa: E402
 import findings_agent_view  # noqa: E402
 import page_memory  # noqa: E402
+import jira_view  # noqa: E402  (U3: takes TRACKER_TOKEN out of the environment at import)
 
 PUB_CSP = "sandbox allow-scripts allow-popups"
 INDEX_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
@@ -1029,7 +1030,9 @@ def make_handler(cfg):
             if bits[0] == "queue" and len(bits) <= 2 and r.queue_dir:
                 if len(bits) == 1:
                     self.send_runs(200, "harness: queue", runs_view.render_queue_page(r, done),
-                                   runs_view.LIVE_JS + findings_view.FINDINGS_JS, head, "queue")
+                                   runs_view.LIVE_JS + findings_view.FINDINGS_JS + jira_view.JS, head, "queue")
+                elif bits[1] == "jira":   # U3: the Jira panel's list (jira_view.panel_json)
+                    self.send_json(jira_view.panel_json(r, q), head)
                 elif bits[1] == "live":
                     self.send_json(runs_view.queue_live(r), head)
                 elif bits[1] == "branches":
@@ -1042,23 +1045,39 @@ def make_handler(cfg):
                     self.send(404, b"not found\n", head=head)
                 return
             if bits[0] == "ticket" and len(bits) in (2, 3):
-                if len(bits) == 2:
-                    got = runs_view.render_ticket(r, bits[1], done)
+                if len(bits) == 2 or bits[2] == "history":
+                    got = runs_view.render_ticket(r, bits[1], done, tab="history" if len(bits) == 3 else "ticket")
                     if got:
                         self.send_runs(200, f"harness: {got[0]}", got[1], runs_view.LIVE_JS, head, "queue")
+                        return
+                elif bits[2] == "agent":
+                    got = runs_view.render_ticket_agent(r, bits[1], (q.get("sid") or [""])[0][:80], self.oc_link())
+                    if got:
+                        self.send_runs(200, f"harness: {got[0]} agent", got[1], got[2], head, "queue")
+                        return
+                elif bits[2] == "diff" and q.get("body"):   # the page's content, fetched after its tabs
+                    got = diff_view.body(r, bits[1], q)
+                    if got is not None:
+                        self.send(200, got.encode(), "text/html; charset=utf-8", text, head)
                         return
                 elif bits[2] == "diff":
                     got = diff_view.page(r, bits[1], q)
                     if got:
                         self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head, "queue")
                         return
+                elif bits[2] == "lines":   # the Changes page's "Show more lines"
+                    code, got = diff_view.lines(r, bits[1], q)
+                    self.send(code, json.dumps(got).encode(), "application/json; charset=utf-8",
+                              {"Cache-Control": "no-store"}, head)
+                    return
                 elif bits[2] == "edit":
                     got = runs_view.render_ticket_edit(r, bits[1])
                     if got:
                         self.send_runs(200, f"harness: {got[0]}", got[1], "", head, "queue")
                         return
                 elif bits[2] == "live":
-                    got = runs_view.ticket_live(r, bits[1])
+                    got = runs_view.ticket_live(r, bits[1], "history" if (q.get("tab") or [""])[0] == "history"
+                                                else "ticket")
                     self.send_json(got if got else {"gone": "/runs/queue"}, head)
                     return
                 else:
@@ -1066,6 +1085,13 @@ def make_handler(cfg):
                     if data is not None:
                         self.send(200, data, extra=text, head=head)
                         return
+                if len(bits) == 2 or (bits[2] in ("history", "agent", "diff", "edit") and not q.get("body")):
+                    self.send_runs(404, "harness: not found", [   # a page: one with the nav and a way back
+                        f"<section class='panel'><h2>No ticket {html.escape(bits[1])}</h2><p class='muted'>It is not "
+                        "in the queue (or it was removed). Archived tickets are listed at the bottom of the queue "
+                        "page.</p><a class='btn' href='/runs/queue'>&larr; Back to the queue</a></section>"],
+                        "", head, "queue")
+                    return
                 self.send(404, b"not found\n", head=head)
                 return
             if bits[0] == "findings" and len(bits) in (2, 4) and bits[1] == "notes":
@@ -1346,7 +1372,7 @@ def make_handler(cfg):
             sys.stderr.write(f"[pub] queue {action} from {user or 'local'}: {msg}\n")
             if not ok and action == "add":   # the form again, with what was typed and why not
                 self.send_runs(409, "harness: queue", runs_view.render_queue_page(cfg.runs, form=form, err=msg),
-                               runs_view.LIVE_JS + findings_view.FINDINGS_JS, active="queue")
+                               runs_view.LIVE_JS + findings_view.FINDINGS_JS + jira_view.JS, active="queue")
                 return
             key = (form.get("back") or [""])[0]   # started from a ticket's page: back there
             back = f"/runs/ticket/{quote(key)}" if runs_view.KEY_RE.match(key) else "/runs/queue"

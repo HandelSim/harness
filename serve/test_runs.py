@@ -5,6 +5,7 @@ Run: python3 -m unittest serve/test_runs.py (tests/unit_serve_test.sh does).
 """
 
 import contextlib
+import html
 import http.client
 import io
 import json
@@ -107,7 +108,7 @@ PLAN_ITEMS = dict(
               {"id": "AC2", "text": "AC2: an empty log <script>alert(1)</script> is skipped", "given": "",
                "when": "", "then": "", "source": "edge of AC1", "edge": True},
               {"id": "AC3", "text": "AC3: GIVEN x WHEN y THEN z", "given": "x", "when": "y", "then": "z",
-               "source": "", "edge": False},
+               "source": "", "edge": False, "check": "test"},
               {"id": "AC1", "text": "a repeat"}, {"id": "bad id!", "text": "no good id"}, "nope", {"text": 3}],
     questions=[{"id": "Q1", "text": "[blocking] Q1: Which db?", "ask": "Which <db>?", "blocking": True,
                 "options": ["postgres", "sqlite <3>"], "default": "(b), because it is small"},
@@ -158,9 +159,23 @@ class RunsServer(unittest.TestCase):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.servers.append(srv)
         self.port = port
+        self.cfg = cfg
         return cfg
 
-    def req(self, method, path, body=None, headers=None):
+    def tabs(self, key="ABC-12"):
+        """The ticket's Ticket and History tabs as one body, once what the Ticket tab works
+        out in the background (the queue's retry choices) is in."""
+        self.req("GET", f"/runs/ticket/{key}")
+        for _ in range(200):
+            if not self.cfg.runs._pending:
+                break
+            time.sleep(0.05)
+        r, body = self.req("GET", f"/runs/ticket/{key}")
+        _, hist = self.req("GET", f"/runs/ticket/{key}/history")
+        return r, body + hist
+
+    def raw_req(self, method, path, body=None, headers=None):
+        """req without following the Changes page's deferred content."""
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         h = {"Host": f"127.0.0.1:{self.port}"}
         h.update(headers or {})
@@ -169,6 +184,15 @@ class RunsServer(unittest.TestCase):
         data = r.read()
         c.close()
         return r, data.decode("utf-8", "replace")
+
+    def req(self, method, path, body=None, headers=None):
+        r, text = self.raw_req(method, path, body, headers)
+        # the Changes page paints its tabs and fetches the rest (?body=1), as its script does
+        got = re.search(r"<div id='dv-body' aria-busy='true' data-src='([^']+)'>", text)
+        if method == "GET" and r.status == 200 and got:
+            _, rest = self.req("GET", html.unescape(got.group(1)), headers=headers)
+            text += rest
+        return r, text
 
     def ticket(self, **st):
         base = {"key": "ABC-12", "project": "/p", "base": "main", "status": "needs-answers", "stage": "plan",
@@ -276,7 +300,7 @@ class RunsTest(RunsServer):
 
     def test_ticket_page(self):
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertEqual(r.status, 200)
         self.assertIn("verifier: pass &lt;ok&gt;", body)
         self.assertNotIn("Stage outputs", body)   # the agent CLI's own output: a link on its attempt only
@@ -302,7 +326,7 @@ class RunsTest(RunsServer):
                     debug={"dir": "20261030-120000-ABC-12", "stage": "implementing", "verdict": "harness-change-needed",
                            "harness_change": True, "retried": False, "secret": "x"})
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertEqual(r.status, 200)
         self.assertIn("Debug agent (implementing block)", body)
         self.assertIn("harness should change", body)
@@ -324,7 +348,7 @@ class RunsTest(RunsServer):
             self.assertEqual(r.status, 404, path)
         # a bad debug in state.json: no panel, the page still up
         self.ticket(status="blocked", debug={"dir": "../../etc", "verdict": 3})
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertEqual(r.status, 200)
         self.assertNotIn("Debug agent (", body)
 
@@ -499,7 +523,7 @@ class RunsTest(RunsServer):
     def test_ticket_page_shows_questions_attempts_and_notes(self):
         self.ticket()
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertEqual(r.status, 200)
         self.assertIn("<div class='q blocking'>Which &lt;db&gt;?</div>", body)
         self.assertIn("name='q0' value='Which &lt;db&gt;?'", body)
@@ -517,20 +541,20 @@ class RunsTest(RunsServer):
         self.assertIn("<div class='glance'><article class='md'><h3>Goal</h3>\n<p>Fix it.</p>", body)
         self.assertIn("<details class='doc' data-k='qplan'><summary>The whole plan", body)   # folded under it
         self.ticket(status="plan-review", questions=[])
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("action='/runs/ticket/ABC-12/approve'", body)
         self.assertIn("Approve the plan, or send feedback", body)   # a free feedback box
         self.assertIn("How notes reach the agents", body)            # the notes panel says how they are passed
         self.ticket(status="plan-review", questions=[], notes=[{"at": "2026-11-01T10:00:00Z", "text": "old"},
                                                               {"at": "2026-11-02T10:00:00Z", "text": "new"}])
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertLess(body.index("<span class='at'>#2 &middot; "), body.index("<span class='at'>#1 &middot; "))
         self.assertIn("<div class='glance'>", body)                 # the plan to approve, beside it
         self.assertIn("Send feedback and plan again", body)
         self.assertNotIn("Go with the defaults", body)
         # blocked at review: no planner's questions, a note that re-plans, and Retry runs review as is
         self.ticket(status="blocked", stage="review", reason="the <review> found a bug")
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("Get it going again", body)
         self.assertIn("It stopped at review: the &lt;review&gt; found a bug.", body)
         self.assertIn("Send and plan again", body)
@@ -539,11 +563,11 @@ class RunsTest(RunsServer):
         self.assertIn("<button type='submit' title='queue it again at the stage it stopped at, as it is'>Retry"
                       "</button>", body)
         self.ticket(status="blocked", stage="review", stages=["implement", "review"])
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("Send and run review again", body)
         self.ticket(status="running", attempt=1)
         self.run_on(stage="plan", step="asking the <verifier>")
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertNotIn("/answer'", body)
         self.assertNotIn("/retry'", body)
         self.assertIn("action='/runs/ticket/ABC-12/stop'", body)   # a running ticket can be stopped
@@ -551,7 +575,7 @@ class RunsTest(RunsServer):
         self.assertIn("plan, attempt 2: asking the &lt;verifier&gt;", body)   # what the run is doing in it
         # left running by a run that is gone (killed, its window closed): not shown as running
         os.remove(os.path.join(self.queue, "run.json"))
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("run ended</span>", body)
         self.assertIn("the queue run ended while it was at plan; start the queue to carry on there", body)
         self.assertIn("action='/runs/queue/start'", body)          # the queue page's Start, here
@@ -562,7 +586,7 @@ class RunsTest(RunsServer):
         r, body = self.req("GET", "/runs/queue")
         self.assertIn("run ended</span>", body)
         self.run_on("ABC-1")   # a run on another ticket takes this one again in its turn
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("the run going now takes it again there", body)
         # or it is queued again now, from the stage picked: no run has it in hand
         self.assertIn("Queue again</button>", body)
@@ -570,7 +594,7 @@ class RunsTest(RunsServer):
         self.assertEqual(r.status, 303, body)
         self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "plan"))
         self.assertNotIn("the queue is not running", r.getheader("Location"))   # the run takes it
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertNotIn("action='/runs/queue/start'", body)
 
     def test_answering_on_the_page_saves_the_answers_and_requeues(self):
@@ -676,6 +700,9 @@ class RunsTest(RunsServer):
                       "<dd>it is &lt;b&gt;ok&lt;/b&gt;</dd>", body)
         self.assertIn("<div class='src'>from the ticket: &ldquo;parse &lt;logs&gt;&rdquo;</div>", body)
         self.assertIn("<div class='fb edge'><div class='q'>AC2 <span class='tag'>edge case of AC1</span></div>", body)
+        self.assertIn("<div class='q'>AC3 <span class='tag' title='a test shows it'>checked by a test</span></div>",
+                      body)   # the criterion's check type
+        self.assertNotIn("the reviewer judges", body)   # none is [check: review]
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt; is skipped", body)   # not GIVEN-shaped: as written
         self.assertNotIn("<script>alert(1)", body)
         self.assertIn("name='ac.AC1' value='accept' checked>Accept</label>", body)
@@ -834,7 +861,7 @@ class RunsTest(RunsServer):
             f.write("# Parse logs\n\nThe ticket.\n")
         self.ticket(status="done", stage="done", questions=[])
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("Agent's state note", body)
         self.assertIn("<h2>Done</h2>\n<ul>\n<li>parsed &lt;logs&gt;</li>", body)
         self.assertIn("<summary>The ticket", body)
@@ -883,7 +910,7 @@ class RunsTest(RunsServer):
                     push={"result": "local", "branch": "ABC-12", "sha": "", "remote": "", "url": "", "error": ""},
                     commits=[], diffstat={"files": 2, "insertions": 9, "deletions": 1})
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("<h2>Rounds <span class='muted'>2</span></h2>", body)
         self.assertIn(f"<b>Round 1</b><span class='muted'>{runs._local('2026-10-29T10:00:00Z')} &middot; 3 commits &middot; 2 file(s), +9 "
                       "&minus;1 &middot; kept on this computer: not pushed</span>", body)
@@ -1265,7 +1292,7 @@ class QueuePageTest(RunsServer):
             f.write("## Goal\n\nFix it.\n")
         self.ticket(project=proj, status="done", stage="done", base_sha=main, made_branch=True, questions=[])
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("Run again</button>", body)
         self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["implement", "review", "push"])
         self.assertIn("not from the start: ABC-12&#x27;s branch ABC-12 has commits that main does not "
@@ -1283,13 +1310,13 @@ class QueuePageTest(RunsServer):
         os.remove(os.path.join(self.queue, "ABC-12", "plan.md"))
         self.ticket(project=proj, status="blocked", stage="plan", made_branch=True, questions=[],
                     reason="the branch has commits")
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertNotIn("action='/runs/ticket/ABC-12/retry'", body)
         self.assertIn("Retry: ABC-12&#x27;s branch ABC-12 has commits that main does not", body)
         self.assertIn("delete it (here and on the remote, then git fetch --prune)", body)
         # the queue's module not to be had (an older checkout): every stage, as before (test: only its own)
         with mock.patch.object(runs, "_tq", lambda: None):
-            r, body = self.req("GET", "/runs/ticket/ABC-12")
+            r, body = self.tabs("ABC-12")
         self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.DEFAULT_STAGES])
 
     def test_start_from_a_ticket_goes_back_to_it(self):
@@ -1372,7 +1399,7 @@ class QueuePageTest(RunsServer):
         self.assertIn(">in your folder</span>", body)
         self.assertIn(">plan approval</span>", body)
         self.assertIn(">on feat/x</span>", body)
-        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        r, body = self.tabs("ABC-7")
         self.assertIn("works <b>in your project folder</b>", body)
         self.assertIn("after the plan <b>waits for your approval</b>", body)
         r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", proj), ("after_plan", "go")])
@@ -1387,7 +1414,7 @@ class QueuePageTest(RunsServer):
             self.assertIsNone(json.load(f).get("plan_review"))
         info = runs.project_branches(proj)
         self.assertEqual((info["current"], info["remotes"], info["defaults"]), ("main", [], []))
-        r, body = self.req("GET", "/runs/ticket/ABC-9")
+        r, body = self.tabs("ABC-9")
         self.assertIn("after the plan <b>goes straight on</b>", body)
         r, body = self.post("/runs/queue/add", [("keys", "ABC-8"), ("project", proj), ("preset", "review"),
                                                 ("branch", "a..b")])
@@ -1420,7 +1447,7 @@ class QueuePageTest(RunsServer):
             self.assertEqual(r.status, 303, body)
             self.assertEqual(calls.pop()[-1], "--no-plan-approval")
         self.ticket(status="queued", take_defaults=True, plan_review=False)
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("after the plan <b>takes each question's default and goes on</b>", body)
 
     def test_a_ticket_shows_its_settings_and_edits_them_before_its_work_starts(self):
@@ -1428,7 +1455,7 @@ class QueuePageTest(RunsServer):
         self.start()
         r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("branch", "feat/x")])
         self.assertEqual(r.status, 303, body)
-        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        r, body = self.tabs("ABC-7")
         self.assertIn("<h2>Settings</h2><a class='btn sm' href='/runs/ticket/ABC-7/edit'>Edit settings</a>", body)
         self.assertIn("branch <b>feat/x</b>", body)
         self.assertIn("Nothing has run yet: every setting can change.", body)
@@ -1484,7 +1511,7 @@ class QueuePageTest(RunsServer):
     def test_a_started_ticket_changes_only_the_stages_to_come_and_after_the_plan(self):
         self.ticket(status="needs-answers", stage="implement", start_sha="a" * 40, plan_review=True)
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("href='/runs/ticket/ABC-12/edit'>Edit settings</a>", body)
         self.assertIn("Its work has started", body)
         r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
@@ -1510,7 +1537,7 @@ class QueuePageTest(RunsServer):
         self.ticket(status="running", stage="plan", start_sha="a" * 40)
         self.run_on()
         self.start()
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("<h2>Settings</h2>", body)
         self.assertNotIn("Edit settings", body)
         self.assertIn("It is running: stop it to change its settings.", body)
@@ -1649,7 +1676,7 @@ class QueuePageTest(RunsServer):
         with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
             st = json.load(f)
         self.assertEqual((st["stages"], st["start"], st["stage"]), (["review"], "ABC-7-work", "review"))
-        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        r, body = self.tabs("ABC-7")
         self.assertIn("the fix is on &lt;ABC-7-work&gt;", body)
         self.assertNotIn("<ABC-7-work>", body)
         r, body = self.req("GET", "/runs/queue")
@@ -1657,7 +1684,7 @@ class QueuePageTest(RunsServer):
         # notes, move, stop, retry, remove on the ticket
         r, _ = self.post("/runs/ticket/ABC-7/note", [("text", "keep the API")])
         self.assertEqual(r.status, 303)
-        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        r, body = self.tabs("ABC-7")
         self.assertIn("keep the API", body)
         r, _ = self.post("/runs/ticket/ABC-8/move", [("where", "top"), ("back", "queue")])
         self.assertEqual((r.status, r.getheader("Location").split("?")[0]), (303, "/runs/queue"))
@@ -2127,7 +2154,7 @@ class QueuePageTest(RunsServer):
         self.assertNotIn("href='/runs/debug/runs/20261103-130000-ABC-12'", body)
         self.ticket(status="blocked", stage="implementing", reason="x",
                     debug={"dir": "20261103-120000-ABC-12", "stage": "implementing", "verdict": "fixed"})
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn(f"href='/runs/{ROOT}'>its session</a>", body)
 
     def test_a_queue_session_has_a_stop_button_and_the_host_an_opencode_link(self):
@@ -2165,6 +2192,171 @@ class QueuePageTest(RunsServer):
             r, _ = self.post(path)
             self.assertEqual(r.status, 401, path)
         self.assertEqual(self.state()["status"], "needs-answers")
+
+
+class TicketTabsTest(RunsServer):
+    """One page per ticket: the same header and tabs on Ticket, Changes, Agent and History."""
+
+    def test_every_tab_has_the_header_and_marks_itself(self):
+        self.ticket(title="Fix <the> parser")
+        self.start()
+        for suffix, name in (("", "Ticket"), ("/diff", "Changes"), ("/agent", "Agent"), ("/history", "History")):
+            r, body = self.req("GET", "/runs/ticket/ABC-12" + suffix)
+            self.assertEqual(r.status, 200, suffix)
+            self.assertIn("<nav class='ttabs' aria-label='ticket'>", body, suffix)
+            self.assertIn(f" class='on' aria-current='page'>{name}</a>", body, suffix)
+            self.assertEqual(body.count("aria-current='page'>"), 2, suffix)   # the top bar's and the tab's
+            self.assertIn("<h1>ABC-12</h1><span class='tktitle'>Fix &lt;the&gt; parser</span>", body, suffix)
+            self.assertIn("<a href='/runs/queue'>&larr; Queue</a>", body, suffix)
+
+    def test_the_one_action_a_ticket_needs(self):
+        self.start()
+        for st, want in ((dict(status="needs-answers"), "#r-qs'>Answer the questions</a>"),
+                         (dict(status="plan-review"), "#r-qs'>Review the plan</a>"),
+                         (dict(status="blocked", reason="x"), "#r-acts'>See why it stopped</a>"),
+                         (dict(status="blocked", packet={"reason": "r"}), "#packet'>Decide</a>"),
+                         (dict(status="running", stage="implement"), "/agent'>Watch the agent</a>"),
+                         (dict(status="done", stage="done"), "/diff'>Review the changes</a>"),
+                         (dict(status="queued"), "#r-start'>Start the queue</a>"),
+                         (dict(status="stopped", stage="implement"), "#r-acts'>Resume</a>")):
+            self.ticket(**st)
+            if st["status"] == "running":
+                self.run_on(stage="implement")
+            elif os.path.exists(os.path.join(self.queue, "run.json")):
+                os.remove(os.path.join(self.queue, "run.json"))
+            _, body = self.req("GET", "/runs/ticket/ABC-12/history")
+            self.assertIn("<a class='btn primary tkgo' href='/runs/ticket/ABC-12" + want, body, st)
+            self.assertEqual(body.count("class='btn primary tkgo'"), 1, st)
+
+    def test_a_blocked_ticket_shows_the_queues_decision_packet(self):
+        crit = [{"id": "AC1", "verdict": "PASS", "quote": "parse() <ok>"}, {"id": "AC2", "verdict": "FAIL"},
+                {"id": "AC3", "verdict": "UNKNOWN"}, "junk", {"verdict": "PASS"}]
+        self.ticket(status="blocked", stage="fix", packet={
+            "reason": "2 open item(s) after 3 fix round(s)", "question": "Push it as it is?",
+            "default": "harness queue retry ABC-12 --stage push", "criteria": crit,
+            "rounds": ["round 0: 2 exec, 0 opinion; AC1 PASS at 0123", {"bad": 1}], "best_commit": "0123456789abcdef"},
+            review_verdicts=[{"round": 0, "criteria": crit}])
+        self.start()
+        _, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<section class='panel packet' id='packet'><h2>Decision needed</h2>"
+                      "<p>2 open item(s) after 3 fix round(s)</p><p><b>Push it as it is?</b></p>", body)
+        self.assertIn("<summary>From the command line</summary><code>harness queue retry ABC-12 --stage push</code>", body)
+        # the default is a button: push as it is (the retry form at the stage it names)
+        self.assertIn("<form method='post' action='/runs/ticket/ABC-12/retry'><input type='hidden' name='stage' "
+                      "value='push'><button type='submit' class='primary'>Push it as it is</button></form>", body)
+        self.assertIn("<a class='btn' href='/runs/ticket/ABC-12/diff'>Comment on the changes for a fix</a>", body)
+        self.assertIn("<a class='btn' href='#again'>Say what should change</a>", body)
+        self.assertIn("class='qs' id='again'>", body)
+        self.assertIn("<li><b>AC1</b> <span class='pill t-ok'>PASS</span> <q>parse() &lt;ok&gt;</q></li>", body)
+        self.assertIn("<li><b>AC2</b> <span class='pill t-bad'>FAIL</span></li>", body)
+        self.assertIn("<span class='pill t-wait'>UNKNOWN</span>", body)
+        self.assertIn("<li>round 0: 2 exec, 0 opinion; AC1 PASS at 0123</li>", body)
+        self.assertIn("<span>best commit <b>0123456789ab</b></span>", body)
+        self.assertNotIn("Review verdicts", body)   # the packet shows them
+        _, live = self.req("GET", "/runs/ticket/ABC-12/live")
+        self.assertIn("Decision needed", json.loads(live)["regions"]["packet"])
+
+    def test_no_packet_or_a_broken_one_shows_nothing_and_verdicts_show_alone(self):
+        for pk in (None, "x", [], {"criteria": "x", "rounds": 3}):
+            self.ticket(status="blocked", packet=pk)
+            time.sleep(0.01)
+            if not self.servers:
+                self.start()
+            r, body = self.req("GET", "/runs/ticket/ABC-12")
+            self.assertEqual(r.status, 200, pk)
+            self.assertNotIn("Decision needed", body, pk) if pk != {"criteria": "x", "rounds": 3} else None
+        self.ticket(status="blocked", review_verdicts=[{"round": 0, "criteria": [{"id": "AC1", "verdict": "FAIL"}]}])
+        time.sleep(0.01)
+        _, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<h2>Review verdicts</h2><ul class='verdicts'><li><b>AC1</b> <span class='pill t-bad'>FAIL",
+                      body)
+
+    def test_the_history_tab_polls_its_own_regions(self):
+        self.ticket()
+        self.start()
+        _, body = self.req("GET", "/runs/ticket/ABC-12/history")
+        self.assertIn("data-live='/runs/ticket/ABC-12/live?tab=history'", body)
+        _, hist = self.req("GET", "/runs/ticket/ABC-12/live?tab=history")
+        _, tick = self.req("GET", "/runs/ticket/ABC-12/live")
+        hist, tick = json.loads(hist)["regions"], json.loads(tick)["regions"]
+        self.assertIn("rounds", hist)
+        self.assertNotIn("qs", hist)
+        self.assertIn("qs", tick)
+        self.assertNotIn("rounds", tick)
+        self.assertIn("aria-current='page'>History</a>", hist["head"])
+        self.assertIn("aria-current='page'>Ticket</a>", tick["head"])
+
+    def test_the_agent_tab_shows_the_tickets_session_and_picks_another(self):
+        self.ticket(status="running", stage="implement")
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12/agent")
+        self.assertEqual(r.status, 200)
+        self.assertIn("aria-current='page'>Agent</a>", body)
+        self.assertIn(f"data-sid='{QSES}'", body)   # its one session, so no picker
+        self.assertNotIn("class='spick'", body)
+        r, body = self.req("GET", f"/runs/ticket/ABC-12/agent?sid={QSES}")
+        self.assertEqual(r.status, 200)
+        self.assertIn(f"data-sid='{QSES}'", body)
+        r, body = self.req("GET", "/runs/ticket/NOPE-1/agent")
+        self.assertEqual(r.status, 404)
+        self.assertIn("<h2>No ticket NOPE-1</h2>", body)   # a page with the nav, not a bare "not found"
+        self.assertIn("href='/runs/queue'>&larr; Back to the queue</a>", body)
+        r, body = self.raw_req("GET", "/runs/ticket/NOPE-1/diff?body=1")
+        self.assertEqual(r.status, 404)   # what a page's script fetches stays plain
+        self.assertNotIn("No ticket", body)
+
+    def test_a_session_of_a_ticket_has_the_tickets_tabs(self):
+        self.ticket(status="running", stage="implement")
+        self.start()
+        _, body = self.req("GET", f"/runs/{QSES}")
+        self.assertIn("<nav class='ttabs' aria-label='ticket'>", body)
+        self.assertIn("aria-current='page'>Agent</a>", body)
+
+    def test_a_plan_with_no_steps_section_renders(self):
+        with open(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-12-plan.md"), "w") as f:
+            f.write("## Goal\n\nFix it.\n\n## Acceptance criteria\n\n- AC1: it works\n")
+        self.ticket(status="queued")
+        self.start()
+        for suffix in ("", "/history", "/agent"):
+            r, body = self.req("GET", "/runs/ticket/ABC-12" + suffix)
+            self.assertEqual(r.status, 200, suffix)
+        _, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("AC1: it works", body)
+
+    def test_the_cache_sees_a_rewrite_in_the_same_second(self):
+        self.ticket(status="queued")
+        cfg = self.start()
+        self.assertEqual(cfg.runs.ticket_state("ABC-12")["status"], "queued")
+        self.ticket(status="stopped")   # the same size or not, within the clock's tick: read again
+        self.assertEqual(cfg.runs.ticket_state("ABC-12")["status"], "stopped")
+        old = time.time() - 60
+        os.utime(os.path.join(self.queue, "ABC-12", "state.json"), (old, old))
+        self.assertEqual(cfg.runs.ticket_state("ABC-12")["status"], "stopped")
+        calls = []
+        self.assertEqual(cfg.runs.memo("t", 1, (os.path.join(self.queue, "ABC-12", "state.json"),),
+                                       lambda: calls.append(1) or len(calls)), 1)
+        self.assertEqual(cfg.runs.memo("t", 1, (os.path.join(self.queue, "ABC-12", "state.json"),),
+                                       lambda: calls.append(1) or len(calls)), 1)   # an old file: kept
+
+    def test_the_queue_row_has_one_action_and_the_rest_under_more(self):
+        self.ticket(status="blocked", stage="implement", reason="x")
+        self.start()
+        _, body = self.req("GET", "/runs/queue")
+        row = body[body.index("data-sort-key='ABC-12'"):]
+        row = row[:row.index("</details>")]
+        ra = row[row.index("<div class='ra'>"):row.index("<details")]
+        self.assertEqual(ra.count("<button") + ra.count("<a class='btn"), 1, ra)
+        self.assertIn("<details class='more' data-k='more-ABC-12'>", row)
+        self.assertIn("Remove</button>", row)
+        self.assertIn("Archive</button>", row)
+
+    def test_the_queue_page_renders_without_the_jira_panel(self):
+        self.ticket()
+        self.start()
+        with mock.patch.dict(sys.modules, {"jira_view": None}):
+            r, body = self.req("GET", "/runs/queue")
+        self.assertEqual(r.status, 200)
+        self.assertIn("id='r-tickets'", body)
 
 
 class TestStageServeTest(RunsServer):
@@ -2222,12 +2414,12 @@ class TestStageServeTest(RunsServer):
         self.assertEqual(st["stages"], list(runs.DEFAULT_STAGES))
         strip = runs.stage_strip({k: v for k, v in st.items() if k != "stages"})
         self.assertEqual(re.findall(r"<span>(\w+)</span>", strip), list(runs.DEFAULT_STAGES))
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("stages <b>plan &rarr; implement &rarr; review &rarr; fix &rarr; push</b>", body)
         self.assertNotIn("<span>test</span>", body)
         self.assertNotIn("<option value='test'", body)   # not a stage of this ticket's to go again at
         with mock.patch.object(runs, "_tq", lambda: None):
-            r, body = self.req("GET", "/runs/ticket/ABC-12")
+            r, body = self.tabs("ABC-12")
         self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.DEFAULT_STAGES])
         self.assertEqual(runs._edit_values("ABC-12", {})["preset"], ["full"])
         self.assertNotIn("stage_test", runs._edit_values("ABC-12", {}))
@@ -2252,7 +2444,7 @@ class TestStageServeTest(RunsServer):
         self.ticket(status="blocked", stage="test", stages=list(runs.STAGES), reason="it failed", questions=[])
         self.start()
         with mock.patch.object(runs, "_tq", lambda: None):
-            r, body = self.req("GET", "/runs/ticket/ABC-12")
+            r, body = self.tabs("ABC-12")
         self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.STAGES])
         self.assertIn("<option value='test' selected>test</option>", body)
         self.assertIn("stages <b>plan &rarr; test &rarr; implement &rarr; review &rarr; fix &rarr; push</b>", body)
@@ -2378,6 +2570,21 @@ class DiffPageTest(RunsServer):
         m = re.search(r"<script type='application/json' id='dv-data'>(.*?)</script>", body, re.S)
         return json.loads(m.group(1)) if m else ""
 
+    def test_the_tabs_come_first_and_the_diff_after(self):
+        # the page itself runs no git: its content (?body=1) is fetched by its script
+        with mock.patch.object(diff_view, "_git", side_effect=AssertionError("git on the page")):
+            r, shell = self.raw_req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
+        self.assertEqual(r.status, 200)
+        self.assertIn(">Changes</a>", shell)
+        self.assertIn("data-src='/runs/ticket/ABC-12/diff?view=uncommitted&amp;body=1'", shell)
+        self.assertNotIn("id='d2h'", shell)
+        r, part = self.raw_req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted&body=1")
+        self.assertEqual(r.status, 200)
+        self.assertIn("id='d2h'", part)
+        self.assertNotIn("<html", part)
+        r, _ = self.raw_req("GET", "/runs/ticket/ABC-99/diff?body=1")
+        self.assertEqual(r.status, 404)
+
     def test_the_tickets_work_and_the_repository_pick(self):
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("href='/runs/ticket/ABC-12/diff'>Changes</a>", body)
@@ -2470,7 +2677,7 @@ class DiffPageTest(RunsServer):
                     owner_reviews=sent)
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
         self.assertIn("data-sent='1:2026-11-01T10:00:00Z'", body)   # a new batch drops the browser's sent draft
-        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        r, body = self.tabs("ABC-12")
         self.assertIn("Your review comments <span class='muted'>1</span>", body)
         self.assertIn("1 comment to the fixer", body)
         self.assertIn("no &lt;b&gt;bold&lt;/b&gt;", body)

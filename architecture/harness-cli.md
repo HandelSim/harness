@@ -776,6 +776,32 @@ ticket page uses), `followup KEY ["TEXT"]` (same input rules; see
 `--item`; see "Owner review comments" below), `findings`, `watch` (tails `run.log`) and `log
 [KEY]` are the owner's side.
 
+Spec and loop (plan, implement, review, fix). The plan is a spec: Goal, How it
+works, Not included, Acceptance criteria each ending `[check: cmd|test|review|human]`
+(`criterion()`'s `check`), at most `SPEC_QUESTIONS` 3 Questions tagged
+`[blocking]`/`[non-blocking]` with `Recommended:` (read as the default), Assumptions;
+no `## Steps` (an old plan's still parses, `plan_items`). `spec_problems` (asked
+again on a retry, a note on the last try, like `shape_problems`) wants each of
+those and a cmd/test criterion or an Assumption `No executable check: <why>`.
+Defaults taken without the owner are listed in `defaults_applied`. `implement.md`
+is also the fix round's prompt (`implement_words(fix=True)`: the Must fix items as
+"Findings to address"; fix.md is gone). An agent that ends with a line
+`BLOCKED: <why>` (`blocked_line`, only after the prompt's last `<<<END_` block)
+blocks the ticket with `no_go_on` and a `packet`. The review writes
+`## Criteria` lines (`AC1: PASS | `quote` | why`, FAIL, UNKNOWN; `review_verdicts`)
+and tags Must fix items `[exec]`/`[opinion]`; each PASS quote is looked for in the
+change's added lines (`quote_checked`, judge's rules): a miss is asked once more
+per round, then UNKNOWN. After a fix the review runs again (`fix_rounds`);
+`review_decision` gives another round only for [exec] items or unmet criteria,
+with fewer open items than before and no PASS gone back, up to `FIX_ROUNDS` 2;
+else opinion items left go to the result note (`open_opinions`) and unmet ones
+block with `packet`. Each round is a `review_verdicts` entry, with
+verify_change's last verdict (`verify_record`) beside it: shadow, verify_change
+still decides. History entries carry the agent call's `start`, `prompt`
+(sha256[:12]), `round` and `verifier` calls; `requeue(action=)`, `cmd_edit` and
+`cmd_remove` append `owner_actions`; `stats [--json]` (`cmd_stats`) sums them,
+removed tickets from `removed.json`.
+
 `edit KEY [add's options] [--no-repo-branches]` (`cmd_edit`) changes only the
 settings given; an empty value (`--branch ''`) puts it back to add's default.
 Add and edit share `settle` (every check add makes, so an edit can never store
@@ -1421,7 +1447,7 @@ list (the run viewer's Changes page): `{"text"}`, or `{"path", "line",
 line becomes `repo/path:…`, from the top where the fixer works; the line
 numbers are the files' as on disk, `old` the base's or the snapshot's, or
 with `"at": "HEAD"`, one made on the uncommitted view, HEAD's: the line
-says `(old, at HEAD)` and fix.md's words say how to read each side).
+says `(old, at HEAD)` and the fix round's words say how to read each side).
 `owner_item` makes each one Must fix line, `path:line (side) "the line":
 comment` (the comment's whitespace collapsed, at most `FIX_ITEM_CAP` 2,000
 characters; the line cut at 160; runs of `<`/`>` broken up so no text can
@@ -2364,6 +2390,21 @@ offered as suggestions. It is taken as pasted: quotes
   stage, then every session newest first. The index shows the live ones in
   an "Agent runs" panel, under a line saying what the queue run is on (or
   that none is going) and how many tickets are queued and waiting on you.
+- One page per ticket, as tabs (`runs.ticket_tabs(runs, key, active)`, the
+  same header on each: key, title, status, stage strip, the one action it
+  needs now, `_primary`): Ticket `/runs/ticket/<KEY>` (actions, questions,
+  the queue's decision `packet` with its answers as buttons and `review_verdicts`, the result, ticket and
+  plan notes), Changes `/diff`, Agent `/agent?sid=` (the live or latest
+  stage session, a picker of the others; a ticket's session page `/runs/<id>`
+  shows the same tabs), History `/history` (settings, sessions, attempts,
+  rounds, notes, docs, the log; its poll is `/live?tab=history`); an unknown
+  ticket's page is a 404 page with the nav and a way back. The queue
+  page's rows show one action, the rest under a More menu. Reads go
+  through one cache (`Runs.memo`: keyed by the files' stat, a file changed
+  in the last second read again); the queue's git checks
+  (`retry_choices` and the other `*_refused`) are cached 60 s per ticket
+  state, and on the Ticket tab worked out in the background, the poll
+  bringing the answer.
 - `/runs/ticket/<KEY>`: status and why, the stage strip, a Result panel
   once `state.json` has `push` (where the branch went, an "Open a pull
   request" link from `compare_url` when it is an http(s) one, the diffstat,
@@ -2466,8 +2507,19 @@ offered as suggestions. It is taken as pasted: quotes
   older than the machine's boot (`left_by_restart`, `/proc/stat` btime) is
   taken away, in place (`in_place_trouble`) and in a ticket's clone before
   each stage.
+- The queue page's Jira panel (`serve/jira_view.py`, above the tickets): the charter
+  tracker's open sprint and backlog in rank order (`/runs/queue/jira?list=sprint|backlog&mine=1`,
+  JSON; `/rest/api/3/search/jql` on `*.atlassian.net`, `/rest/api/2/search` otherwise, each
+  falling back to the other on 404/410; 8 s limit; 60 s cache refreshed in the background, so
+  the page never waits on Jira). The project is the literal prefix of `ticket_pattern`, else the
+  queue's most-used key prefixes. A queued row shows its status; Add posts the Add form's
+  settings with `kind=jira` to `/runs/queue/add`; a row Done in Jira has no Add, and an error hides the
+  add tools behind a Try again. `cmd_serve` hands `TRACKER_TOKEN` to pub.py
+  alone, and `jira_view` removes it from the environment at import.
 - `/runs/ticket/<KEY>/diff?repo=&view=` (`serve/diff_view.py`, "Changes" on
-  the ticket page): a diff drawn in the browser by the vendored diff2html
+  the ticket page): the page is the ticket's tabs and a placeholder its script fills from
+  `?body=1` (`diff_view.body`), so the git calls behind a diff do not hold up the tab; the
+  project's nested repositories are scanned at most every 5 minutes (`runs.memo`). A diff drawn in the browser by the vendored diff2html
   3.4.56 (`serve/vendor/diff2html/`, MIT; its JS and CSS inlined, the JS
   under the page's nonce), side by side or one column (remembered per
   browser). The page takes the window's full width and a long line wraps
@@ -2522,6 +2574,20 @@ offered as suggestions. It is taken as pasted: quotes
   KEY --stdin`; a refusal links back to the Changes page, draft intact.
   The JS builds every node with `textContent`; the file of a line comes
   from `Diff2Html.parse` in the order the file wrappers are drawn.
+  "Show 10 more lines" (and "Show all N" under 30) sits in each hunk's
+  header row and in a row after a file's last hunk (not on new, deleted
+  or binary files): it fetches `/runs/ticket/<KEY>/lines?repo=&view=&rev=
+  &path=&from=&to=` (`diff_view.lines`, JSON, at most 500 lines) and
+  `dvHunks` (`HUNKS_JS`) adds them to that file's diff text as context,
+  moving the hunk's header (both sides' numbers follow from it) and
+  joining a hunk the lines reach; only that file is drawn again, the
+  scroll kept, and the new lines take comments like any other. The lines
+  are the new side's: `rev` is the commit the page diffed (`changes`
+  diffs a sha, not the branch, and says it in `data-lines`), which must
+  be the tip or between the base and it; the uncommitted view and a part
+  left uncommitted read the file in the folder (no symlink, inside it).
+  The path must be one `git diff --name-status` of that view lists as
+  changed or moved, neither name a secret; the repo one of the ticket's.
 - `/runs/<sid>`: the transcript (text, thinking, each tool call with input,
   output, status and timing, subtasks, retries, errors; a file change as its
   diff from opencode's tool metadata, a `todowrite` as a checklist), crumbs

@@ -275,6 +275,29 @@ main.rv { max-width: 1280px; gap: 18px; padding-top: 22px; }
 .ph { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; min-width: 0; }
 .ph h1 { font-size: 22px; font-weight: 680; letter-spacing: -.01em; overflow-wrap: anywhere; }
 .ph .sub { flex-basis: 100%; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+.tkh { gap: 8px 12px; }
+.tkh .crumbs { flex-basis: 100%; }
+.tkh .tktitle { font-size: 16px; color: var(--ink); font-weight: 550; overflow-wrap: anywhere; min-width: 0; }
+.tkh .tkgo { margin-left: auto; }
+.tkh .tkstrip { flex-basis: 100%; }
+.ttabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); overflow-x: auto; margin-top: -6px; }
+.ttabs a { padding: 9px 14px; color: var(--muted); font-weight: 550; font-size: 14px; white-space: nowrap;
+  border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.ttabs a:hover { color: var(--ink); text-decoration: none; }
+.ttabs a.on { color: var(--ink); border-bottom-color: var(--accent); }
+.spick { display: flex; gap: 6px; flex-wrap: wrap; }
+.spick a { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--line); font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.spick a.on { color: var(--ink); border-color: var(--accent); }
+.spick a:hover { text-decoration: none; color: var(--ink); }
+h2.sesh { font-size: 16px; font-weight: 620; overflow-wrap: anywhere; }
+.verdicts { list-style: none; padding: 0; margin: 6px 0; display: grid; gap: 6px; }
+.verdicts q { color: var(--muted); }
+.packet { border-color: var(--bad); }
+div[id^='r-']:empty { display: none; }   /* an empty live region takes no gap */
+.packet p { margin: 4px 0 8px; } .packet .acts { margin-top: 12px; } .packet h2 { margin-bottom: 6px; }
+.packet summary { font: 13px var(--sans); color: var(--muted); cursor: pointer; margin-top: 6px; }
+.packet ul.plain { margin: 6px 0 0 18px; padding: 0; font-size: 13px; color: var(--ink-2); }
 .crumbs { display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; font-size: 13px; color: var(--muted);
   flex-basis: 100%; min-width: 0; }
 .crumbs a { color: var(--muted); } .crumbs a:hover { color: var(--ink); }
@@ -352,6 +375,13 @@ details.arch > summary h2::before { content: "\\25B8  "; color: var(--faint); }
 details.arch[open] > summary h2::before { content: "\\25BE  "; }
 .tk.arch .key a { color: var(--muted); }
 .ra form { margin: 0; }
+.ra details.more { position: relative; }
+.ra details.more > summary { list-style: none; cursor: pointer; letter-spacing: 1px; }
+.ra details.more > summary::-webkit-details-marker { display: none; }
+.ra details.more .menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 5; display: flex;
+  flex-direction: column; gap: 4px; padding: 6px; min-width: 150px; background: var(--panel);
+  border: 1px solid var(--line-2); border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.14); }
+.ra details.more .menu button { width: 100%; text-align: left; }
 .empty { padding: 28px 18px; color: var(--muted); text-align: center; font-size: 14px; }
 
 /* buttons and fields */
@@ -564,6 +594,7 @@ details.doc summary .muted { font-weight: 400; }
   .tk .strip { grid-column: 2 / -1; grid-row: 2; max-width: 520px; }
   .tk .when { grid-column: 3; grid-row: 1; align-self: start; }
   .tk .ra { grid-column: 2 / -1; grid-row: 3; justify-content: flex-start; }
+  .ra details.more .menu { right: auto; left: 0; }
 }
 @media (max-width: 860px) {
   .presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -709,6 +740,68 @@ class Runs:
         self.launched = None        # the `harness queue run` this viewer started: (Popen, started at)
         self._in_place = {}         # KEY: (state.json stat, project, launch windows) of in-place tickets
         self.launch_lock = threading.RLock()
+        self._memo = {}             # the pages' one cache: (what, args) -> (stamp, value, sure); see memo
+        self._pending = set()       # memo keys being worked out in the background
+
+    def memo(self, what, args, paths, fn, ttl=0, later=False, default=None):
+        """fn()'s value, kept while every one of paths stats the same (and, with ttl,
+        for at most ttl s): the one in-process cache the pages read the queue's files,
+        and the git answers derived from them, through. A page or poll draws each
+        ticket many times; on Windows an open, a listdir or a git spawn costs far more
+        than a stat. The value is shared: callers must not change it. later: not kept
+        yet, fn runs in the background and default is the answer now (the page's poll
+        brings the real one a few seconds on), so a git call is not on a page's way."""
+        now, stamp, newest = time.time(), [], 0
+        for p in paths:
+            try:
+                fs = os.stat(p)
+                stamp.append((fs.st_mtime_ns, fs.st_size, fs.st_ino))
+                newest = max(newest, fs.st_mtime_ns)
+            except OSError:
+                stamp.append(None)
+        if ttl:
+            stamp.append(int(now // ttl))
+        # as git's racy check: a file changed within a second of the read may change again
+        # with the same stat (a coarse clock, the same size), so that read is not trusted
+        sure = newest < (now - 1) * 1e9
+        k = (what, args)
+        got = self._memo.get(k)
+        if got is not None and got[0] == stamp and got[2]:
+            return got[1]
+        if len(self._memo) > 4000:
+            self._memo.clear()
+        if later:
+            if k not in self._pending:
+                self._pending.add(k)
+
+                def bg():
+                    try:
+                        self._memo[k] = (stamp, fn(), sure)
+                    finally:
+                        self._pending.discard(k)
+                threading.Thread(target=bg, daemon=True).start()
+            # until it is in: what was worked out before (it changed since), else default
+            return got[1] if got is not None else default
+        val = fn()
+        self._memo[k] = (stamp, val, sure)
+        return val
+
+    def _ticket_stamp(self, key):
+        """What the queue's checks on a ticket read that a stat shows: its state.json and
+        its folder (a plan or stage output written or removed). The refs they read are
+        not stat'ed: the checks are kept for at most a minute."""
+        d = os.path.join(self.queue_dir, key)
+        return (os.path.join(d, "state.json"), d)
+
+    def _json(self, path):
+        """path's JSON (None when it cannot be read), through memo."""
+        def load():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                return None
+        return self.memo("json", path, (path,), load)
 
     @property
     def vault(self):
@@ -866,17 +959,23 @@ class Runs:
         return ""
 
     def _ticket_dirs(self):
-        try:
-            return [n for n in os.listdir(self.queue_dir) if KEY_RE.match(n)]
-        except OSError:
-            return []
+        def read():
+            try:
+                return [n for n in os.listdir(self.queue_dir) if KEY_RE.match(n)]
+            except OSError:
+                return []
+        return list(self.memo("dirs", self.queue_dir, (self.queue_dir,), read))
 
     def _listed(self, name):
-        try:
-            with open(os.path.join(self.queue_dir, name), encoding="utf-8") as f:
-                return f.read().split()
-        except OSError:
-            return []
+        path = os.path.join(self.queue_dir, name)
+
+        def read():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return f.read().split()
+            except OSError:
+                return []
+        return list(self.memo("listed", path, (path,), read))
 
     def ticket_keys(self):
         """The queue's tickets in its order, then any other ticket folder; not the archived ones."""
@@ -895,15 +994,11 @@ class Runs:
         """state.json, its fields checked: written by the queue, but a hand edit or
         an old version must not take the page down. The owner's notes are read from
         notes.json (only `note` writes it; state.json carries a copy)."""
-        try:
-            with open(os.path.join(self.queue_dir, key, "state.json"), encoding="utf-8") as f:
-                st = json.load(f)
-        except (OSError, ValueError):
-            return {}
+        st = self._json(os.path.join(self.queue_dir, key, "state.json"))
         if not isinstance(st, dict):
             return {}
         out = {k: st[k] for k in ("status", "stage", "reason", "updated", "vault", "project", "base", "ref",
-                                  "start", "branch", "sha", "created", "stopped_from", "clone_mode")
+                                  "start", "branch", "sha", "created", "stopped_from", "clone_mode", "title")
                if isinstance(st.get(k), str)}
         out.setdefault("start", out.get("ref", ""))
         out["attempt"] = st["attempt"] if isinstance(st.get("attempt"), int) else 0
@@ -931,16 +1026,12 @@ class Runs:
         out["resume"] = isinstance(st.get("resume"), dict)   # queued to go on in it when a run takes it
         kept = st.get("verify_only")   # its agent ended; Continue checks its work rather than launch it again
         out["finished"] = isinstance(kept, dict) and kept.get("stage") == out.get("stage") and bool(kept.get("out"))
-        notes = st.get("notes")
-        try:
-            with open(os.path.join(self.queue_dir, key, "notes.json"), encoding="utf-8") as f:
-                notes = json.load(f)
-        except (OSError, ValueError):
-            pass
+        notes = self._json(os.path.join(self.queue_dir, key, "notes.json"))
+        notes = st.get("notes") if notes is None else notes
         out["notes"] = [{"at": str(n.get("at", "")), "text": n["text"]} for n in
                         (notes if isinstance(notes, list) else []) if isinstance(n, dict) and isinstance(n.get("text"), str)]
         # the plan's items: an older state's questions have a text and blocking only
-        out["criteria"] = [{"id": i, "text": _s(c["text"]), **{k: _s(c.get(k)) for k in ("given", "when", "then", "source")},
+        out["criteria"] = [{"id": i, "text": _s(c["text"]), **{k: _s(c.get(k)) for k in ("given", "when", "then", "source", "check")},
                             "edge": c.get("edge") is True or _s(c.get("source")).lower().startswith("edge")}
                            for i, c in _items(st.get("criteria"), "AC", MAX_CRITERIA)]
         out["questions"] = [{"id": i, "text": _s(q["text"]), "ask": _s(q.get("ask")).strip() or _s(q["text"]),
@@ -965,6 +1056,22 @@ class Runs:
         out["owner_reviews"] = [{"at": str(r.get("at", "")), "items": [str(i) for i in r["items"]][:100]}
                                 for r in (sent if isinstance(sent, list) else [])
                                 if isinstance(r, dict) and isinstance(r.get("items"), list)]
+        pk = st.get("packet")   # the queue's decision packet on a ticket it gave up on: what to decide
+        out["packet"] = ({"reason": _s(pk.get("reason")), "question": _s(pk.get("question")),
+                          "default": _s(pk.get("default")), "best_commit": _s(pk.get("best_commit"), 64),
+                          "criteria": [{k: _s(c.get(k), 500 if k == "quote" else 40) for k in ("id", "verdict", "quote")}
+                                       for c in pk.get("criteria") or [] if isinstance(c, dict)][:MAX_CRITERIA]
+                          if isinstance(pk.get("criteria"), list) else [],
+                          "rounds": [_s(r, 300) for r in pk["rounds"] if isinstance(r, str)][:20]
+                          if isinstance(pk.get("rounds"), list) else []}
+                         if isinstance(pk, dict) else {})
+        # the queue's review rounds ({round, summary, criteria: [{id, verdict, quote}], sha}): the last one's
+        rv = st.get("review_verdicts")
+        rv = rv if isinstance(rv, list) else []
+        last = next((e for e in reversed(rv) if isinstance(e, dict) and isinstance(e.get("criteria"), list)), None)
+        rv = last["criteria"] if last else rv
+        out["review_verdicts"] = [{k: _s(v.get(k), 500 if k == "quote" else 40) for k in ("id", "verdict", "quote")}
+                                  for v in rv if isinstance(v, dict) and v.get("id")][:MAX_CRITERIA]
         sig = st.get("plan_sig")
         out["plan_sig"] = sig if isinstance(sig, str) and re.match(r"^[0-9a-f]{4,64}$", sig) else ""
         out["take_defaults"] = st.get("take_defaults") is True
@@ -1020,60 +1127,68 @@ class Runs:
                 out.update(status="interrupted", stopping=False, run_going=r["running"])
         return out
 
-    def retry_choices(self, key):
+    def retry_choices(self, key, later=False):
         """{stage: why the queue refuses a retry there, or ""}, None the plain retry:
         ticket_queue.retry_choices on state.json as it is (the remotes as last
         fetched). None when the queue's module or the state cannot be read."""
-        tq = _tq()
-        if tq is None:
-            return None
-        try:
-            q = tq.Queue(self.queue_dir)
-            st = q.load(key)
-            return tq.retry_choices(q, st) if isinstance(st, dict) else None
-        except Exception:   # a hand-edited state.json: every stage, and the queue says no where it must
-            return None
+        def check():
+            tq = _tq()
+            if tq is None:
+                return None
+            try:
+                q = tq.Queue(self.queue_dir)
+                st = q.load(key)
+                return tq.retry_choices(q, st) if isinstance(st, dict) else None
+            except Exception:   # a hand-edited state.json: every stage, and the queue says no where it must
+                return None
+        return self.memo("retry_choices", (key, _tq), self._ticket_stamp(key), check, ttl=60, later=later)
 
     def continue_refused(self, key):
         """Why harness queue continue would refuse the ticket (ticket_queue.continue_refused
         on state.json as it is), "" when it would go on, None when that cannot be read."""
-        tq = _tq()
-        if tq is None:
-            return None
-        try:
-            q = tq.Queue(self.queue_dir)
-            st = q.load(key)
-            return tq.continue_refused(q, st) if isinstance(st, dict) else None
-        except Exception:   # a hand-edited state.json: offered, and the queue says no where it must
-            return None
+        def check():
+            tq = _tq()
+            if tq is None:
+                return None
+            try:
+                q = tq.Queue(self.queue_dir)
+                st = q.load(key)
+                return tq.continue_refused(q, st) if isinstance(st, dict) else None
+            except Exception:   # a hand-edited state.json: offered, and the queue says no where it must
+                return None
+        return self.memo("continue_refused", (key, _tq), self._ticket_stamp(key), check, ttl=60)
 
     def followup_refused(self, key):
         """Why harness queue followup would refuse the ticket, "" when it would take
         one, None when that cannot be read (the form is offered; the queue says no)."""
-        tq = _tq()
-        if tq is None or not hasattr(tq, "followup_refused"):
-            return None
-        try:
-            q = tq.Queue(self.queue_dir)
-            st = q.load(key)
-            return tq.followup_refused(q, st) if isinstance(st, dict) else None
-        except Exception:
-            return None
+        def check():
+            tq = _tq()
+            if tq is None or not hasattr(tq, "followup_refused"):
+                return None
+            try:
+                q = tq.Queue(self.queue_dir)
+                st = q.load(key)
+                return tq.followup_refused(q, st) if isinstance(st, dict) else None
+            except Exception:
+                return None
+        return self.memo("followup_refused", (key, _tq), self._ticket_stamp(key), check, ttl=60)
 
     def fix_refused(self, key):
         """Why harness queue fix would refuse the owner's review comments on the ticket's
         diff, "" when it would take them, None when that cannot be read (no comment box).
         It does not snapshot the folder (look=False): the page's diff already shows whether
         anything changed, and a snapshot of a big one takes minutes."""
-        tq = _tq()
-        if tq is None or not hasattr(tq, "owner_fix_refused"):
-            return None
-        try:
-            q = tq.Queue(self.queue_dir)
-            st = q.load(key)
-            return tq.owner_fix_refused(q, st, look=False) if isinstance(st, dict) else None
-        except Exception:
-            return None
+        def check():
+            tq = _tq()
+            if tq is None or not hasattr(tq, "owner_fix_refused"):
+                return None
+            try:
+                q = tq.Queue(self.queue_dir)
+                st = q.load(key)
+                return tq.owner_fix_refused(q, st, look=False) if isinstance(st, dict) else None
+            except Exception:
+                return None
+        return self.memo("fix_refused", (key, _tq), self._ticket_stamp(key), check, ttl=60)
 
     def vault_of(self, st):
         """The vault the queue ran the ticket with (it may not be the one this
@@ -1086,25 +1201,31 @@ class Runs:
         vault = vault or self.vault
         if not vault:
             return ""
-        try:
-            with open(os.path.join(vault, "wiki", "notes", "tickets", f"{key}-{kind}.md"),
-                      encoding="utf-8", errors="replace") as f:
-                return f.read()
-        except OSError:
-            return ""
+        path = os.path.join(vault, "wiki", "notes", "tickets", f"{key}-{kind}.md")
+
+        def read():
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except OSError:
+                return ""
+        return self.memo("note", path, (path,), read)
 
     def stage_outs(self, key):
         """[(name, mtime, size)] of the ticket's stage outputs, oldest first."""
         d = os.path.join(self.queue_dir, key)
-        out = []
-        try:
-            for n in os.listdir(d):
-                if OUT_RE.match(n):
-                    st = os.stat(os.path.join(d, n))
-                    out.append((n, st.st_mtime, st.st_size))
-        except OSError:
-            return []
-        return sorted(out, key=lambda t: t[1])
+
+        def read():
+            out = []
+            try:
+                for n in os.listdir(d):
+                    if OUT_RE.match(n):
+                        st = os.stat(os.path.join(d, n))
+                        out.append((n, st.st_mtime, st.st_size))
+            except OSError:
+                return []
+            return sorted(out, key=lambda t: t[1])
+        return list(self.memo("outs", d, (d,), read))   # a stage's output lands with a rename: d changes
 
     def stage_of(self, key, created_ms, outs=None):
         """The stage (e.g. plan-1) a ticket session belongs to: the first stage output
@@ -1205,14 +1326,8 @@ class Runs:
         seconds; a beat older than RUN_FRESH is a run that is gone), and the run this
         viewer started, if any: "starting" until its first beat, or how it ended."""
         now = now or time.time()
-        info = {}
-        try:
-            with open(os.path.join(self.queue_dir, "run.json"), encoding="utf-8") as f:
-                got = json.load(f)
-            if isinstance(got, dict):
-                info = got
-        except (OSError, ValueError):
-            pass
+        got = self._json(os.path.join(self.queue_dir, "run.json"))
+        info = got if isinstance(got, dict) else {}
         out = {k: info[k] for k in ("model", "ticket", "stage", "step", "started") if isinstance(info.get(k), str)}
         out.update(host=info.get("host") is True, single=info.get("single") is True)
         # "watch": a run that waits for work when it has none (QUEUE_WATCH); None: a run.json older than that
@@ -1230,10 +1345,8 @@ class Runs:
         if out["parallel"] and out["running"]:
             slots = []
             for i in range(1, out["parallel"] + 1):
-                try:
-                    with open(os.path.join(self.queue_dir, f"run-{i}.json"), encoding="utf-8") as f:
-                        got = json.load(f)
-                except (OSError, ValueError):
+                got = self._json(os.path.join(self.queue_dir, f"run-{i}.json"))
+                if got is None:
                     continue
                 b = got.get("beat") if isinstance(got, dict) else None
                 if isinstance(b, (int, float)) and not isinstance(b, bool) and now - b < RUN_FRESH:
@@ -1883,9 +1996,9 @@ def _ticket_row(runs, key, st, i, n, now):
     status = st.get("status", "")
     base = f"/runs/ticket/{quote(key)}/"
     back = (("back", "queue"),)
-    acts = []
+    acts, first = [], []   # first: the one action the ticket needs now; the rest go under More
     if status in ("needs-answers", "plan-review"):
-        acts.append(f"<a class='btn sm primary' href='/runs/ticket/{quote(key)}' title="
+        first.append(f"<a class='btn sm primary' href='/runs/ticket/{quote(key)}' title="
                     + ("'open the ticket to answer the planner&#39;s questions'>Answer" if status == "needs-answers"
                        else "'open the ticket to read the plan and approve it or send feedback'>Review plan")
                     + "</a>")
@@ -1896,12 +2009,16 @@ def _ticket_row(runs, key, st, i, n, now):
         acts.append(_end_btn("sm"))
     go_on = status != "queued" and _continuable(runs, key, st)   # a queued one: on its page
     if go_on:
-        acts.append(_btn(base + "continue", f"Continue {esc(st['stage'])}", "sm primary", back,
-                         title=FINISHED_TITLE if st.get("finished") else CONTINUE_TITLE))
+        first.append(_btn(base + "continue", f"Continue {esc(st['stage'])}", "sm primary", back,
+                          title=FINISHED_TITLE if st.get("finished") else CONTINUE_TITLE))
     if status in RETRYABLE:   # Start over names the stage: a plain retry would check a finished agent's work
-        acts.append(_btn(base + "retry", _retry_label(status, go_on), "sm",
-                         back + ((("stage", st["stage"]),) if go_on else ()),
-                         title=REDO_TITLE if go_on else RETRY_TITLE[status]))
+        (acts if first or status == "done" else first).append(_btn(
+            base + "retry", _retry_label(status, go_on), "sm", back + ((("stage", st["stage"]),) if go_on else ()),
+            title=REDO_TITLE if go_on else RETRY_TITLE[status]))
+    if status == "done" and not first:
+        first.append(f"<a class='btn sm' href='{base}diff' title='what its work changed'>Changes</a>")
+    if status == "running" and not first and acts:   # its Stop
+        first.append(acts.pop(0))
     acts.append(_btn(base + "remove", "Remove", "sm danger", back, disabled=status == "running",
                      title="Stop it first" if status == "running" else REMOVE_TITLE,
                      confirm=f"Remove {key} from the queue? Its " + ("stage outputs are deleted (the project "
@@ -1911,7 +2028,7 @@ def _ticket_row(runs, key, st, i, n, now):
     tone = " wait" if status in WAITING + ("interrupted",) else " run" if status == "running" else ""
     proj = os.path.basename((st.get("project") or "").rstrip("/\\"))
     tags = f"<span class='tag' title='{esc(st.get('project', ''))}'>{esc(proj)}</span>" if proj else ""
-    if st.get("start"):
+    if st.get("start") and st["start"] != st.get("base"):
         tags += (f" <span class='tag' title='the work starts from {esc(st['start'])}'>"
                  f"from {esc(_short(st['start']))}</span>")
     if st.get("branch") and st["branch"] != key:
@@ -1931,7 +2048,9 @@ def _ticket_row(runs, key, st, i, n, now):
             f"<a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>{_pill(status, st.get('stopping'))}{tags}</div>"
             f"<div class='why' title='{esc(_why(st))}'>{esc(_why(st)) or '&nbsp;'}</div></div>"
             f"{stage_strip(st)}<span class='when' title='last changed'>{_ago(when, now) if when else ''}</span>"
-            f"<div class='ra'>{''.join(acts)}</div></div>")
+            f"<div class='ra'>{''.join(first)}<details class='more' data-k='more-{esc(key)}'>"
+            f"<summary class='btn sm' title='More for {esc(key)}' aria-label='More for {esc(key)}'>&middot;&middot;&middot;"
+            f"</summary><div class='menu'>{''.join(acts)}</div></details></div></div>")
 
 
 WATCHING = ("No ticket to work on, so no agent runs; the run watches the queue and starts a ticket as soon as one "
@@ -2076,12 +2195,15 @@ def _serve_project(runs):
     d = runs.project_dir
     if not d or not os.path.isdir(d):
         return ""
-    try:
-        r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
-                           timeout=10, stdin=subprocess.DEVNULL, **NO_WINDOW)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
+
+    def top():
+        try:
+            r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                               timeout=10, stdin=subprocess.DEVNULL, **NO_WINDOW)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return r.stdout.strip() if r.returncode == 0 else ""
+    return runs.memo("serve_project", d, (d,), top, ttl=300)
 
 
 def _projects(runs):
@@ -2237,15 +2359,25 @@ def add_form(runs, form=None, err="", edit=""):
             "</form></section>")
 
 
+def _jira_panel(runs):
+    """U3: the Jira panel's placeholder (it loads its list itself); "" if it cannot be had."""
+    try:
+        import jira_view
+        return jira_view.panel_html(runs)
+    except Exception:
+        return ""
+
+
 def render_queue_page(runs, msg="", bad=False, form=None, err=""):
     d = queue_live(runs)
     return [_live_tag("/runs/queue/live", d["sig"]),
-            "<header class='ph'><h1>Queue</h1><a class='btn sm' href='#add'>+ Add tickets</a>"
+            "<header class='ph'><h1>Queue</h1><a class='btn sm' href='#jira'>+ From Jira</a><a class='btn sm' href='#add'>+ Add tickets</a>"
             "<a class='btn sm' href='/runs/debug'>Debug reports</a>"
             "<div class='sub'>The run works the tickets top down, one stage at a time. A ticket waiting on you "
             "(questions, a plan to approve, blocked) does not hold the queue.</div></header>",
             _flash(msg, bad),
             f"<div id='r-runner'>{d['regions']['runner']}</div>",
+            _jira_panel(runs),   # the Jira sprint/backlog panel (serve/jira_view.py): what to add, above the list
             f"<section class='panel flush' id='r-tickets'>{d['regions']['tickets']}</section>",
             f"<div id='r-fagent'>{d['regions']['fagent']}</div>",
             f"<section class='panel flush' id='r-findings'>{d['regions']['findings']}</section>",
@@ -2257,7 +2389,7 @@ def render_queue_page(runs, msg="", bad=False, form=None, err=""):
 
 def _note_form(key, button):
     """A blocked ticket: one note for the agents, sent the same way as answers."""
-    return (f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"
+    return (f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs' id='again'>"
             "<label><div class='q'>What should change</div><textarea name='note' required placeholder='For "
             "example: the tests need the database running first, or: keep the old API and add the new one beside "
             "it'></textarea></label>"
@@ -2348,7 +2480,13 @@ def _criterion_card(c):
         body = f"<div class='txt'>{esc_math(c['text'])}</div>"
     pick = "".join(f"<label><input type='radio' name='ac.{i}' value='{v}'{' checked' if v == 'accept' else ''}>"
                    f"{lab}</label>" for v, lab in (("accept", "Accept"), ("reject", "Reject")))
-    return (f"<div class='fb{' edge' if c['edge'] else ''}'><div class='q'>{i}{tag}</div>{src}{body}"
+    chk = {"cmd": ("checked by a command", "a build or a command shows it"),
+           "test": ("checked by a test", "a test shows it"),
+           "review": ("the reviewer judges", "no command proves it: the review reads the change"),
+           "human": ("you check it", "only a person can tell: it is left to you")
+           }.get((c.get("check") or "").lower())
+    chk = f" <span class='tag' title='{chk[1]}'>{chk[0]}</span>" if chk else ""
+    return (f"<div class='fb{' edge' if c['edge'] else ''}'><div class='q'>{i}{tag}{chk}</div>{src}{body}"
             f"<div class='pick row'>{pick}</div><textarea class='line' rows='1' name='acc.{i}' "
             f"aria-label='comment on {i}' placeholder='Comment (optional): what should change'></textarea></div>")
 
@@ -2458,8 +2596,8 @@ def _t_settings(key, st):
             f"<div class='kv'>{''.join(_settings_facts(key, st))}</div><div class='muted'>{esc(why)}</div></section>")
 
 
-def _t_head(runs, key, st, pos, n):
-    status = st.get("status", "")
+def _t_facts(runs, key, st, pos, n):
+    """The ticket's facts: its commit, when added and changed, where it is in the queue."""
     facts = []
     if st.get("sha"):
         facts.append(f"<span>commit <b>{esc(st['sha'][:12])}</b></span>")
@@ -2468,14 +2606,11 @@ def _t_head(runs, key, st, pos, n):
     upd = _iso_ms(st.get("updated", ""))
     if upd:
         facts.append(f"<span>updated <b>{_ago(upd)}</b></span>")
-    where = (f"<span class='muted'>{pos} of {n} in the queue</span>" if pos else
-             "<span class='muted'>archived</span>" if key in runs.archived_keys() else "")
-    return ("<header class='ph'><div class='crumbs'><a href='/runs/queue'>Queue</a><span>/</span>"
-            f"<b>{esc(key)}</b></div><h1>{esc(key)}</h1>{_pill(status, st.get('stopping'))}{where}"
-            f"<a class='btn' href='/runs/ticket/{quote(key)}/diff'>Changes</a>"
-            f"<div class='sub'>{esc(_why(st))}</div></header>"
-            f"<section class='panel'>{stage_strip(st, True)}<div class='kv'>{''.join(facts)}</div></section>"
-            + _t_settings(key, st) + _t_result(st))
+    if pos:
+        facts.append(f"<span><b>{pos} of {n}</b> in the queue</span>")
+    elif key in runs.archived_keys():
+        facts.append("<span><b>archived</b></span>")
+    return f"<section class='panel'><div class='kv'>{''.join(facts)}</div></section>" if facts else ""   # the stages: the header's
 
 
 PUSHED = {"pushed": "pushed to {remote}", "local": "kept on this computer: not pushed",
@@ -2570,7 +2705,8 @@ def _t_retry(runs, key, st, go_on=False):
     would take it at (its own retry_refused); why not, when it takes none."""
     status = st.get("status", "")
     label = _retry_label(status, go_on)
-    why = runs.retry_choices(key) or dict.fromkeys((None,) + STAGES, "")   # unknown: all, the queue still says no
+    # not worked out yet (git): every stage for now, the poll brings the queue's answer; the queue still says no
+    why = runs.retry_choices(key, later=True) or dict.fromkeys((None,) + STAGES, "")
     mine = st.get("stages") or DEFAULT_STAGES   # test, opt-in, only on a ticket that has it
     stages = [s for s in STAGES if not why.get(s) and (s != "test" or s in mine)]
     if why.get(None) and not stages:
@@ -2799,18 +2935,26 @@ def _t_debug(runs, key, st):
             f"<a class='muted' href='/runs/debug'>all debug reports</a></div>{note}{body}</details></section>")
 
 
-def _t_docs(runs, key, st, log):
-    """The ticket's notes in the vault, rendered: the plan (unless it is open above,
-    with the answer form), the agent's state note, the review, the findings, the
-    owner's answers and follow-ups, the ticket itself; then the queue's own log."""
+TICKET_DOCS = ("ticket", "plan")   # the Ticket tab's notes; the History tab has the rest
+
+
+def _t_docs(runs, key, st, log, tab="ticket"):
+    """The ticket's notes in the vault, rendered. The Ticket tab: the ticket itself and
+    the plan (unless it is open above, with the answer form). The History tab: the
+    agent's state note, the review, the findings, the owner's answers and follow-ups,
+    the debug reports, then the queue's own log."""
     vault = runs.vault_of(st)
     parts = []
-    for kind, label in DOCS:
+    for kind, label in sorted(DOCS, key=lambda d: d[0] != "ticket"):
+        if (kind in TICKET_DOCS) != (tab == "ticket"):
+            continue
         if kind == "plan" and st.get("status") in WAITING and st.get("status") != "blocked":
             continue   # shown open above, with the answer form
         text = _vault_text(vault, _note_rel(key, kind))
         if text.strip():
-            parts.append(_doc(runs, vault, key, kind, label, text))
+            parts.append(_doc(runs, vault, key, kind, label, text, open_=kind == "ticket"))
+    if tab == "ticket":
+        return "".join(parts)
     parts.append(_t_debug(runs, key, st))
     text = _local_log(log[-60000:]) if log.strip() else "no log yet"
     parts.append("<section class='panel'><details class='doc' data-k='log'><summary>Queue log"
@@ -2930,51 +3074,197 @@ def _t_reviews(key, st):
     return "".join(parts)
 
 
-def ticket_live(runs, key):
-    """The ticket page's regions, or None when the ticket is gone."""
+TICKET_TABS = (("ticket", "", "Ticket"), ("changes", "/diff", "Changes"), ("agent", "/agent", "Agent"),
+               ("history", "/history", "History"))
+
+
+def _primary(runs, key, st):
+    """The one thing the ticket needs from the owner now, as a link to where it is done."""
+    base, status = f"/runs/ticket/{quote(key)}", st.get("status", "")
+    if st.get("stopping"):
+        return ""
+    if status == "needs-answers":
+        href, label = base + "#r-qs", "Answer the questions"
+    elif status == "plan-review":
+        href, label = base + "#r-qs", "Review the plan"
+    elif status == "blocked":
+        href, label = (base + "#packet", "Decide") if st.get("packet") else (base + "#r-acts", "See why it stopped")
+    elif status == "running":
+        href, label = base + "/agent", "Watch the agent"
+    elif status == "done":
+        href, label = base + "/diff", "Review the changes"
+    elif status in ("queued", "interrupted") and not runs.runner()["running"]:
+        href, label = base + "#r-start", "Start the queue"
+    elif status == "stopped":
+        href, label = base + "#r-acts", "Resume"
+    else:
+        return ""
+    return f"<a class='btn primary tkgo' href='{href}'>{esc(label)}</a>"
+
+
+def ticket_tabs(runs, key, active):
+    """The top of every page of a ticket: its key, title, status, stages, the one
+    action it needs now, and the tabs (active: ticket, changes, agent or history)."""
+    st = runs.ticket_state(key) if KEY_RE.match(key or "") else {}
+    base = f"/runs/ticket/{quote(key)}"
+    tabs = "".join(f"<a href='{base}{suffix}'" + (" class='on' aria-current='page'" if name == active else "")
+                   + f">{label}</a>" for name, suffix, label in TICKET_TABS)
+    title = f"<span class='tktitle'>{esc(st['title'])}</span>" if st.get("title") else ""
+    why, go = _why(st), _primary(runs, key, st)
+    here = dict((n, sfx) for n, sfx, _ in TICKET_TABS).get(active)
+    if here and f"href='{base}{here}'" in go:   # it is this tab already
+        go = ""
+    return (f"<header class='ph tkh'><div class='crumbs'><a href='/runs/queue'>&larr; Queue</a></div>"
+            f"<h1>{esc(key)}</h1>{title}{_pill(st.get('status', ''), st.get('stopping'))}{go}"
+            f"<div class='tkstrip'>{stage_strip(st)}</div>"
+            + (f"<div class='sub'>{esc(why)}</div>" if why else "")
+            + f"</header><nav class='ttabs' aria-label='ticket'>{tabs}</nav>")
+
+
+def _t_packet(st, key=""):
+    """The queue's decision packet: why it stopped, the question, its default, each
+    criterion's verdict with the quote that backs it. Nothing when there is none."""
+    p = st.get("packet") or {}
+    if not p:
+        return ""
+    rounds = p.get("rounds") or []
+    facts = (f"<span>rounds <b>{len(rounds)}</b></span>" if rounds else "") + (
+        f"<span>best commit <b>{esc(p['best_commit'][:12])}</b></span>" if p.get("best_commit") else "")
+    return ("<section class='panel packet' id='packet'><h2>Decision needed</h2>"
+            + (f"<p>{esc(p['reason'])}</p>" if p.get("reason") else "")
+            + (f"<p><b>{esc(p['question'])}</b></p>" if p.get("question") else "")
+            + _verdict_list(p.get("criteria"))
+            + (f"<div class='kv'>{facts}</div>" if facts else "")
+            + ("<details><summary>The rounds</summary><ul class='plain'>"
+               + "".join(f"<li>{esc(r)}</li>" for r in rounds) + "</ul></details>" if rounds else "")
+            + _packet_acts(key, p) + "</section>")
+
+
+def _packet_acts(key, p):
+    """The packet's answers as buttons: push as it is (the default's --stage), fix it on
+    the Changes tab, or say what should change; the queue's command under them."""
+    go = re.search(r"--stage (\w+)", p.get("default") or "")
+    base = f"/runs/ticket/{quote(key)}"
+    acts = []
+    if go:
+        acts.append(f"<form method='post' action='{base}/retry'><input type='hidden' name='stage' value='{esc(go[1])}'>"
+                    f"<button type='submit' class='primary'>{'Push it as it is' if go[1] == 'push' else 'Go on to ' + esc(go[1])}"
+                    "</button></form>")
+        acts.append(f"<a class='btn' href='{base}/diff'>Comment on the changes for a fix</a>")
+    acts.append("<a class='btn' href='#again'>Say what should change</a>")
+    return (f"<div class='acts'>{''.join(acts)}</div>"
+            + (f"<details class='muted'><summary>From the command line</summary><code>{esc(p['default'])}</code></details>"
+               if p.get("default") else ""))
+
+
+def _verdict_list(rows):
+    """Each criterion's verdict (the queue's PASS, FAIL or UNKNOWN) and the quote that backs it."""
+    def tone(v):
+        v = (v or "").lower()
+        return "t-ok" if v in ("pass", "passed", "met") else "t-wait" if v in ("unknown", "") else "t-bad"
+    items = "".join(f"<li><b>{esc(c['id'])}</b> <span class='pill {tone(c.get('verdict'))}'>{esc(c.get('verdict') or '?')}"
+                    "</span>" + (f" <q>{esc(c['quote'])}</q>" if c.get("quote") else "") + "</li>" for c in rows or [])
+    return f"<ul class='verdicts'>{items}</ul>" if items else ""
+
+
+def _t_verdicts(st):
+    """The review's verdict on each criterion, when the queue wrote them and no packet shows them."""
+    vs = st.get("review_verdicts") or []
+    if not vs or st.get("packet"):
+        return ""
+    return f"<section class='panel'><h2>Review verdicts</h2>{_verdict_list(vs)}</section>"
+
+
+def ticket_live(runs, key, tab="ticket"):
+    """The regions of the ticket's tab page (ticket or history), or None when the ticket is gone."""
     if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
         return None
-    try:
-        with open(os.path.join(runs.queue_dir, key, "log.md"), encoding="utf-8", errors="replace") as f:
-            log = f.read()
-    except OSError:
-        log = ""
     now = time.time()
-    live = runs.live(now)
-    outs = runs.stage_outs(key)
     st = runs.ticket_state(key)
+    head = ticket_tabs(runs, key, tab)
+    if tab == "history":
+        try:
+            with open(os.path.join(runs.queue_dir, key, "log.md"), encoding="utf-8", errors="replace") as f:
+                log = f.read()
+        except OSError:
+            log = ""
+        live = runs.live(now)
+        outs = runs.stage_outs(key)
+        rows = runs.ticket_sessions(key)
+        regions = {"head": head, "settings": _t_settings(key, st),
+                   "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
+                   "attempts": _t_attempts(key, st, {o[0] for o in outs}), "notes": _t_notes(key, st),
+                   "rounds": _t_rounds(runs, key, st) + _t_reviews(key, st),
+                   "docs": _t_docs(runs, key, st, log, "history"), "nav": nav(runs, "queue")}
+        return {"sig": _sig(regions), "regions": regions}
+    live = runs.live(now)
     rows = runs.ticket_sessions(key)
     order = runs.ticket_keys()
-    try:
-        with open(os.path.join(runs.queue_dir, "queue.list"), encoding="utf-8") as f:
-            listed = f.read().split()
-    except OSError:
-        listed = []
+    listed = runs._listed("queue.list")
     pos = listed.index(key) + 1 if key in listed else 0
     n = len([k for k in listed if k in order])
-    regions = {"head": _t_head(runs, key, st, pos, n), "acts": _t_acts(runs, key, st, rows, live, pos, n),
-               "start": _t_start(runs, key, st, runs.runner(now), now), "qs": _t_questions(runs, key, st),
-               "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
-               "attempts": _t_attempts(key, st, {o[0] for o in outs}), "notes": _t_notes(key, st),
-               "rounds": _t_rounds(runs, key, st) + _t_reviews(key, st), "docs": _t_docs(runs, key, st, log), "nav": nav(runs, "queue")}
+    regions = {"head": head, "acts": _t_acts(runs, key, st, rows, live, pos, n),
+               "start": _t_start(runs, key, st, runs.runner(now), now), "packet": _t_packet(st, key) + _t_verdicts(st),
+               "qs": _t_questions(runs, key, st), "result": _t_facts(runs, key, st, pos, n) + _t_result(st),
+               "docs": _t_docs(runs, key, st, "", "ticket"), "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}
 
 
-def render_ticket(runs, key, msg="", bad=False):
-    d = ticket_live(runs, key)
+def render_ticket(runs, key, msg="", bad=False, tab="ticket"):
+    d = ticket_live(runs, key, tab)
     if d is None:
         return None
     g = d["regions"]
-    return key, [_live_tag(f"/runs/ticket/{quote(key)}/live", d["sig"]),
-                 f"<div id='r-head' class='stack'>{g['head']}</div>", _flash(msg, bad),
-                 f"<section class='panel' id='r-acts'>{g['acts']}</section>",
-                 f"<div id='r-start'>{g['start']}</div>", f"<div id='r-qs'>{g['qs']}</div>",
-                 "<div class='wide'><div class='stack'>"
-                 f"<section class='panel' id='r-sessions'>{g['sessions']}</section>"
-                 f"<div id='r-docs' class='stack'>{g['docs']}</div>"
-                 f"<section class='panel' id='r-attempts'>{g['attempts']}</section></div>"
-                 f"<div class='stack'><section class='panel' id='r-notes'>{g['notes']}</section>"
-                 f"<div id='r-rounds'>{g['rounds']}</div></div></div>"]
+    live = _live_tag(f"/runs/ticket/{quote(key)}/live" + ("?tab=history" if tab == "history" else ""), d["sig"])
+    if tab == "history":
+        return key, [live, f"<div id='r-head' class='stack'>{g['head']}</div>", _flash(msg, bad),
+                     "<div class='wide'><div class='stack'>"
+                     f"<div id='r-settings'>{g['settings']}</div>"
+                     f"<div id='r-rounds'>{g['rounds']}</div>"
+                     f"<section class='panel' id='r-attempts'>{g['attempts']}</section>"
+                     f"<div id='r-docs' class='stack'>{g['docs']}</div></div>"
+                     f"<div class='stack'><section class='panel' id='r-notes'>{g['notes']}</section>"
+                     f"<section class='panel' id='r-sessions'>{g['sessions']}</section></div></div>"]
+    return key, [live, f"<div id='r-head' class='stack'>{g['head']}</div>", _flash(msg, bad),
+                 f"<div id='r-packet'>{g['packet']}</div>", f"<section class='panel' id='r-acts'>{g['acts']}</section>",
+                 f"<div id='r-start'>{g['start']}</div>",
+                 f"<div id='r-qs'>{g['qs']}</div>", f"<div id='r-result' class='stack'>{g['result']}</div>",
+                 f"<div id='r-docs' class='stack'>{g['docs']}</div>"]
+
+
+def render_ticket_agent(runs, key, sid="", oc_url=None):
+    """/runs/ticket/KEY/agent: the ticket's live (else latest) agent session, or the
+    one picked (sid), as its own page shows it, with a picker of the ticket's sessions."""
+    if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
+        return None
+    rows = runs.ticket_sessions(key)
+    if not rows:
+        return key, [ticket_tabs(runs, key, "agent"),
+                     "<section class='panel muted'>No agent session for this ticket yet.</section>"], ""
+    live = runs.live()
+    ids = [r["id"] for r in rows]
+    if sid not in ids:
+        on = [r for r in rows if r["id"] in live]
+        sid = (on or rows)[-1]["id"]
+    got = render_detail(runs, sid, oc_url=oc_url)
+    if not got:
+        return None
+    # a session still going opens at its latest step (the end), a finished one at its start
+    end = ";if (!location.hash) window.scrollTo(0, document.body.scrollHeight);" if sid in live else ""
+    return key, got[1], (got[2] or "") + end
+
+
+def _picker(runs, key, sid):
+    """The ticket's stage sessions, newest first, as one row of links (the shown one marked)."""
+    rows, st, outs, live = runs.ticket_sessions(key), runs.ticket_state(key), runs.stage_outs(key), runs.live()
+    links = []
+    for r in reversed(rows):
+        stage, n = _stage_label(runs, key, r, st, outs)
+        on = " class='on' aria-current='true'" if r["id"] == sid else ""
+        dot = "<span class='sdot run'></span>" if r["id"] in live else ""
+        links.append(f"<a href='/runs/ticket/{quote(key)}/agent?sid={quote(r['id'])}'{on}>{dot}"
+                     f"{esc(stage or 'session')}{f' {n}' if n else ''}</a>")
+    return f"<nav class='spick' aria-label='sessions'>{''.join(links)}</nav>" if len(links) > 1 else ""
 
 
 # --- /runs/ticket/KEY/edit ---------------------------------------------------------
@@ -3030,10 +3320,10 @@ def render_ticket_edit(runs, key, form=None, err=""):
         return None
     can, why = _edit_lock(st)
     k = quote(key)
-    parts = [f"<header class='ph'><div class='crumbs'><a href='/runs/queue'>Queue</a><span>/</span>"
-             f"<a href='/runs/ticket/{k}'>{esc(key)}</a><span>/</span><b>settings</b></div>"
-             f"<h1>{esc(key)}: settings</h1>{_pill(st.get('status', ''), st.get('stopping'))}"
-             f"<a class='btn' href='/runs/ticket/{k}'>Back to the ticket</a><div class='sub'>{esc(why)}</div></header>"]
+    # under the ticket's tabs, as History (where its Edit link is); Back: to that tab
+    parts = [ticket_tabs(runs, key, "history"),
+             f"<h2 class='sesh'>Settings <a class='btn sm' href='/runs/ticket/{k}/history'>Back</a></h2>"
+             f"<div class='sub'>{esc(why)}</div>"]
     if can == "all":
         parts.append(add_form(runs, form if form is not None else _edit_values(key, st), err, edit=key))
     else:
@@ -4740,7 +5030,10 @@ def render_detail(runs, sid, sent="", follow="", oc_url=None, msg="", bad=False)
         crumbs.append(f"<span>/</span><a href='/runs/{quote(p['id'])}'>{esc(p.get('title') or p['id'])}</a>")
     title = row.get("title") or sid
     link = oc_url(src.label, sid) if oc_url else ""
-    parts = [f"<header class='ph'><div class='crumbs'>{''.join(crumbs)}</div><h1>{esc(title)}</h1>"
+    top = ticket_tabs(runs, key, "agent") + _picker(runs, key, sid) if key else ""
+    h = "h2" if key else "h1"   # under a ticket's tabs: the session is a part of the ticket's page
+    parts = [f"{top}<header class='ph'>" + ("" if key and len(crumbs) == 1 else f"<div class='crumbs'>{''.join(crumbs)}</div>")
+             + f"<{h} class='sesh'>{esc(title)}</{h}>"
              f"{_status(runs, row, live)}<a class='btn sm' href='/runs/{quote(sid)}.json' target='_blank' "
              "rel='noopener'>JSON</a></header>", _flash(msg, bad),
              "<div class='cols'><div class='stack'>"

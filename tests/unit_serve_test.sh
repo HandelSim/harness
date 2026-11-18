@@ -11,6 +11,7 @@
 #   - serve/test_runs.py  the run viewer (/runs)
 #   - serve/test_findings.py   the queue page's findings board
 #   - serve/test_page_memory.py what is typed survives leaving the page
+#   - serve/test_diff_view.py   the Changes page's Show more lines
 #   - agents/live-run.sh  headless runs that take messages (stub opencode)
 #   - harness_view        the run viewer a headless launch brings up
 #   - harness_view_refresh harness upgrade restarts it on the new code
@@ -43,6 +44,8 @@ ok "S1: run viewer tests (/runs)"
 ok "S1: the queue page's findings board"
 ( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_page_memory ) || fail "S1: serve/test_page_memory.py failed"
 ok "S1: page memory"
+( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_diff_view ) || fail "S1: serve/test_diff_view.py failed"
+ok "S1: the Changes page's Show more lines"
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
