@@ -50,6 +50,10 @@ AGENT_MAX = 8 * 1024 * 1024   # and of findings.json
 TITLE_MAX = 300
 TEXT_MAX = 4000
 FORM_MAX = 64 * 1024
+STEPS_MAX = 12        # a bug's steps to see it in the app
+TRACE_MAX = 10        # and its code path
+LOCATIONS_MAX = 20    # a rolling finding's item: the places it is
+ITEMS_SHOWN = 50      # a rolling finding's items listed in its row
 FORM_FIELDS = 2 * OPEN_CAP + 20
 
 _CACHE = {}             # path: ((mtime_ns, size), parsed)
@@ -212,9 +216,71 @@ def _str(v, cap):
     return " ".join(v.split())[:cap] if isinstance(v, str) else ""
 
 
+def _line(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else (
+        int(v) if isinstance(v, str) and v.isdigit() else 0)
+
+
+def _strs(v, cap, n):
+    """A list of strings, each folded and cut to cap, the empty ones and the non-strings
+    dropped, at most n of them; [] when it is not a list."""
+    if not isinstance(v, list):
+        return []
+    return [x for x in (_str(s, cap) for s in v) if x][:n]
+
+
+def _trace(v):
+    """The code path, entry by entry: {path, line, code}; an entry of the wrong shape is dropped."""
+    out = []
+    for t in v if isinstance(v, list) else []:
+        if not isinstance(t, dict) or not isinstance(t.get("path"), str) or not isinstance(t.get("code"), str):
+            continue
+        line = t.get("line")
+        if not isinstance(line, int) or isinstance(line, bool) or line < 0:
+            continue
+        path = _str(t["path"], 500)
+        if path:
+            out.append({"path": path, "line": line, "code": _str(t["code"], 500)})
+        if len(out) >= TRACE_MAX:
+            break
+    return out
+
+
+def _at(path, line):
+    return f"{path}:{line}" if path and line else path
+
+
+def _items(v):
+    """A rolling finding's open items, checked: {id, path, line, note, evidence, locations}."""
+    out, seen = [], set()
+    for i in v if isinstance(v, list) else []:
+        if not isinstance(i, dict) or not isinstance(i.get("id"), str) or not ID_RE.match(i["id"]):
+            continue
+        if i.get("status") not in (None, "", "open") or i["id"] in seen:
+            continue
+        seen.add(i["id"])
+        out.append({"id": i["id"], "path": _str(i.get("path"), 500), "line": _line(i.get("line")),
+                    "note": _str(i.get("note"), TEXT_MAX), "evidence": _str(i.get("evidence"), 500),
+                    "locations": _strs(i.get("locations"), 500, LOCATIONS_MAX)})
+    return out
+
+
+def rolled(f, items):
+    """A rolling finding's row with these items: its title counts them, its md lists them."""
+    n = len(items)
+    md = f"- {f['rtitle']} ({n} place{'' if n == 1 else 's'}, findings agent)" + "".join(
+        "\n  - " + ": ".join(x for x in (_at(i["path"], i["line"]), i["note"] or i["evidence"]) if x)
+        for i in items)
+    return dict(f, title=f"{f['rtitle']} ({n})", md=md, items=items, children=[i["id"] for i in items])
+
+
 def parse_agent(text):
     """findings.json's findings, each checked: a hand edit or a newer writer must not
-    take the page down. [] when it is not what it should be."""
+    take the page down. [] when it is not what it should be.
+
+    Three shapes: a plain finding; a bug that also says how to see it in the app (ui,
+    steps, expected, actual, trace, verdict); a rolling one (kind "rolling"): one row per
+    theme with its open items, each of which can be archived on its own."""
     try:
         data = json.loads(text)
     except ValueError:
@@ -228,23 +294,44 @@ def parse_agent(text):
             continue
         fid = f["id"]
         title, detail = _str(f.get("title"), TITLE_MAX), _str(f.get("detail"), TEXT_MAX)
-        if fid in seen or not (title or detail):
+        cat, sev = _str(f.get("category"), 40).lower(), _str(f.get("severity"), 20).lower()
+        project = _str(f.get("project"), 1000)
+        if fid in seen:
+            continue
+        if f.get("kind") == "rolling":
+            its = _items(f.get("items"))
+            title = title or detail[:TITLE_MAX] or cat
+            if not its or not title:
+                continue
+            seen.add(fid)
+            out.append(rolled({"id": fid, "src": "agent", "key": "", "cat": cat, "sev": "", "stage": "",
+                               "kind": "rolling", "rtitle": title,
+                               "text": f"{title}: {detail}" if detail and detail != title else title,
+                               "body": detail, "evidence": "", "path": "", "line": 0,
+                               "ms": iso_ms(f.get("found_at")) or iso_ms(f.get("updated_at")), "pos": pos,
+                               "project": project}, its))
+            continue
+        if not (title or detail):
             continue
         seen.add(fid)
         path = _str(f.get("path"), 500)
-        line = f.get("line")
-        line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else (
-            int(line) if isinstance(line, str) and line.isdigit() else 0)
-        cat, sev = _str(f.get("category"), 40).lower(), _str(f.get("severity"), 20).lower()
-        project = _str(f.get("project"), 1000)
+        line = _line(f.get("line"))
         where = (f"{path}:{line}: " if line else f"{path}: ") if path else ""
         tags = ", ".join(x for x in (cat, sev) if x)
         md = f"- {where}{title or detail}" + (f": {detail}" if title and detail and detail != title else "") + (
             f" ({tags}, findings agent)" if tags else " (findings agent)")
+        steps, trace = _strs(f.get("steps"), 500, STEPS_MAX), _trace(f.get("trace"))
+        expected, actual = _str(f.get("expected"), TEXT_MAX), _str(f.get("actual"), TEXT_MAX)
+        md += "".join(x for x in (
+            ("\n  Steps: " + " ".join(f"{n}. {s}" for n, s in enumerate(steps, 1))) if steps else "",
+            f"\n  Expected: {expected}" if expected else "",
+            f"\n  Actual: {actual}" if actual else "",
+            ("\n  Trace: " + ", ".join(_at(t["path"], t["line"]) for t in trace)) if trace else ""))
         out.append({"id": fid, "src": "agent", "key": "", "cat": cat, "sev": sev, "stage": "",
                     "title": title or detail[:TITLE_MAX], "text": f"{title}: {detail}" if title and detail else title or detail,
                     "body": detail, "evidence": _str(f.get("evidence"), 500), "path": path, "line": line, "ms": iso_ms(f.get("found_at")), "pos": pos, "md": md,
-                    "project": project})
+                    "project": project, "ui": _str(f.get("ui"), TITLE_MAX), "steps": steps, "expected": expected,
+                    "actual": actual, "trace": trace, "verdict": _str(f.get("verdict"), TEXT_MAX)})
     return out
 
 
@@ -396,14 +483,16 @@ def action(runs, act, form):
     try:
         with held(lock):
             items = collect(runs)
-            existing = {f["id"] for f in items}
+            rows = {f["id"] for f in items}
+            # a rolling finding's items are archived (and restored) one by one too
+            existing = rows | {c for f in items for c in f.get("children", ())}
             board = read_board(path)
             if act == "move":
                 key = (form.get("key") or [""])[0]
                 before = (form.get("before") or [""])[0]
-                if key not in existing:
+                if key not in rows:
                     return False, "that finding is not on the board any more: reload the page"
-                if before and before not in existing:
+                if before and before not in rows:
                     return False, "the finding it was dropped next to is gone: reload the page"
                 order = [f["id"] for f in arrange(items, board)[3] if f["id"] != key]
                 order.insert(order.index(before) if before and before != key else len(order), key)
@@ -441,6 +530,52 @@ def _stamp(ms):
     return time.strftime("%m-%d %H:%M", time.localtime(ms / 1000)) if ms else ""
 
 
+def _ev(label, text):
+    return f"<p class='fev'><span class='muted'>{label}</span> {text}</p>"
+
+
+def _bug(f):
+    """A bug's way to see it in the app: where, the steps, expected and actual, the code
+    path, what checking it found. "" for a finding that says none of it."""
+    out = _ev("in the app", f"<code>{esc(f['ui'])}</code>") if f.get("ui") else ""
+    if f.get("steps"):
+        out += "<ol class='fsteps'>" + "".join(f"<li>{esc(s)}</li>" for s in f["steps"]) + "</ol>"
+    if f.get("expected"):
+        out += _ev("expected", esc(f["expected"]))
+    if f.get("actual"):
+        out += _ev("actual", esc(f["actual"]))
+    if f.get("trace"):
+        out += "<ul class='ftrace'>" + "".join(
+            f"<li><code>{esc(_at(t['path'], t['line']))}</code>"
+            + (f" <code>{esc(t['code'])}</code>" if t["code"] else "") + "</li>" for t in f["trace"]) + "</ul>"
+    if f.get("verdict"):
+        out += _ev("checked", esc(f["verdict"]))
+    return out
+
+
+def _item_list(f, archived):
+    """A rolling finding's items, each with its own Not this one (the board's form posts
+    it to archive, as the row's Archive does)."""
+    items = f.get("items") or []
+    if not items:
+        return ""
+    lis = []
+    for i in items[:ITEMS_SHOWN]:
+        where = _at(i["path"], i["line"])
+        li = (f"<code>{esc(where)}</code>" if where else "") + (f" <span>{esc(i['note'])}</span>" if i["note"] else "")
+        if len(i["locations"]) > 1:
+            li += " " + "".join(f"<code>{esc(x)}</code>" for x in i["locations"][1:])
+        if i["evidence"]:
+            li += f" <code>{esc(i['evidence'])}</code>"
+        if not archived:
+            li += (f" <button type='submit' class='sm' name='id' value='{esc(i['id'])}' "
+                   "title='not this one: take it off the list'>Not this one</button>")
+        lis.append(f"<li>{li}</li>")
+    if len(items) > ITEMS_SHOWN:
+        lis.append(f"<li class='muted'>{len(items) - ITEMS_SHOWN} more</li>")
+    return "<ul class='fitems'>" + "".join(lis) + "</ul>"
+
+
 def _row(f, archived=False, new=False):
     fid = esc(f["id"])
     tags = ""
@@ -473,7 +608,7 @@ def _row(f, archived=False, new=False):
     body = f.get("body") or ""
     full = (f"<p class='fbx'>{esc(body)}</p>" if body and body != f["title"] else "") + (
         f"<p class='fev'><span class='muted'>evidence</span> <code>{esc(f['evidence'])}</code></p>"
-        if f.get("evidence") else "")
+        if f.get("evidence") else "") + _bug(f) + _item_list(f, archived)
     return (f"<div class='fd' data-sort-key='{fid}' data-src='{esc(f['src'])}' data-cat='{esc(f['cat'])}' "
             f"data-md='{esc(f['md'])}'>{lead}<div class='fmain'><details class='fx' data-k='fx-{fid}'>"
             f"<summary class='ft' title='show the whole finding'>{tags}"
@@ -486,9 +621,17 @@ def _row(f, archived=False, new=False):
 def findings_region(runs):
     """The findings panel's HTML (the queue page's r-findings region): one form, so the
     poll leaves it alone while a finding is ticked or a filter is set (hSwap)."""
-    items = collect(runs)
     path = board_path(runs)
     board = read_board(path) if path else {"version": 1, "order": [], "archived": {}}
+    items = []
+    for f in collect(runs):   # a rolling finding without the items archived one by one; none left: not shown
+        if f.get("children"):
+            left = [i for i in f["items"] if i["id"] not in board["archived"]]
+            if not left:
+                continue
+            if len(left) < len(f["items"]):
+                f = rolled(f, left)
+        items.append(f)
     open_, archived, fresh, _ = arrange(items, board)
     mark = fresh if board["order"] else set()
     keys = list(dict.fromkeys(f["key"] for f in items if f["key"]))
@@ -562,6 +705,11 @@ FINDINGS_CSS = """
 .fd .fx[open] .tl { white-space: normal; overflow-wrap: anywhere; }
 .fd .fx .fbx, .fd .fx .fev { margin: 6px 0 2px; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .fd .fx .fev code { font: 12px var(--mono); }
+.fd .fx .fsteps, .fd .fx .ftrace, .fd .fx .fitems { margin: 6px 0 2px; padding-left: 20px; font-size: 13px; }
+.fd .fx .ftrace, .fd .fx .fitems { list-style: none; padding-left: 0; }
+.fd .fx li { margin: 3px 0; overflow-wrap: anywhere; }
+.fd .fx .fitems li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.fd .fx .ftrace code, .fd .fx .fitems code { font: 12px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
 .fd .fm { display: flex; flex-wrap: wrap; gap: 2px 14px; font-size: 12px; color: var(--muted); min-width: 0; }
 .fd .fm code { font: 11.5px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
 .fd .pill { height: 18px; padding: 0 7px; font-size: 11px; }

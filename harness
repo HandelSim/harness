@@ -7369,7 +7369,11 @@ and .sh files after implement and fix), QUEUE_REMOTE (origin), QUEUE_PUSH (1;
 QUEUE_PLAN_REVIEW (0: each ticket's own choice, which by default waits for
 'harness queue approve'; 1 holds every plan, --no-plan-approval ones too),
 QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
-0 turns the idle watchdog off), QUEUE_STAGE_TIMEOUT (10800 s; one agent
+0 turns the idle watchdog off), QUEUE_PLANNERS (3; a ticket's first plan is
+drafted by this many planners, one after the other, and merged; 1: one
+planner), QUEUE_PLANNER_MODELS (one model per planner, comma-separated;
+default QUEUE_MODEL), QUEUE_REVIEWERS (general,ux,standards; a loop's first
+review is one reviewer per lens, merged; general: one reviewer), QUEUE_STAGE_TIMEOUT (10800 s; one agent
 launch at most), QUEUE_PARALLEL (1; tickets a run works at a time,
 the same as run --parallel N), QUEUE_DEBUG (1; 0 turns the debug agent off),
 QUEUE_DEBUG_TIMEOUT (1200 s; one debug agent at most), QUEUE_WATCH (1: a run
@@ -7610,6 +7614,8 @@ HELP
                    --syntax-check "${QUEUE_SYNTAX_CHECK:-1}"
                    --remote "${QUEUE_REMOTE:-origin}" --plan-review "${QUEUE_PLAN_REVIEW:-0}"
                    --outage-wait "${QUEUE_OUTAGE_WAIT:-21600}" --idle-min "${QUEUE_IDLE_MIN:-20}"
+                   --planners "${QUEUE_PLANNERS:-3}" --planner-models "${QUEUE_PLANNER_MODELS:-}"
+                   --reviewers "${QUEUE_REVIEWERS:-general,ux,standards}"
                    --stage-timeout "${QUEUE_STAGE_TIMEOUT:-10800}"
                    --debug "${QUEUE_DEBUG:-1}" --debug-timeout "${QUEUE_DEBUG_TIMEOUT:-1200}"
                    # the session databases a working agent writes to: its idle watchdog watches them

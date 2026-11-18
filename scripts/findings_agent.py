@@ -4,34 +4,49 @@
   findings_agent.py run    --state DIR --proxy URL --harness PATH [--model M] [--repo DIR]... [--default-repo DIR] [--once]
   findings_agent.py stop   --state DIR
   findings_agent.py status --state DIR [--json] [--running]
+  findings_agent.py archive-old --state DIR   archive the open findings of the old format (no steps)
 
 Each pass is one real opencode session (`harness host --read-only -p`, in
 single-message mode unless FINDINGS_SINGLE_MESSAGE=0) on a free model. It runs
 in a snapshot of the repository's HEAD (git archive into DIR/tree/, secret-looking
 files left out), may read, grep, glob and run read-only commands there, and
 can change nothing: no edit or write tool, no command that writes, nothing
-outside the snapshot. It is given an area of the repository to start from (a
-folder, two levels deep) and one question, and told to follow calls, imports,
-config and data across files, since bugs are often in how parts meet. It ends
-its answer with FINDING-<nonce> lines and one COVERED-<nonce> line; this
-script checks them and keeps the ones that cite real code. Its memory between
-passes is the files below: what earlier passes of the area covered and found
-goes into the next one's prompt. Every session is on the web UI (/runs), and
-the agent's card lists them.
+outside the snapshot. Its memory between passes is the files below; every
+session is on the web UI (/runs), and the agent's card lists them.
 
-Passes: each area of each repository times the questions that fit it:
-  bug       code: wrong logic, contracts that callers and callees disagree on,
-            unhandled errors, races, leaks, security holes
-  trace     code: one path followed end to end across files (entry point,
-            calls, data, side effects, errors), written into the area's note
-  ui        areas with web/UI files: what a user would notice
-  cleanup   code: duplication, dead code, needless complexity, wrong docs
-Order: passes whose area changed (any file's blob), whose prompt version or
-owner notes changed, or that never ran; then every other pass, the one run
-longest ago first. It never runs out: when all are done it goes over them
-again, each time from the area's note and what earlier passes covered, so a
-pass looks further than the last one. A pass that fails 3 times in a row is
-set aside for 24 h or until its area changes.
+Passes, two questions:
+  bug       one per entry point: a file where the app wires what users do (a
+            .ui form, code that makes actions, buttons, menus, shortcuts or
+            connects their signals, routes, CLI parsers); an area (a folder,
+            two levels deep) when a repository has none. The session picks a
+            thing a user does there and follows its handler through every file
+            to its effect. A bug is reported as a BUG block: the control's text
+            (found in the code), numbered steps, expected, actual, the line that
+            causes it with a copy of it, and a trace of 2+ path:line hops, each
+            line copied. At most 2 a pass; none is the normal answer.
+  cleanup   one per area: the rolling lists (themes). Each theme is one finding
+            on the board with items added over time: unused (files nothing
+            names; a mechanical scan at each HEAD, plus pairs only the build
+            names), dead (code nothing calls), unify (the same logic twice, or
+            own code a maintained library does), safety, and the owner's themes
+            (DIR/themes.md: "## slug", "title: ...", what to look for; a built-in
+            slug there replaces it, "off" turns it off). ITEM lines, at most 10.
+A BUG block that passes the checks (control text in a tracked file, 2+ steps,
+expected and actual, evidence within 8 lines of its line, 2+ trace hops whose
+lines are there, at most one bad, not near a known one) waits in ledger.json
+"pending" for a second session that tries to refute it (a guard upstream? can
+the UI produce it? known already?) with the code around each hop; only a "real"
+verdict goes on the board. One that gets no verdict is tried again, 3 times.
+What is known (open and owner-dismissed findings, the ticket agents' findings
+notes, every rolling item) is in .findings-notes/KNOWN.md of the snapshot,
+one line each by file, and a candidate on the same file within 12 lines whose
+title shares half its words with a known one is dropped as a duplicate.
+Order: passes whose area changed (any file's blob), whose prompt version, owner
+notes or (cleanup) themes changed, or that never ran, bug and cleanup in turn;
+then every other pass, the one run longest ago first. It never runs out: when
+all are done it goes over them again, each time from the area's note and what
+earlier passes covered. A pass that fails 3 times in a row is set aside for
+24 h or until its area changes.
 
 Notes: every pass also writes what it learned about the area (what it is for,
 its files, entry points, how data flows, the paths it traced, its contracts and
@@ -42,12 +57,13 @@ also correct up to 2 other areas' notes. Every pass gets its area's note in the
 prompt (marked when the area's files changed since) and all of the
 repository's notes, with INDEX.md, in .findings-notes/ of its snapshot. The web
 UI lists them at /runs/findings/notes.
-Open findings are checked against HEAD whenever it moves (evidence gone:
-status stale).
+Open findings and rolling items are checked against HEAD whenever it moves
+(evidence gone: the finding is stale, the item gone).
 
-A finding is kept only when its file is in HEAD and its evidence (a line
-copied from the code) is found within 8 lines of the line it names. Its id is
-"f-" and 12 hex of sha1(repo name, path, category, evidence).
+A bug's id is "f-" and 12 hex of sha1(repo name, path, category, evidence); a
+theme's finding is "r-<theme>-<8 hex of the repo>" (a "-N" generation once the
+owner archived the one before), its items "i-" and 12 hex; the owner can
+archive one item ("not this one") and it is not added again.
 
 Guards: one pass at a time, FINDINGS_GAP seconds apart; a pass is ended after
 FINDINGS_PASS_TIMEOUT s, or after FINDINGS_IDLE_TIMEOUT s with no new output
@@ -81,7 +97,12 @@ Environment (defaults):
 Files under DIR:
   findings.json   {"version":1,"findings":[{id, category, severity, title, detail,
                   path, line, found_at, project, lens, evidence, model, status,
-                  stale_at, session, area}]}; only this process writes it
+                  stale_at, session, area, entry, ui, steps, expected, actual,
+                  trace [{path, line, code}], verdict}, {id, kind "rolling",
+                  category, theme, title, detail, project, items [{id, path,
+                  line, evidence, note, locations, found_at, session, status,
+                  source}], ...}]}; only this process writes it (and
+                  archive-old writes board.json, under board.lock)
   ledger.json     per pass key: area sha, prompt hash, last run, outcome,
                   failures, covered; the file index; per-question counts;
                   "passes": the last 200 sessions {n, session, repo, area, lens,
@@ -95,6 +116,7 @@ Files under DIR:
                   session, lens, sha, head, chars, summary, changed}]}
   agent.out       the log when started detached; agent.out.1 at 5 MB
   notes.md        the owner's notes, added to every prompt (first 4k chars)
+  themes.md       the owner's rolling themes (see cleanup above)
   stop            ask a running agent to end
   wanted          the owner started it and has not stopped it: harness serve
                   starts it again when it is not running (after a restart)
@@ -120,7 +142,9 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from vault_ingest import (InfraError, SECRET_PATH, SKIP_DIRS, SKIP_EXT, SKIP_NAMES,  # noqa: E402
-                          pid_alive, safe_git, try_lock)
+                          pid_alive, safe_git, try_lock, words)
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "serve"))
+import findings_view  # noqa: E402  (the ticket agents' findings, and board.json's lock)
 
 
 def _env_num(name, default, cast=float, lo=0):
@@ -138,17 +162,30 @@ IDLE_TIMEOUT = _env_num("FINDINGS_IDLE_TIMEOUT", 600, int, 30)
 OPEN_MAX = _env_num("FINDINGS_OPEN_MAX", 200, int, 1)
 SINGLE = os.environ.get("FINDINGS_SINGLE_MESSAGE", "1").strip() != "0"
 
-PROMPT_VERSION = "3"
-LENSES = ("bug", "trace", "ui", "cleanup")   # priority order
-CATEGORIES = ("bug", "ui", "refactor", "simplify", "remove", "docs")
+PROMPT_VERSION = "4"
+LENSES = ("bug", "cleanup")   # the passes' questions; "verify" checks a bug pass's reports
 PREFERRED = ("gemini-3.8-flash", "gemini-2.5-pro")
 MAX_BYTES = 400 * 1024
 NOTES_MAX = 4000
 AREA_FILES_SHOWN = 60
 PRIOR_MAX = 25
 COVERED_MAX = 5
-PER_PASS = 8
+BUG_PER_PASS = 2           # bug reports a pass may make (none is the normal answer)
+ITEM_PER_PASS = 10         # items a cleanup pass may add to the rolling lists
 EVIDENCE_WINDOW = 8
+STEPS_MIN, STEPS_MAX = 2, 12
+TRACE_MIN, TRACE_MAX = 2, 10
+UI_SHOWN = 40              # texts of an entry point's controls listed in its prompt
+DUP_LINES = 12             # a candidate this near a known one, sharing half its title's words: a duplicate
+DUP_SHARE = 0.5
+VERIFY_BATCH = 4           # reports one checking session gets
+VERIFY_TRIES = 3           # a report with no verdict after this many sessions is dropped
+PENDING_MAX = 20
+HOP_CONTEXT = 15           # lines around each trace hop shown to the checker
+KNOWN_LINES = 3000         # lines of KNOWN.md
+DISMISSED_KEEP = 2000      # owner-archived findings remembered after the store drops them
+THEMES_MAX = 6000          # characters of themes.md read
+LOCATIONS_MAX = 20
 FAIL_SET_ASIDE = 3
 SET_ASIDE = 24 * 3600      # seconds a pass that failed FAIL_SET_ASIDE times waits (or until its area changes)
 KNOW_IN = 8000             # characters of the area's note in its prompt
@@ -179,26 +216,76 @@ UI_DIRS = {"web", "ui", "frontend", "static", "templates", "public", "www", "com
 CODE_NAMES = {"Dockerfile", "Makefile"}
 GENERATED_RE = re.compile(r"@generated|do not edit|auto-?generated|generated by|generated: harness", re.I)
 
+ENTRY_RE = re.compile(
+    r"\b(?:addAction|addMenu|QAction|QPushButton|QToolButton|QMenu|QShortcut|QCheckBox|QComboBox|QDialog|"
+    r"connect\s*\([^;]{0,240}?(?:triggered|clicked|toggled|activated|accepted|textChanged|textEdited|"
+    r"valueChanged|currentIndexChanged|returnPressed|editingFinished|stateChanged|itemChanged)|"
+    r"on_\w+_(?:clicked|triggered|toggled|activated|accepted|textChanged|valueChanged)|"
+    r"addEventListener|onClick|onclick|onSubmit|onChange|MouseArea|onClicked|onTriggered|"
+    r"app\.(?:route|get|post|put|delete)|router\.(?:get|post|put|delete)|add_parser|ArgumentParser|"
+    r"click\.command|typer\.Typer)\b")
+UI_TEXT_RE = re.compile(   # the texts users see, as code gives them
+    r"\b(?:tr|qsTr|QObject::tr|i18n|QCoreApplication::translate|gettext|_)\s*\(\s*(?:\"[^\"\n]*\"\s*,\s*)?"
+    r"\"((?:[^\"\\\n]|\\.){2,120})\"|"
+    r"\b(?:setText|setWindowTitle|setToolTip|setStatusTip|setPlaceholderText|setTitle|setLabelText|addAction|"
+    r"addMenu|addTab|setTabText|information|warning|critical|question|getText|getOpenFileName|"
+    r"getSaveFileName|QAction|QPushButton|QMenu|QLabel|QCheckBox|QRadioButton|QGroupBox|QToolButton)\s*\("
+    r"[^\"\n;]{0,60}\"((?:[^\"\\\n]|\\.){2,120})\"|"
+    r"\badd_(?:argument|parser)\(\s*[\"']([^\"'\n]{2,60})[\"']")
+UI_XML_RE = re.compile(r"<string(?![^>]*notr=\"true\")[^>]*>([^<]{1,200})</string>")
+MARKUP_TEXT_RE = re.compile(r">([^<>\n]{2,120})<")
+LITERAL_RE = re.compile(r"\"((?:[^\"\\\n]|\\.){2,200})\"|'((?:[^'\\\n]|\\.){2,200})'")
+MARKUP_EXT = {".ui", ".html", ".htm", ".xml", ".vue", ".svelte", ".jsx", ".tsx", ".qml"}
+# unused files: what a C/C++/Qt project builds or loads by name
+SRC_EXT = {".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm"}
+HDR_EXT = {".h", ".hh", ".hpp", ".hxx", ".h++", ".inl", ".ipp", ".tpp"}
+RES_EXT = {".ui", ".qrc", ".qss", ".png", ".svg", ".ico", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".icns"}
+BUILD_NAMES = {"cmakelists.txt", "meson.build", "makefile", "gnumakefile", "sconstruct", "sconscript", "build",
+               "build.bazel", "wscript", "configure.ac"}
+BUILD_EXT = {".cmake", ".pro", ".pri", ".vcxproj", ".filters", ".vcproj", ".qbs", ".mk", ".gyp", ".gypi", ".bzl"}
+GLOB_RE = re.compile(r"\bfile\s*\(\s*GLOB|\baux_source_directory\s*\(|\$\$files\s*\(|\bglob\s*\(", re.I)
+NOT_UNUSED = re.compile(r"(^|/)(tests?|testing|unittests?|docs?|doc|examples?|samples?|benchmarks?|3rdparty|"
+                        r"third_party|vendor|external|extern|deps|packaging|installer)(/|$)|(^|/)(test_|tst_)"
+                        r"|_tests?\.\w+$|Tests?\.\w+$|(^|/)main\.\w+$", re.I)
+REF_TOKEN = re.compile(r"[A-Za-z0-9_+\-]+\.[A-Za-z0-9]{1,10}")
+
+# The rolling lists: one finding per theme, items added over time. themes.md can
+# replace one (same slug) or turn it off ("off").
+THEMES = {
+    "unused": ("Files nothing uses",
+               "Whole files nothing builds, includes, loads or names: delete them after a look. The scan at each "
+               "HEAD lists the ones no other file names; add a file only when nothing but its own pair (foo.h with "
+               "foo.cpp) and the build lists name it, after grepping for its classes and functions."),
+    "dead": ("Code nothing calls",
+             "Functions, methods, classes, branches, settings and fields inside files that are used, which "
+             "nothing calls or reads: search for every caller first (signal/slot connections, names in strings, "
+             "callbacks, virtual overrides, tests do not count as users)."),
+    "unify": ("Code to unify or hand to a library",
+              "The same logic written in two or more places that should be one shared function (name every "
+              "place), and the project's own code for what the language's standard library, the frameworks it "
+              "uses (for example Qt) or another maintained library it already depends on does: name the "
+              "function or class to use instead, so the project stops maintaining its own copy."),
+    "safety": ("Safety and robustness",
+               "Places a real input breaks: an unchecked size, index, null pointer, division, cast or parse "
+               "result; an ignored error from a file, network, process or database call; a resource not released "
+               "on an error path; a data race; undefined behaviour. Say which input breaks it. Not style."),
+}
+THEME_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
+
 QUESTIONS = {
-    "bug": "Find real bugs. Read the code of the area, then follow it: the functions it calls and the ones that "
-           "call it, the files it imports or is imported by, the config, environment, files and data formats it "
-           "shares with other parts. Many bugs are in how parts meet: a caller that passes what the callee does "
-           "not expect, a return value or error that is ignored or misread, two places that disagree on a "
-           "format, a path, a key or a state; a race, a leaked resource, a security hole, an edge case that "
-           "breaks something. Only what you can point to in the code. Not style, not naming, not missing tests.",
-    "trace": "Trace how something works, end to end. Pick one path that starts in this area and that the "
-             "notes do not describe yet, or describe thinly: a command, a request handler, a job, a public "
-             "function. Follow it through every function and file it reaches, in other areas too: what goes in, "
-             "what state it reads and writes, what it calls, how its errors travel, what comes out. Write what "
-             "you traced into the note, and report what breaks or can break along the way.",
-    "ui": "Find user interface problems a user would notice: confusing, wrong or inconsistent text, missing "
-          "feedback or error states, a broken or cramped layout, accessibility problems (labels, contrast, "
-          "keyboard use), a control that does something unexpected, a page and its handler that disagree "
-          "(a field the server ignores, a route the page calls that does not exist). Follow the page to the "
-          "code that serves it.",
-    "cleanup": "Find code to delete or simplify, across files: duplicated logic that should be shared, a "
-               "function or file nothing uses any more (search for its callers first), needless indirection, "
-               "code made general but used one way, comments or docs that say something the code does not do.",
+    "bug": "Find bugs a user of the application can run into. Pick one or two things a user does that start in "
+           "this file (a menu action, a button, a dialog, a shortcut, a setting, opening or saving a file, a "
+           "command, a page). Find the handler each one runs and follow it through every function it calls, in "
+           "any file, to its effect: what is read, computed, stored and shown. Read the code on the way and grep "
+           "for callers and callees. Look for an input or a sequence of actions a user can really produce that "
+           "goes wrong: a wrong result, a crash, lost or corrupted data, a hang, a control that does nothing or "
+           "the wrong thing, two views that disagree after an edit, a setting that is not kept. Before you "
+           "report one, look for what would stop it: a check or clamp upstream, a disabled or hidden control, a "
+           "validator, an earlier step that cannot be skipped. If you cannot say how a user gets there, or you "
+           "are not sure it happens, do not report it. Not bugs: style, naming, missing tests, code that could "
+           "be cleaner, problems no user action reaches (those belong on the rolling lists).",
+    "cleanup": "Add to the owner's rolling lists. Read the area's code and what it calls, grep across the "
+               "repository, and add items to the lists below: only ones you checked, only ones not on them yet.",
 }
 
 _STOP = []
@@ -371,51 +458,78 @@ def area_of(path):
     return "/".join(parts[:2]) if parts else "."
 
 
-def ui_path(path):
-    parts = path.lower().split("/")
-    return os.path.splitext(parts[-1])[1] in UI_EXT or any(p in UI_DIRS for p in parts[:-1])
+def stem_of(path):
+    return os.path.splitext(path.rsplit("/", 1)[-1])[0]
 
 
 class Unit:
-    """One pass: an area of a repository and a question."""
+    """One pass: an area of a repository and a question; a bug pass also has its entry
+    point (the file it starts from). Its sha is the area's (its notes are the area's)."""
 
-    def __init__(self, root, area, lens, files, sha):
-        self.root, self.area, self.lens, self.files, self.sha = root, area, lens, files, sha
-        self.key = f"{root}:{area}:{lens}"
+    def __init__(self, root, area, lens, files, sha, entry=""):
+        self.root, self.area, self.lens, self.files, self.sha, self.entry = root, area, lens, files, sha, entry
+        self.key = f"{root}:{entry or area}:{lens}"
 
     def label(self):
-        return f"{os.path.basename(self.root)}: {self.area}/ ({self.lens})"
+        return f"{os.path.basename(self.root)}: {self.entry or self.area + '/'} ({self.lens})"
+
+
+def entries_of(paths, files):
+    """The area's entry points: code that wires what users do, and .ui forms (as the code
+    file of the same name, when there is one: that is where they are wired)."""
+    code = {}
+    for p in paths:
+        if files[p]["kind"] == "code":
+            code.setdefault(stem_of(p).lower(), []).append(p)
+    out = []
+    for p in paths:
+        ent = files[p]
+        if p.lower().endswith(".ui"):
+            twins = [c for c in code.get(stem_of(p).lower(), []) if os.path.splitext(c)[1].lower() in SRC_EXT
+                     or c.endswith(".py")]
+            p = twins[0] if twins else p
+        elif not (ent["kind"] == "code" and ent.get("entry")):
+            continue
+        if p not in out:
+            out.append(p)
+    return sorted(out)
 
 
 def units_of(root, files):
-    """The passes of a repository from its file index: one per area and question that fits."""
+    """The passes of a repository from its file index: a bug pass per entry point (per
+    area when the repository has none) and a cleanup pass per area with code."""
     areas = {}
     for path, ent in files.items():
         if ent.get("skip"):
             continue
         areas.setdefault(area_of(path), []).append(path)
-    out = []
+    by_area = []
     for area in sorted(areas):
         paths = sorted(areas[area])
-        kinds = {files[p]["kind"] for p in paths}
+        if not any(files[p]["kind"] == "code" for p in paths):
+            continue
         sha = sha16("\n".join(f"{p}:{files[p]['blob']}" for p in paths))
-        for lens in LENSES:
-            if lens in ("bug", "trace", "cleanup") and "code" not in kinds and not (lens == "cleanup" and "doc" in kinds):
-                continue
-            if lens == "ui" and not any(ui_path(p) and files[p]["kind"] == "code" for p in paths):
-                continue
-            out.append(Unit(root, area, lens, paths, sha))
+        by_area.append((area, paths, sha, entries_of(paths, files)))
+    any_entry = any(e for _, _, _, e in by_area)
+    out = []
+    for area, paths, sha, ents in by_area:
+        if any_entry:
+            out += [Unit(root, area, "bug", paths, sha, entry=e) for e in ents]
+        else:
+            out.append(Unit(root, area, "bug", paths, sha))
+        out.append(Unit(root, area, "cleanup", paths, sha))
     return out
 
 
 def due(units, ledger_units, prompt_hash, t):
     """(first, rest): the passes to run, in order. First the ones whose area changed,
-    whose prompt version or owner notes changed or that never ran (by question);
-    then every other one, the one explored longest ago first, so the agent never
-    runs out: it goes over each area again, from what its note and the last passes
-    covered. Left out: a failed pass while it is deferred, and one that failed
-    FAIL_SET_ASIDE times in a row, for SET_ASIDE seconds or until its area changes."""
-    first, rest = [], []
+    whose prompt (its version, the owner's notes, for cleanup the themes) changed or
+    that never ran, bug and cleanup in turn; then every other one, the one explored
+    longest ago first, so the agent never runs out: it goes over each again, from what
+    its note and the last passes covered. Left out: a failed pass while it is
+    deferred, and one that failed FAIL_SET_ASIDE times in a row, for SET_ASIDE seconds
+    or until its area changes. prompt_hash: {lens: hash}."""
+    first, rest, rank = [], [], {}
     for u in units:
         e = ledger_units.get(u.key) or {}
         if e.get("fail_sha") == u.sha:
@@ -423,12 +537,17 @@ def due(units, ledger_units, prompt_hash, t):
                 continue
             if e.get("failures", 0) >= FAIL_SET_ASIDE and t - e.get("tried", 0) < SET_ASIDE:
                 continue
-        if e.get("sha") != u.sha or e.get("prompt") != prompt_hash:
+        if e.get("sha") != u.sha or e.get("prompt") != prompt_hash.get(u.lens):
             first.append(u)
         else:
             rest.append((e.get("scanned", 0), LENSES.index(u.lens), u))
-    first.sort(key=lambda u: (LENSES.index(u.lens), u.root, u.area))
-    rest.sort(key=lambda x: (x[0], x[1], x[2].root, x[2].area))
+    first.sort(key=lambda u: (LENSES.index(u.lens), u.root, u.area, u.entry))
+    seen = {}
+    for u in first:   # in turn: the n-th bug pass, then the n-th cleanup pass
+        rank[u.key] = seen.get(u.lens, 0)
+        seen[u.lens] = rank[u.key] + 1
+    first.sort(key=lambda u: (rank[u.key], LENSES.index(u.lens)))
+    rest.sort(key=lambda x: (x[0], x[1], x[2].root, x[2].area, x[2].entry))
     return first, [u for _, _, u in rest]
 
 

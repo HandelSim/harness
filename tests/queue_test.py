@@ -27,11 +27,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import ticket_queue as tq  # noqa: E402
 
 TICKET = "# ABC-1: Add a feature file\n\nPlease add a feature file that says hello feature.\n"
+ITEM = "[cleanup] feature.txt:1: `hello feature` say it twice"   # the fake review's Must fix item
 
 # The agent of every stage. Reads the stage from the prompt (the last argument)
 # and does what FAKE_* in its environment say.
 FAKE_AGENT = r'''
 import os, re, subprocess, sys
+ITEM = "[cleanup] feature.txt:1: `hello feature` say it twice"
 args = sys.argv[1:]
 vault = os.environ["FAKE_VAULT"]
 log = open(os.environ["FAKE_CALLS"], "a")
@@ -139,11 +141,32 @@ if stage == "implementing" and os.environ.get("FAKE_INSTEAD") and not (
 if stage == "planning":
     blocking = os.environ.get("FAKE_BLOCKING") and "Use the blue one" not in prompt
     qs = "- [blocking] Which colour? Default: blue\n" if blocking else "- None\n"
+    qs = os.environ["FAKE_QS"] + "\n" if os.environ.get("FAKE_QS") and blocking else qs   # the question's own words
     crit = os.environ.get("FAKE_CRITERIA", "- AC1: GIVEN the project WHEN the change is in THEN a file feature.txt says "
                           "hello feature (ticket: \"add a feature file\")\n")
     if not os.environ.get("FAKE_RAW_CRITERIA"):   # a spec's criteria each say how they are checked
         crit = re.sub(r"(?m)^(- AC\d+:.*?)[ \t]*$", lambda m: m.group(1) if "[check:" in m.group(1)
                       else m.group(1) + " [check: test]", crit)
+    planner = re.search(r"You are planner (\d+) of (\d+)", prompt)   # one of the plan panel's planners
+    if planner:
+        open(os.environ["FAKE_CALLS"] + ".planners", "a").write(planner.group(1) + "\n")
+        bad = os.environ.get("FAKE_BAD_DRAFTS", "").split(",")
+        if planner.group(1) in bad:   # a draft that is not a plan
+            open(path("Write the plan to"), "w").write("I looked at the code.\n")
+            sys.exit(0)
+        if planner.group(1) == os.environ.get("FAKE_DRAFT_SLEEP") and not os.path.exists(os.environ["FAKE_CALLS"] + ".draftslept"):
+            import time   # the queue is halted or killed while this planner works
+            open(os.path.join(os.path.dirname(path("Write the plan to")), "ABC-1-plan-draft-2.md"), "w").write("half")
+            open(os.environ["FAKE_CALLS"] + ".draftslept", "w").write("x")
+            log.flush()
+            time.sleep(int(os.environ.get("FAKE_DRAFT_SLEEP_SECS", "20")))
+        if planner.group(1) == "2":   # the second planner finds an edge case the others miss
+            crit += ("- AC2: GIVEN feature.txt already exists WHEN the change is in THEN it says hello feature once "
+                     "(edge of AC1) [check: review]\n")
+        if os.environ.get("FAKE_PEEK_DRAFTS"):   # what another planner's draft looks like from here
+            d = os.path.dirname(path("Write the plan to"))
+            open(os.environ["FAKE_CALLS"] + ".peek", "a").write(
+                planner.group(1) + ":" + ",".join(sorted(f for f in os.listdir(d) if "draft" in f)) + "\n")
     plan = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n" + crit +
             "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
             "## Assumptions\n- None\n")
@@ -228,9 +251,26 @@ elif stage in ("implementing", "fixing"):
         f.write("- other.py:3: an unrelated bug (seen while " + stage + " ABC-1)\n")
 elif stage == "reviewing":
     fixed = "+fixed by review" in prompt and os.environ.get("FAKE_MUSTFIX") != "always"   # the fix round did it
-    must = "- feature.txt:1: say it twice\n" if os.environ.get("FAKE_MUSTFIX") and not fixed else "- None\n"
+    must = "- " + ITEM + "\n" if os.environ.get("FAKE_MUSTFIX") and not fixed else "- None\n"
     crit = os.environ.get("FAKE_VERDICTS", "")   # the review's ## Criteria lines
     must = "- [exec] feature.txt:1: `make check` fails\n" if os.environ.get("FAKE_MUSTFIX") == "exec" else must
+    must = os.environ["FAKE_MUST_TEXT"] + "\n" if os.environ.get("FAKE_MUST_TEXT") and not fixed else must
+    lens = re.search(r"You are the (\w+)(?:-\w+)? reviewer", prompt)   # one of the review panel's reviewers
+    if lens:
+        open(os.environ["FAKE_CALLS"] + ".lenses", "a").write(lens.group(1) + "\n")
+        if lens.group(1) in os.environ.get("FAKE_BAD_LENSES", "").split(","):
+            open(path("Write the review to"), "w").write("Looked.\n")
+            sys.exit(0)
+        if lens.group(1) == "ux":   # a real bug, its steps on lines of their own
+            must = ("- [bug] feature.txt:1: `hello feature` is lower-case where the app's other greetings are not.\n"
+                    "  Steps:\n  1. open the app\n  2. look at the greeting\n  Sees: hello feature. Expected: Hello feature.\n")
+        elif lens.group(1) == "standards":   # the same place as the general one's, and one made up
+            must = ("- [cleanup] feature.txt:2: `hello feature` written twice\n"
+                    "- [risk] feature.txt:1: this may crash someday\n"
+                    "- [bug] feature.txt:1: `hello feature` looks wrong\n")
+            crit = ""
+        if lens.group(1) != "general":
+            crit = ""
     open(path("Write the review to"), "w").write("# ABC-1 review\n" + ("## Criteria\n" + crit if crit else "")
                                                  + "## Must fix\n" + must + "## Notes\n- None\n")
 if os.environ.get("FAKE_HANG_AFTER") and os.environ.get("FAKE_HANG_STAGE", stage) == stage:
@@ -255,9 +295,24 @@ class FakeProxy(http.server.BaseHTTPRequestHandler):
     down_left = 0      # the next N requests get 502 whatever the mode
     badquote_left = 0  # the next N "check a code change" answers quote what is not in the diff
     hang_secs = 5
+    merge = "ok"       # ok | noledger (no ledger at all) | once (the first merge lacks a ledger) | new (adds a criterion) | down
+    merges = 0
 
     def log_message(self, *a):
         pass
+
+    @staticmethod
+    def merged(prompt):
+        drafts = re.findall(r"<<<BEGIN_DRAFT (\d+)[^\n]*>>>\n(.*?)\n<<<END_DRAFT", prompt, re.S)
+        best = max((d for _, d in drafts), key=len)
+        ledger = "".join(f"D{i}-{x} -> {x}\n" for i, d in drafts for x in re.findall(r"^- ((?:AC|Q|A)\d+)\b", d, re.M))
+        mode = FakeProxy.merge
+        if mode == "noledger" or (mode == "once" and FakeProxy.merges == 1):
+            return best
+        if mode == "new":
+            best = best.replace("## Approach", "- AC9: GIVEN nothing WHEN nothing THEN a thing no draft has "
+                                "(edge of AC1) [check: review]\n## Approach")
+        return best + "\n=== LEDGER ===\n" + ledger
 
     def reply(self, code, obj):
         body = json.dumps(obj).encode()
@@ -286,6 +341,9 @@ class FakeProxy(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"choices": [{"message": {"content": "too late"}}]})
         if FakeProxy.mode == "garbage" and "check a" in prompt:
             return self.reply(200, {"choices": [{"message": {"content": "Looks fine to me, ship it."}}]})
+        if "You are merging" in prompt:   # the plan panel's drafts: the longest kept, every item in the ledger
+            FakeProxy.merges += 1
+            return self.reply(200, {"choices": [{"message": {"content": FakeProxy.merged(prompt)}}]})
         m = re.search(r"numbered:\n((?:\d+\. .*\n)+)", prompt)
         n = len(m.group(1).splitlines()) if m else 0
         ids = re.search(r"with their ids:\n((?:AC\d+: .*\n)+)", prompt)   # a plan's criteria, by AC number
@@ -357,6 +415,7 @@ class Base(unittest.TestCase):
                 del os.environ[k]
         os.environ.update(FAKE_VAULT=self.vault, FAKE_CALLS=self.calls, FAKE_TICKET=TICKET)
         FakeProxy.mode = "ok"
+        FakeProxy.merge, FakeProxy.merges = "ok", 0
         FakeProxy.seen = []
         FakeProxy.down_left = 0
         FakeProxy.badquote_left = 0
@@ -388,8 +447,10 @@ class Base(unittest.TestCase):
 
     def run_queue(self, *extra):
         # an outage ends the run and no idle watchdog, unless a test asks (the last one given wins)
+        # one planner and one reviewer unless a test asks for the panels
         return self.q("run", "--vault", self.vault, "--proxy", self.proxy, "--harness", self.harness,
-                      "--default-model", "free-withtools", "--outage-wait", "0", "--idle-min", "0", *extra)
+                      "--default-model", "free-withtools", "--outage-wait", "0", "--idle-min", "0",
+                      "--planners", "1", "--reviewers", "general", *extra)
 
     def status(self, key="ABC-1"):
         return tq.Queue(self.state).load(key)
@@ -1424,6 +1485,9 @@ class QueueTest(Base):
             text = tq.render(name, DIFF="d", MUST_FIX="m", **{**v, **more})
             self.assertNotIn("{{", text, name)
             self.assertLess(len(text), 120_000)
+        merge = tq.render("plan_merge", KEY="K-1", N="2", DRAFTS="d", LEDGER_MARK=tq.LEDGER_MARK, TICKET="t",
+                          NOTES="n", SPEC_QUESTIONS="3")
+        self.assertNotIn("{{", merge)
         for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="AC1: c", ANSWERS="a")),
                            ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m", FIX_DIFF="f",
                                                   MET_WHEN=tq.MET_WHEN[0])),
@@ -1467,7 +1531,7 @@ class ReviewFixesTest(Base):
         self.add("ABC-1")
         self.run_queue()
         fix_prompts = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
-        self.assertIn("2. (review) feature.txt:1: say it twice", fix_prompts)
+        self.assertIn("2. (review) " + ITEM, fix_prompts)
 
     def test_a_wrong_review_item_can_be_answered_in_the_commit_message(self):
         os.environ.update(FAKE_MUSTFIX="1", FAKE_FIX_REJECT="1")
@@ -1496,7 +1560,7 @@ class ReviewFixesTest(Base):
         rc, out = self.run_queue()
         st = self.status()
         self.assertEqual(st["status"], "done", out)
-        self.assertEqual(st["open_opinions"], ["feature.txt:1: say it twice"])
+        self.assertEqual(st["open_opinions"], [ITEM])
         self.assertNotIn("packet", st)
 
     def test_exec_items_with_no_progress_stop_with_a_packet(self):
@@ -1711,7 +1775,7 @@ class OwnerControlTest(Base):
         self.addCleanup(out.close)
         p = subprocess.Popen([sys.executable, tq.__file__, "--state", self.state, "run", "--vault", self.vault,
                               "--proxy", self.proxy, "--harness", self.harness, "--default-model", "free-withtools",
-                              *extra], stdout=out, stderr=subprocess.STDOUT, text=True)
+                              "--planners", "1", "--reviewers", "general", *extra], stdout=out, stderr=subprocess.STDOUT, text=True)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         return p
 
@@ -1799,7 +1863,7 @@ class OwnerControlTest(Base):
         self.assertIn("ABC-2", sh("git", "-C", self.remote, "branch", "--list", "ABC-2"))
         # No plan and no criteria in the ticket: held to the ticket as a whole, and the review.
         prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
-        self.assertIn("1. " + tq.NO_PLAN_CRITERION + "\n2. (review) feature.txt:1: say it twice", prompt)
+        self.assertIn("1. " + tq.NO_PLAN_CRITERION + "\n2. (review) " + ITEM, prompt)
 
     def test_implement_without_a_plan_takes_the_tickets_criteria(self):
         os.environ["FAKE_TICKET"] = TICKET + "\n## Acceptance criteria\n- A file says hello feature\n\n## Notes\nx\n"
@@ -2784,7 +2848,7 @@ class ReviewerFixesTest(Base):
         self.addCleanup(out.close)
         p = subprocess.Popen([sys.executable, tq.__file__, "--state", self.state, "run", "--vault", self.vault,
                               "--proxy", self.proxy, "--harness", self.harness, "--default-model", "free-withtools",
-                              *extra], stdout=out, stderr=subprocess.STDOUT)
+                              "--planners", "1", "--reviewers", "general", *extra], stdout=out, stderr=subprocess.STDOUT)
         self.addCleanup(lambda: p.poll() is None and p.kill())
         end = time.time() + 30
         while not os.path.exists(self.calls + ".sleeping"):
@@ -5486,6 +5550,302 @@ class OwnerReviewTest(Base):
         self.assertEqual(len(tq.judge(obj, crit, whole, "quote", "diff")), 1)   # without the fix's diff: no proof
         # a plan criterion is judged on the whole change, as before
         self.assertEqual(len(tq.judge(obj, ["f.py has no debug output"], whole, "quote", "diff", fix_diff=fixed)), 1)
+
+
+class PanelTest(Base):
+    """A ticket's first plan from several planners, merged; a loop's first review from a
+    reviewer per lens, merged; and the review's Must fix items kept only with their evidence."""
+
+    PANEL = ("--planners", "3", "--reviewers", "general,ux,standards")
+
+    def notes(self):
+        return os.path.join(self.vault, "wiki", "notes", "tickets")
+
+    def drafts_in_vault(self):
+        return sorted(f for f in os.listdir(self.notes()) if "-draft-" in f or re.search(r"-review-\w+\.md$", f))
+
+    def test_three_planners_drafts_merged_into_the_plan(self):
+        os.environ["FAKE_PEEK_DRAFTS"] = "1"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "3", "--planner-models", "m-one,m-two", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        self.assertEqual(cat(self.calls + ".planners").split(), ["1", "2", "3"])
+        # each planner alone: no other draft in the notes while it works
+        self.assertEqual(cat(self.calls + ".peek").split(), ["1:", "2:", "3:"])
+        # one model per planner, round the list; the planners' launches only (no 4th planner)
+        plans = self.calls_of("planning")
+        self.assertEqual(len(plans), 3, plans)
+        self.assertEqual([re.search(r"-m (\S+)", l).group(1) for l in plans],
+                         ["harness/m-one", "harness/m-two", "harness/m-one"])
+        cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()[:3] if c.strip()]
+        self.assertTrue(all("You are planner" in c["done"] for c in cards), cards)
+        self.assertIn("ABC-1-plan-draft-2.md", cards[1]["done"])
+        # the merge kept the edge case only planner 2 found
+        plan = cat(os.path.join(self.notes(), "ABC-1-plan.md"))
+        self.assertIn("AC2: GIVEN feature.txt already exists", plan)
+        self.assertNotIn("=== LEDGER ===", plan)
+        self.assertEqual(FakeProxy.merges, 1)
+        pan = st["panels"]["plan"]
+        self.assertEqual((pan["drafts"], pan["merged"], pan["unique"]), (3, True, {"d1": 0, "d2": 1, "d3": 0}))
+        # files: the drafts out of the vault, in the ticket's panel folder, with the ledger
+        self.assertEqual(self.drafts_in_vault(), [])
+        d = os.path.join(tq.Queue(self.state).dir("ABC-1"), "panel")
+        self.assertEqual(sorted(os.listdir(d)), ["plan-d1.md", "plan-d2.md", "plan-d3.md", "plan-ledger.md",
+                                                 "plan-merge-0.txt"])
+        self.assertIn("D2-AC2 -> AC2", cat(os.path.join(d, "plan-ledger.md")))
+        outs = sorted(f for f in os.listdir(tq.Queue(self.state).dir("ABC-1")) if f.startswith("plan-"))
+        self.assertEqual(outs, ["plan-0-d1.out", "plan-0-d2.out", "plan-0-d3.out", "plan-0-panel.out"])
+        self.assertNotIn("panel", st)   # the panel at work is over once the plan passed
+        log = cat(os.path.join(tq.Queue(self.state).dir("ABC-1"), "log.txt")) if os.path.exists(
+            os.path.join(tq.Queue(self.state).dir("ABC-1"), "log.txt")) else out
+        self.assertIn("3 drafts merged into the plan", log + out)
+
+    def test_a_second_plan_is_one_planner(self):
+        # answered, followed up or retried: the panel is for a ticket's first plan only
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        ctx = types.SimpleNamespace(q=q, planners=3, planner_models="", model="m", reviewers="general,ux")
+        st = q.load("ABC-1")
+        p = tq.note_paths(self.vault, "ABC-1")
+        want = lambda st: tq.plan_panel_wanted(ctx, st, p)
+        self.assertTrue(want(st))
+        self.assertFalse(want(dict(st, attempt=1)))          # a retry: one planner, told what failed
+        self.assertFalse(want(dict(st, built_on="abc")))     # a follow-up round
+        self.assertFalse(want(dict(st, verify_only={"stage": "plan", "out": "x"})))
+        self.assertTrue(want(dict(st, attempt=1, panel={"stage": "plan", "members": {"d1": {}}})))   # under way
+        self.assertFalse(want(dict(st, panel={"stage": "plan", "members": {}, "done": True})))
+        put(os.path.join(q.dir("ABC-1"), "plan.json"), "{}")     # a plan passed before
+        self.assertFalse(want(st))
+        os.remove(os.path.join(q.dir("ABC-1"), "plan.json"))
+        os.makedirs(os.path.dirname(p["answers"]), exist_ok=True)
+        put(p["answers"], "Q1: (b)\n")                           # answered
+        self.assertFalse(want(st))
+        os.remove(p["answers"])
+        self.assertFalse(tq.plan_panel_wanted(types.SimpleNamespace(**dict(vars(ctx), planners=1)), st, p))
+        self.assertEqual(tq.planners(types.SimpleNamespace(**dict(vars(ctx), planners=9, planner_models="a,b"))),
+                         ["a", "b", "a", "b", "a"])                   # PANEL_MAX, round the models
+        self.assertEqual(tq.lenses(types.SimpleNamespace(reviewers="ux, nonsense,ux")), ["general", "ux"])
+        self.assertEqual(tq.lenses(types.SimpleNamespace(reviewers="")), ["general"])
+        self.assertTrue(tq.review_panel_wanted(ctx, st, 0))
+        self.assertFalse(tq.review_panel_wanted(ctx, st, 1))         # a fix round's review: one reviewer
+        self.assertFalse(tq.review_panel_wanted(ctx, dict(st, must_fix_by="owner"), 0))
+
+    def test_drafts_that_fail_their_check_do_not_count(self):
+        os.environ["FAKE_BAD_DRAFTS"] = "1,3"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(FakeProxy.merges, 0)   # one good draft: it is the plan, no merge
+        self.assertEqual((st["panels"]["plan"]["drafts"], st["panels"]["plan"]["used"]), (1, "d2"))
+        self.assertIn("AC2: GIVEN", cat(os.path.join(self.notes(), "ABC-1-plan.md")))
+        self.assertFalse(st["panels"]["plan"]["members"]["d1"]["ok"])
+        self.assertEqual(self.drafts_in_vault(), [])
+
+    def test_no_good_draft_one_planner_plans(self):
+        os.environ["FAKE_BAD_DRAFTS"] = "1,2,3"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(len(self.calls_of("planning")), 4)   # the three, then the stage's own planner
+        self.assertNotIn("You are planner", cat(self.calls + ".planning").split("=====")[-2])
+        self.assertEqual(st["panels"]["plan"]["drafts"], 0)
+
+    def test_a_merge_without_its_ledger_is_asked_again_then_the_first_draft(self):
+        FakeProxy.merge = "noledger"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(FakeProxy.merges, 2)
+        self.assertFalse(st["panels"]["plan"]["merged"])
+        self.assertIn("not in the ledger", st["panels"]["plan"]["why"])
+        self.assertNotIn("AC2: GIVEN", cat(os.path.join(self.notes(), "ABC-1-plan.md")))   # d1, as it was
+
+    def test_a_merge_asked_again_with_its_problems(self):
+        FakeProxy.merge = "once"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual((st["status"], FakeProxy.merges, st["panels"]["plan"]["merged"]), ("done", 2, True), out)
+        again = [s[2] for s in FakeProxy.seen if "You are merging" in s[2]][1]
+        self.assertIn("PROBLEMS_WITH_THE_LAST_MERGE", again)
+        self.assertIn("not in the ledger", again)
+
+    def test_a_merge_that_adds_what_no_draft_has_is_not_the_plan(self):
+        FakeProxy.merge = "new"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertFalse(st["panels"]["plan"]["merged"])
+        self.assertIn("from no draft", st["panels"]["plan"]["why"])
+        self.assertNotIn("AC9", cat(os.path.join(self.notes(), "ABC-1-plan.md")))
+
+    def test_merge_problems(self):
+        d1 = ("# K-1 plan\n## Goal\nA thing.\n## Acceptance criteria\n- AC1: GIVEN a WHEN b THEN c (ticket: \"x\")\n"
+              "## Questions\n- Q1 [blocking] Which? Options: (a) one (b) two (c) three Recommended: (a), because.\n"
+              "## Assumptions\n- A1: it is so\n")
+        d2 = d1.replace("- AC1", "- AC1: GIVEN d WHEN e THEN f (ticket: \"x\")\n- AC2", 1)
+        drafts = [("d1", d1), ("d2", d2)]
+        full = "D1-AC1 -> AC1\nD1-Q1 -> Q1\nD1-A1 -> A1\nD2-AC1 -> AC2\nD2-AC2 -> AC1\nD2-Q1 -> Q1\nD2-A1 -> dropped: same\n"
+        merged = d2
+        self.assertEqual(tq.merge_problems(merged, full, drafts), [])
+        self.assertEqual(tq.unique_kept(full, drafts), {"d1": 1, "d2": 1})   # d1's A1, d2's AC1 (now AC2)
+        p = tq.merge_problems(merged, full.replace("D2-AC2 -> AC1\n", ""), drafts)
+        self.assertTrue(any("draft 2's AC2 not in the ledger" in x for x in p), p)
+        p = tq.merge_problems(merged, full.replace("D2-AC1 -> AC2", "D2-AC1 -> AC7"), drafts)
+        self.assertTrue(any("points them at no item" in x for x in p), p)
+        self.assertTrue(any("AC2: in the plan but from no draft" in x for x in p), p)
+        long = merged.replace("A thing.", "A thing. " + "word " * 200)
+        self.assertTrue(any("1.2 times the median" in x for x in tq.merge_problems(long, full, drafts)))
+        # options: as many as there are good answers
+        self.assertEqual(len(tq.question(sectioned := tq.plan_questions(tq.sections(d1))[0], 1)["options"]), 3,
+                         sectioned)
+
+    def test_halted_during_the_second_planner_goes_on_with_it(self):
+        os.environ.update(FAKE_DRAFT_SLEEP="2", FAKE_DRAFT_SLEEP_SECS="60")
+        self.add("ABC-1")
+        p = OwnerControlTest.run_bg(self, "--planners", "3", "--reviewers", "general")
+        OwnerControlTest.wait_for(self, lambda: os.path.exists(self.calls + ".draftslept"), "planner 2", 60)
+        rc, out = self.q("halt")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(timeout=30), 0)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("queued", "plan"))
+        self.assertEqual(sorted(st["panel"]["members"]), ["d1"])   # d1 done, d2 cut off
+        self.assertEqual(self.drafts_in_vault(), [])   # the half draft is not left for the next one to read
+        rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(cat(self.calls + ".planners").split(), ["1", "2", "2", "3"])   # d1 not again
+        self.assertTrue(st["panels"]["plan"]["merged"])
+
+    def test_killed_during_the_second_planner_goes_on_with_it(self):
+        os.environ.update(FAKE_DRAFT_SLEEP="2", FAKE_DRAFT_SLEEP_SECS="8")
+        self.add("ABC-1")
+        p = OwnerControlTest.run_bg(self, "--planners", "3", "--reviewers", "general")
+        OwnerControlTest.wait_for(self, lambda: os.path.exists(self.calls + ".draftslept"), "planner 2", 60)
+        p.kill()
+        p.wait()
+        time.sleep(9)   # the orphaned planner finishes on its own
+        rc, out = self.run_queue("--planners", "3", "--reviewers", "general")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(cat(self.calls + ".planners").split()[:2], ["1", "2"])
+        self.assertEqual(cat(self.calls + ".planners").split().count("1"), 1, out)
+        self.assertTrue(st["panels"]["plan"]["merged"], st["panels"])
+        self.assertEqual(self.drafts_in_vault(), [])
+
+    def test_three_reviewers_merged_and_the_unevidenced_dropped(self):
+        os.environ["FAKE_MUSTFIX"] = "1"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "1", "--reviewers", "general,ux,standards")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(cat(self.calls + ".lenses").split(), ["general", "ux", "standards"])
+        d = tq.Queue(self.state).dir("ABC-1")
+        self.assertEqual(sorted(os.listdir(os.path.join(d, "panel"))),
+                         ["review-general.md", "review-standards.md", "review-ux.md"])
+        self.assertEqual(self.drafts_in_vault(), [])
+        row = st["review_verdicts"][0]
+        self.assertTrue(row["panel"])
+        # general's cleanup and standards' at line 2 are one item; ux's bug with its Steps
+        # list kept whole; standards' risk with no quote or Trigger, and its bug with no
+        # Steps, dropped
+        why = {x["item"][:30]: x["why"] for x in row["dropped"]}
+        self.assertEqual(len(row["dropped"]), 2, row["dropped"])
+        self.assertTrue(any("[risk]" in x["item"] and "quotes no code" in x["why"] for x in row["dropped"]), why)
+        self.assertTrue(any("[bug]" in x["item"] and "Steps:" in x["why"] for x in row["dropped"]), why)
+        fixes = cat(self.calls + ".fixing") if os.path.exists(self.calls + ".fixing") else \
+            cat(self.calls + ".implementing").split("=====")[-2]
+        self.assertIn("(also found by the standards reviewer)", fixes)
+        self.assertIn("2. look at the greeting", fixes)
+        self.assertNotIn("this may crash someday", fixes)
+        # the second review (after the fix round) is one reviewer
+        self.assertEqual(cat(self.calls + ".lenses").split(), ["general", "ux", "standards"])
+        self.assertEqual(len(self.calls_of("reviewing")), 4)
+        cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines() if c.strip()]
+        self.assertTrue(any("You are the ux reviewer" in c.get("done", "") for c in cards))
+
+    def test_no_general_review_one_reviewer_reviews(self):
+        os.environ.update(FAKE_BAD_LENSES="general")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--planners", "1", "--reviewers", "ux,general")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(cat(self.calls + ".lenses").split(), ["general", "ux"])   # general first, whatever the order
+        self.assertEqual(len(self.calls_of("reviewing")), 3)
+        self.assertFalse(st["panels"]["review"]["merged"])
+
+    def test_a_single_review_is_asked_once_for_its_evidence(self):
+        os.environ["FAKE_MUST_TEXT"] = "- [bug] feature.txt:1: `hello feature` is wrong"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(len(self.calls_of("reviewing")), 2, out)   # asked once, then dropped
+        self.assertIn("Steps:", st["review_verdicts"][-1]["dropped"][0]["why"])
+        self.assertEqual(st["review_verdicts"][-1]["summary"]["opinion"], [])
+        self.assertEqual(self.calls_of("fixing"), [])
+
+    def test_must_items_and_the_evidence_gate(self):
+        body = ("- [bug] a.py:3: `total = price + 1` wrong.\n  Steps:\n  1. open it\n  2. press Go\n  Sees: 2. Expected: 1.\n"
+                "1. [risk] a.py:4: `del items[0]` Trigger: an empty list\n- None\n")
+        items = tq.must_items(body)
+        self.assertEqual(len(items), 2, items)
+        self.assertIn("2. press Go", items[0])
+        repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo)
+        os.makedirs(os.path.join(repo, "sub", "pkg"))
+        put(os.path.join(repo, "sub", "pkg", "a.py"), "import os\ntotal = price + 1\nz = 2\ndel items[0]\n")
+        diff = ("diff --git a/sub/pkg/a.py b/sub/pkg/a.py\n--- a/sub/pkg/a.py\n+++ b/sub/pkg/a.py\n@@\n+total = price + 1\n"
+                " z = 2\n+self.cache_two = {}\n")
+        gate = lambda m: tq.evidence_problem(m, repo, diff)
+        self.assertEqual(gate(items[0]), "")              # a path given from deeper down: the diff's file
+        self.assertEqual(gate(items[1]), "")
+        self.assertEqual(gate("[bug] b/sub/pkg/a.py:2: `total = price + 1` wrong. Steps: 1) go. Actual: boom"), "")
+        self.assertEqual(gate("[bug] sub\\pkg\\a.py:2: `total = price + 1` wrong. Steps: 1) go. Sees: boom"), "")
+        self.assertIn("evidence tag", gate("[opinion] a.py:2: slow"))
+        self.assertIn("evidence tag", gate("a.py:2: untagged"))
+        self.assertIn("Steps:", gate("[bug] a.py:2: `total = price + 1` is wrong"))
+        self.assertIn("Trigger", gate("[risk] a.py:4: `del items[0]` may fail"))
+        self.assertIn("not in", gate("[risk] a.py:4: `items.pop(0) and more` Trigger: empty"))
+        self.assertIn("quotes no code", gate("[risk] a.py:4: `del` Trigger: empty"))
+        self.assertIn("names no path:line", gate("[risk] somewhere: `del items[0]` Trigger: empty"))
+        self.assertIn("not in the change or", gate("[risk] nope.py:4: `del items[0]` Trigger: empty"))
+        self.assertEqual(gate("[cleanup] a.py:3: `self.cache_two = {}` nothing reads it"), "")
+        self.assertIn("no line the change adds", gate("[cleanup] a.py:4: `del items[0]` old code"))
+        self.assertEqual(gate("[exec] a.py:1: `make test` Output: 2 failed"), "")
+        self.assertIn("names no command", gate("[exec] a.py:1: tests fail"))
+        self.assertIn("printed", gate("[exec] a.py:1: `make test` hmm"))
+        kept, dropped = tq.evidence_gate([items[0], "[opinion] a.py:2: slow"], repo, diff)
+        self.assertEqual((kept, [d["item"] for d in dropped]), ([items[0]], ["[opinion] a.py:2: slow"]))
+
+    def test_merge_reviews(self):
+        g = ("# K review\n## Criteria\n- AC1: PASS | `x` | y\n## Must fix\n- [cleanup] a.py:10: `self.n = 0` unused\n"
+             "## Notes\n- fine\n")
+        s = "# K review\n## Criteria\n- None\n## Must fix\n- [cleanup] a.py:18: `self.n = 0` unused too\n" \
+            "- [risk] a.py:40: `del q[0]` Trigger: empty\n## Notes\n- None\n"
+        u = "# K review\n## Criteria\n- AC1: FAIL | | no\n## Must fix\n- [bug] a.py:12: `self.n = 0` x Steps: 1) a Sees: b\n" \
+            "## Notes\n- tidy\n"
+        text, folded = tq.merge_reviews("K-1", [("general", g), ("standards", s), ("ux", u)])
+        secs = tq.sections(text)
+        self.assertEqual(secs["criteria"].strip(), "- AC1: PASS | `x` | y")   # the general reviewer's only
+        items = tq.must_items(secs["must fix"])
+        self.assertEqual(folded, 1)
+        self.assertEqual(len(items), 3, items)
+        self.assertIn("(found by the general reviewer) (also found by the standards reviewer)", items[0])
+        self.assertIn("[bug]", items[2])   # another tag at the same place: its own item
+        self.assertIn("[ux] tidy", secs["notes"])
+        # an item the gate will drop is not folded into, nor folds a sound one into it
+        bad = "# K review\n## Must fix\n- [cleanup] a.py:10: unused\n## Notes\n- None\n"
+        text, folded = tq.merge_reviews("K-1", [("general", bad), ("standards", g)],
+                                        ok=lambda m: "`" in m)
+        self.assertEqual((folded, len(tq.must_items(tq.sections(text)["must fix"]))), (0, 2))
+        self.assertEqual(tq.check_review(text)[0], [])
 
 
 class SpecLoopTest(unittest.TestCase):

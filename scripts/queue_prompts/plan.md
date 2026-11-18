@@ -21,7 +21,7 @@ Your working directory is {{WHERE}}{{ON_BRANCH}}. Read the code the ticket touch
 <<<BEGIN_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>
 {{FEEDBACK}}
 <<<END_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>
-
+{{PANEL}}
 Write the plan to {{PLAN_FILE}} (overwrite it) in exactly this shape. One line per item: never break an item over two lines. The ids (AC1, Q1, A1) are how the owner answers you, item by item.
 
 The owner reads this plan before anything is built and approves it or corrects it; a plan the owner misreads gets built wrong and done again. So write for a busy person: short plain lines, the owner's words and not the code's, nothing said twice. The Goal, How it works, Not included and Questions are what the owner reads first: they must be enough on their own to tell whether you understood the ticket.
@@ -38,7 +38,7 @@ One or two sentences in plain words: what the owner gets when the ticket is done
 - AC1: GIVEN <the starting state> WHEN <one action> THEN <one result you can see: output, file content, exit code, error text>. (ticket: "<words copied exactly from the ticket>") [check: test]
 - AC2: GIVEN ... WHEN ... THEN ... (edge of AC1) [check: cmd]
 ## Questions
-- Q1 [blocking] <question>? Options: (a) <...> (b) <...> Recommended: (a), because <one reason>.
+- Q1 [blocking] <question>? Options: (a) <...> (b) <...> (c) <...> Recommended: (a), because <one reason>.
 - Q2 [non-blocking] <question>? Options: (a) <...> (b) <...> Recommended: (b), because <one reason>.
 ## Assumptions
 - A1: <a decision you made yourself and the code fact behind it>.
@@ -49,7 +49,7 @@ How to fill it:
 - Goal, How it works, Not included: what changes for the owner, not how the code does it. Name things as the owner will meet them (the command, the button, the message text). Not included is where a wrong reading of the ticket shows: list what the ticket could be taken to ask for that you are leaving out.
 - Acceptance criteria: one behaviour each, at most 40 in all. First one for each thing the ticket asks for, tagged (ticket: "...") with the ticket's own words; at most 15 of these, and these are the ones the owner reads, so make each THEN something the owner can see and check. Then, for each, its edge cases, tagged (edge of ACn): empty, missing or invalid input; the limits; the error path; and the existing callers of the code the change touches, which must keep working. Nothing the ticket and its edge cases do not need: no new options, outputs or features. THEN is something running the code shows, not "the code is clean". {{TEST_CRITERIA}}, so make each one exact. {{TEST_STEP}}
 - End every criterion with how it is checked: [check: cmd] (a command's output or exit code shows it: a build, a script run), [check: test] (an automated test shows it), [check: review] (only reading the code shows it), [check: human] (only the owner can tell, by looking). At least one criterion is cmd or test; when nothing in this ticket can be run, add an Assumption "No executable check: <why>".
-- Questions: at most 3, only what the owner must decide so that what gets built is what they meant: where the ticket can be read two ways, what the owner will see, what is in or out of scope, an existing behaviour that would change. Ask in words someone who has not read the code can answer, with Options that each say what would be built, and a Recommended answer. [blocking] only when a wrong guess builds the wrong thing; the ticket then waits for the owner. A [non-blocking] one goes on at its Recommended answer, which the owner sees listed. Ask only what the ticket, the code and the owner's answers do not settle. Write "- None" when there are none.
+- Questions: at most 3, only what the owner must decide so that what gets built is what they meant: where the ticket can be read two ways, what the owner will see, what is in or out of scope, an existing behaviour that would change. Ask in words someone who has not read the code can answer, with Options that each say what would be built: one option for each distinct good answer, as many as there are (two, three, up to eight; never filler), and a Recommended answer. [blocking] only when a wrong guess builds the wrong thing; the ticket then waits for the owner. A [non-blocking] one goes on at its Recommended answer, which the owner sees listed. Ask only what the ticket, the code and the owner's answers do not settle. Write "- None" when there are none.
 - Assumptions: each decision you made alone that is too small to ask about, or "- None". The owner can correct one by its id.
 - Write it all as plain text a person reads: no LaTeX or $...$ math. Say it in words, or with symbols like ×, ≈, ≤, ≥ and →: "about S(A1) × D(A1)", not "$\approx S_{A1} \times D_{A1}$".
 

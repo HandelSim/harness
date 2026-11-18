@@ -303,6 +303,144 @@ class Render(Base):
         self.assertNotIn("data-sort-url", h)
 
 
+BUG = {"id": "f-0123456789ab", "category": "bug", "severity": "high", "title": "Saving a renamed layer drops its color",
+       "detail": "the rename path resets the color", "path": "src/layers.cpp", "line": 120, "evidence": "m_color = QColor();",
+       "found_at": "2026-11-18T08:00:00Z", "project": "/home/x/app", "status": "open", "ui": "Rename Layer...",
+       "steps": ["Open a project with two layers", "Right-click a layer, choose Rename Layer...",
+                 "Type a new name and press Enter", "File > Save, reopen the file"],
+       "expected": "the layer keeps its color", "actual": "the layer is black after reopening",
+       "trace": [{"path": "src/mainwindow.cpp", "line": 88, "code": "connect(renameAct, &QAction::triggered);"},
+                 {"path": "src/layers.cpp", "line": 120, "code": "m_color = QColor();"}],
+       "verdict": "real: no guard on the rename path"}
+
+ROLL = {"id": "r-unused-1a2b3c4d", "kind": "rolling", "category": "unused", "theme": "unused", "severity": "low",
+        "title": "Files nothing uses", "detail": "Files no build list compiles: safe to delete after a look.",
+        "path": "", "line": 0, "status": "open", "project": "/home/x/app", "found_at": "2026-11-18T08:00:00Z",
+        "items": [{"id": "i-0123456789ab", "path": "src/old/legacy.cpp", "line": 0, "evidence": "",
+                   "note": "in no CMakeLists.txt", "locations": ["src/old/legacy.cpp"], "status": "open"},
+                  {"id": "i-ba9876543210", "path": "src/geo/dist.cpp", "line": 42, "evidence": "double d = a - b;",
+                   "note": "subtracts n-vectors", "locations": ["src/geo/dist.cpp:42", "src/map/route.cpp:77"],
+                   "status": "open"},
+                  {"id": "i-stalestale01", "path": "gone.cpp", "note": "stale", "status": "stale"},
+                  {"id": "bad id", "path": "x.cpp", "note": "not an id"}]}
+
+
+class NewShapes(Base):
+    def region(self, *findings):
+        self.agent({"version": 1, "findings": list(findings)})
+        fv._CACHE.clear()
+        return fv.findings_region(self.runs)
+
+    def test_bug_with_steps(self):
+        h = self.region(BUG)
+        ol = re.search(r"<ol class='fsteps'>(.*?)</ol>", h).group(1)
+        self.assertEqual(re.findall(r"<li>(.*?)</li>", ol),
+                         ["Open a project with two layers", "Right-click a layer, choose Rename Layer...",
+                          "Type a new name and press Enter", "File &gt; Save, reopen the file"])
+        self.assertIn("<span class='muted'>in the app</span> <code>Rename Layer...</code>", h)
+        self.assertIn("<span class='muted'>expected</span> the layer keeps its color", h)
+        self.assertIn("<span class='muted'>actual</span> the layer is black after reopening", h)
+        self.assertIn("<ul class='ftrace'><li><code>src/mainwindow.cpp:88</code> "
+                      "<code>connect(renameAct, &amp;QAction::triggered);</code></li>", h)
+        self.assertIn("<span class='muted'>checked</span> real: no guard", h)
+        f = [x for x in fv.collect(self.runs) if x["id"] == BUG["id"]][0]
+        self.assertEqual(f["md"].split("\n"), [
+            "- src/layers.cpp:120: Saving a renamed layer drops its color: the rename path resets the color "
+            "(bug, high, findings agent)",
+            "  Steps: 1. Open a project with two layers 2. Right-click a layer, choose Rename Layer... "
+            "3. Type a new name and press Enter 4. File > Save, reopen the file",
+            "  Expected: the layer keeps its color", "  Actual: the layer is black after reopening",
+            "  Trace: src/mainwindow.cpp:88, src/layers.cpp:120"])
+        self.assertIn("Steps: 1.", f["md"])
+
+    def test_rolling(self):
+        h = self.region(ROLL)
+        self.assertEqual(h.count("class='grip'"), 4 + 1)   # the notes' 4 and one row for the theme
+        self.assertIn("<span class='tl'>Files nothing uses (2)</span>", h)
+        self.assertIn("<code>src/old/legacy.cpp</code> <span>in no CMakeLists.txt</span>", h)
+        self.assertIn("<code>src/geo/dist.cpp:42</code>", h)
+        self.assertIn("<code>src/map/route.cpp:77</code>", h)
+        self.assertIn("<code>double d = a - b;</code>", h)
+        self.assertEqual(h.count(">Not this one</button>"), 2)
+        self.assertIn("name='id' value='i-ba9876543210'", h)
+        self.assertNotIn("stale", h.split("Files nothing uses (2)")[1].split("</details>")[0])
+        self.assertNotIn("<span class='pill t-off'>", h)   # no severity pill
+        f = [x for x in fv.collect(self.runs) if x["id"] == ROLL["id"]][0]
+        self.assertEqual((f["cat"], f["sev"], f["children"]), ("unused", "", ["i-0123456789ab", "i-ba9876543210"]))
+        self.assertEqual(f["md"].split("\n"), ["- Files nothing uses (2 places, findings agent)",
+                                               "  - src/old/legacy.cpp: in no CMakeLists.txt",
+                                               "  - src/geo/dist.cpp:42: subtracts n-vectors"])
+
+    def test_archive_one_item(self):
+        self.region(ROLL)
+        ok, msg = fv.action(self.runs, "archive", {"id": ["i-0123456789ab"]})
+        self.assertEqual((ok, msg), (True, "Archived 1 finding."))
+        h = fv.findings_region(self.runs)
+        self.assertIn("Files nothing uses (1)", h)
+        self.assertNotIn("src/old/legacy.cpp", h)
+        self.assertIn("src/geo/dist.cpp:42", h)
+        self.assertEqual(h.count(">Not this one</button>"), 1)
+        self.assertNotIn("findings-archived", h)   # an item is not an archived row
+        ids = self.open_ids()
+        fv.action(self.runs, "move", {"key": [ids[-1]], "before": [ids[0]]})   # a later save
+        self.assertIn("i-0123456789ab", self.board()["archived"])
+        self.assertFalse(fv.action(self.runs, "move", {"key": ["i-ba9876543210"], "before": [""]})[0])
+        ok, msg = fv.action(self.runs, "restore", {"id": ["i-0123456789ab"]})
+        self.assertTrue(ok, msg)
+        self.assertIn("Files nothing uses (2)", fv.findings_region(self.runs))
+
+    def test_rolling_with_nothing_left_is_off_the_board(self):
+        self.region(ROLL)
+        fv.action(self.runs, "archive", {"sel": ["i-0123456789ab", "i-ba9876543210"]})
+        h = fv.findings_region(self.runs)
+        self.assertNotIn("Files nothing uses", h)
+        self.assertIn("4 open</span>", h)
+        stale = dict(ROLL, id="r-stale-00000000", items=[{"id": "i-111111111111", "status": "stale"}, "x"])
+        h = self.region(stale)
+        self.assertNotIn("Files nothing uses", h)
+        self.assertNotIn("r-stale-00000000", h)
+        # the theme's own row archived: in Archived, as any row
+        self.region(ROLL)
+        fv.action(self.runs, "restore", {"id": ["i-0123456789ab"]})
+        fv.action(self.runs, "archive", {"id": [ROLL["id"]]})
+        h = fv.findings_region(self.runs)
+        arch = h[h.index("findings-archived"):]
+        self.assertIn("Files nothing uses (1)", arch)
+        self.assertNotIn("Not this one", arch)
+
+    def test_old_record_unchanged(self):
+        h = self.region(AGENT["findings"][0])
+        self.assertNotIn("fsteps", h)
+        self.assertNotIn("ftrace", h)
+        self.assertNotIn("fitems", h)
+        self.assertNotIn("in the app", h)
+        f = [x for x in fv.collect(self.runs) if x["id"] == "f-0123456789ab"][0]
+        self.assertEqual(f["md"], "- a/b.py:5: Race <in> x: two writers (bug, high, findings agent)")
+        self.assertIn("<p class='fbx'>two writers</p></details>", h)
+
+    def test_malformed_new_fields_dropped(self):
+        bad = dict(BUG, steps="open it", ui=3, expected=["x"], actual=None, verdict={"a": 1},
+                   trace=["src/a.cpp:1", {"path": "a.cpp", "line": "7", "code": "x"}, {"path": 3, "line": 1, "code": ""},
+                          {"path": "ok.cpp", "line": 5, "code": "y"}, {"path": "b.cpp", "line": True, "code": "z"}])
+        h = self.region(bad, dict(BUG, id="f-steps0000000", steps=["one", 2, None, "  ", "two"] + ["s"] * 20,
+                                  trace="nope"))
+        f = {x["id"]: x for x in fv.collect(self.runs)}
+        a = f[BUG["id"]]
+        self.assertEqual((a["steps"], a["ui"], a["expected"], a["actual"], a["verdict"]), ([], "", "", "", ""))
+        self.assertEqual(a["trace"], [{"path": "ok.cpp", "line": 5, "code": "y"}])
+        self.assertTrue(a["md"].endswith("\n  Trace: ok.cpp:5"))
+        b = f["f-steps0000000"]
+        self.assertEqual(b["steps"][:3], ["one", "two", "s"])
+        self.assertEqual(len(b["steps"]), fv.STEPS_MAX)
+        self.assertEqual(b["trace"], [])
+        self.assertIn("<code>ok.cpp:5</code> <code>y</code>", h)
+        roll = dict(ROLL, items="nope")
+        self.assertNotIn("Files nothing uses", self.region(roll))
+        roll = dict(ROLL, items=[{"id": "i-0123456789ab", "path": 3, "line": "x", "note": ["n"], "locations": "a"}])
+        h = self.region(roll)
+        self.assertIn("Files nothing uses (1)", h)
+        self.assertEqual(h.count(">Not this one</button>"), 1)
+
 class Routes(Base):
     def setUp(self):
         super().setUp()

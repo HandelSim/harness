@@ -72,7 +72,7 @@ import findings_view
 SID_RE = re.compile(r"^ses_[A-Za-z0-9]{1,64}$")
 PART_RE = re.compile(r"^prt_[A-Za-z0-9]{1,64}$")
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
-OUT_RE = re.compile(r"^[a-z]+-[0-9]+\.out$")
+OUT_RE = re.compile(r"^[a-z]+-[0-9]+(-[a-z0-9]+)?\.out$")   # plan-0.out; a panel's: plan-0-d2.out, review-0-ux.out
 # A git ref or commit as the add form takes it: no leading '-' (an option), no
 # spaces, no '..' (a range), nothing git would read as revision syntax.
 REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$")
@@ -1072,6 +1072,13 @@ class Runs:
         rv = last["criteria"] if last else rv
         out["review_verdicts"] = [{k: _s(v.get(k), 500 if k == "quote" else 40) for k in ("id", "verdict", "quote")}
                                   for v in rv if isinstance(v, dict) and v.get("id")][:MAX_CRITERIA]
+        out["panels"] = _panels(st.get("panels"))
+        # the reviews' Must fix items dropped for want of evidence, each review round's
+        rows = st.get("review_verdicts") if isinstance(st.get("review_verdicts"), list) else []
+        out["review_dropped"] = [{"item": _s(d.get("item"), 600), "why": _s(d.get("why"), 400),
+                                  "round": e["round"] if isinstance(e.get("round"), int) else 0}
+                                 for e in rows if isinstance(e, dict) and isinstance(e.get("dropped"), list)
+                                 for d in e["dropped"] if isinstance(d, dict)][-20:]
         sig = st.get("plan_sig")
         out["plan_sig"] = sig if isinstance(sig, str) and re.match(r"^[0-9a-f]{4,64}$", sig) else ""
         out["take_defaults"] = st.get("take_defaults") is True
@@ -1791,12 +1798,39 @@ def _row(runs, row, live, extra="", now=None):
             f"<span class='meta'>{' &middot; '.join(meta)}</span></li>")
 
 
+PANEL_TAGS = {"d": "planner", "general": "general reviewer", "ux": "ux reviewer", "standards": "standards reviewer"}
+
+
+def _panels(got):
+    """state.json's "panels" ({stage: what its panel did}), its fields checked."""
+    out = {}
+    for stage, p in (got.items() if isinstance(got, dict) else []):
+        if stage not in ("plan", "review") or not isinstance(p, dict):
+            continue
+        mem = p.get("members") if isinstance(p.get("members"), dict) else {}
+        out[stage] = {"merged": p.get("merged") is True, "why": _s(p.get("why"), 300), "used": _s(p.get("used"), 20),
+                      "drafts": p["drafts"] if isinstance(p.get("drafts"), int) else 0,
+                      "groups": p["groups"] if isinstance(p.get("groups"), int) else 0,
+                      "unique": {_s(k, 20): v for k, v in (p.get("unique") or {}).items() if isinstance(v, int)}
+                      if isinstance(p.get("unique"), dict) else {},
+                      "members": {_s(t, 20): {"ok": m.get("ok") is True, "model": _s(m.get("model"), 80),
+                                              "problems": [_s(x, 300) for x in m.get("problems") or []
+                                                           if isinstance(x, str)][:5]}
+                                  for t, m in list(mem.items())[:8] if isinstance(m, dict)}}
+    return out
+
+
 def _stage_label(runs, key, row, st, outs):
     """(stage, attempt) of a ticket session: the stage output written after it
-    started; none yet: the stage the ticket is running now."""
+    started; none yet: the stage the ticket is running now. A panel member's stage
+    says which one it is (plan, planner 2)."""
     name = runs.stage_of(key, _ms(row["time_created"]), outs)
     if name:
         stage, _, n = name.partition("-")
+        n, _, tag = n.partition("-")
+        if tag:
+            who = f"planner {tag[1:]}" if re.fullmatch(r"d\d+", tag) else PANEL_TAGS.get(tag, tag)
+            stage = f"{stage}, {who}" if tag != "panel" else f"{stage}, merged"
         return stage, int(n) + 1 if n.isdigit() else 0
     if st.get("status") in ("running", "interrupted"):
         return st.get("stage", ""), st.get("attempt", 0) + 1
@@ -3175,6 +3209,46 @@ def _t_verdicts(st):
     return f"<section class='panel'><h2>Review verdicts</h2>{_verdict_list(vs)}</section>"
 
 
+def _t_panels(st):
+    """How the plan and the review were made (several agents' work merged), and the
+    review's items dropped because they did not carry their evidence."""
+    pans, parts = st.get("panels") or {}, []
+    pl = pans.get("plan")
+    if pl:
+        n = len(pl["members"])
+        if pl["merged"]:
+            found = [f"planner {t[1:]} found {u} item{'s' if u != 1 else ''} no other did" for t, u in pl["unique"].items() if u]
+            line = (f"Made from <b>{pl['drafts']} drafts</b> by {n} planners, merged"
+                    + (f"; {esc(', '.join(found))}" if found else "; every kept item was in more than one draft") + ".")
+        elif pl["drafts"] > 1:
+            line = (f"{pl['drafts']} drafts by {n} planners, not merged, so planner {esc(str(pl.get('used') or 'd1')[1:])}'s "
+                    f"draft is the plan.<div class='muted'>Why: {esc(pl['why'] or 'not said')}</div>")
+        elif pl["drafts"]:
+            line = f"{n} planners; {esc(pl['why'] or 'not merged')}."
+        else:
+            line = f"{n} planners, no draft passed its check; one planner wrote it."
+        bad = [f"planner {t[1:]}: {'; '.join(m['problems'][:2])}" for t, m in pl["members"].items() if not m["ok"]]
+        parts.append(f"<div><b>Plan</b> &middot; {line}</div>"
+                     + "".join(f"<div class='muted'>{esc(b)}</div>" for b in bad))
+    rv = pans.get("review")
+    if rv:
+        names = ", ".join(rv["members"])
+        line = (f"Reviewed by <b>{esc(names)}</b>, merged" + (f"; {rv['groups']} item(s) found by more than one"
+                                                               if rv["groups"] else "") + "."
+                if rv["merged"] else f"{esc(names)} reviewers; {esc(rv['why'] or 'not merged')}: one reviewer reviewed.")
+        parts.append(f"<div><b>Review</b> &middot; {line} <span class='muted'>A bug's Steps are traced from the code "
+                     "by the reviewer, not run.</span></div>")
+    dr = st.get("review_dropped") or []
+    if dr:
+        items = "".join(f"<li><div class='txt'>{esc(d['item'])}</div><div class='muted'>review round "
+                        f"{d['round']}: dropped: {esc(d['why'])}</div></li>" for d in dr)
+        parts.append(f"<details class='doc' data-k='dropped'><summary>Dropped from the review<span class='muted'>"
+                     f"{len(dr)}</span></summary><div class='muted'>Must fix items without the evidence they need "
+                     "(a command and its output, a bug's steps, a risk's trigger, a quote of the code): they never "
+                     f"reached the fixer.</div><ul class='rounds'>{items}</ul></details>")
+    return f"<section class='panel'><h2>How it was made</h2>{''.join(parts)}</section>" if parts else ""
+
+
 def ticket_live(runs, key, tab="ticket"):
     """The regions of the ticket's tab page (ticket or history), or None when the ticket is gone."""
     if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
@@ -3204,7 +3278,7 @@ def ticket_live(runs, key, tab="ticket"):
     pos = listed.index(key) + 1 if key in listed else 0
     n = len([k for k in listed if k in order])
     regions = {"head": head, "acts": _t_acts(runs, key, st, rows, live, pos, n),
-               "start": _t_start(runs, key, st, runs.runner(now), now), "packet": _t_packet(st, key) + _t_verdicts(st),
+               "start": _t_start(runs, key, st, runs.runner(now), now), "packet": _t_packet(st, key) + _t_verdicts(st) + _t_panels(st),
                "qs": _t_questions(runs, key, st), "result": _t_facts(runs, key, st, pos, n) + _t_result(st),
                "docs": _t_docs(runs, key, st, "", "ticket"), "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}

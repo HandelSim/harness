@@ -2271,6 +2271,53 @@ class TicketTabsTest(RunsServer):
         self.assertIn("<h2>Review verdicts</h2><ul class='verdicts'><li><b>AC1</b> <span class='pill t-bad'>FAIL",
                       body)
 
+    def test_how_the_plan_and_review_were_made_and_what_was_dropped(self):
+        self.ticket(status="done", stage="", panels={
+            "plan": {"drafts": 3, "merged": True, "unique": {"d1": 0, "d2": 2, "d3": 1}, "members": {
+                "d1": {"ok": True, "model": "m"}, "d2": {"ok": True}, "d3": {"ok": True}, "d4": {"ok": False,
+                                                                                               "problems": ["no <file>"]}}},
+            "review": {"merged": True, "groups": 1, "members": {"general": {"ok": True}, "ux": {"ok": True}}},
+            "junk": {"merged": True}, "fix": "x"},
+            review_verdicts=[{"round": 0, "criteria": [], "dropped": [
+                {"item": "[risk] a.py:1: may <crash>", "why": "[risk] quotes no code"}, "junk"]}, "x", {"round": 1}])
+        self.start()
+        _, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<h2>How it was made</h2>", body)
+        self.assertIn("Made from <b>3 drafts</b> by 4 planners, merged; planner 2 found 2 items no other did, "
+                      "planner 3 found 1 item no other did.", body)
+        self.assertIn("planner 4: no &lt;file&gt;", body)
+        self.assertIn("Reviewed by <b>general, ux</b>, merged; 1 item(s) found by more than one.", body)
+        self.assertIn("A bug's Steps are traced from the code by the reviewer, not run.", body)
+        self.assertIn("<summary>Dropped from the review<span class='muted'>1</span></summary>", body)
+        self.assertIn("[risk] a.py:1: may &lt;crash&gt;</div><div class='muted'>review round 0: dropped: [risk] "
+                      "quotes no code", body)
+        # drafts that were not merged: whose draft is the plan, and why
+        self.ticket(status="done", stage="", panels={"plan": {"drafts": 3, "merged": False, "used": "d2",
+                                                              "why": "draft 1's <Q1> not in the ledger",
+                                                              "members": {"d1": {"ok": True}}}})
+        time.sleep(0.01)
+        _, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("3 drafts by 1 planners, not merged, so planner 2's draft is the plan.<div class='muted'>"
+                      "Why: draft 1&#x27;s &lt;Q1&gt; not in the ledger</div>", body)
+        # nothing to say: no panel
+        self.ticket(status="done", stage="", panels="x", review_verdicts={"a": 1})
+        time.sleep(0.01)
+        _, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("How it was made", body)
+
+    def test_a_panel_members_output_is_its_own_stage(self):
+        self.assertTrue(runs.OUT_RE.match("plan-0-d2.out"))
+        self.assertTrue(runs.OUT_RE.match("review-1-standards.out"))
+        self.assertFalse(runs.OUT_RE.match("plan-0-../x.out"))
+        self.assertFalse(runs.OUT_RE.match("plan-0-D2.out"))
+        import types
+        lab = lambda name: runs._stage_label(types.SimpleNamespace(stage_of=lambda *a: name), "K-1",
+                                             {"time_created": 0}, {}, [])
+        self.assertEqual(lab("plan-0-d2"), ("plan, planner 2", 1))
+        self.assertEqual(lab("review-1-ux"), ("review, ux reviewer", 2))
+        self.assertEqual(lab("plan-0-panel"), ("plan, merged", 1))
+        self.assertEqual(lab("plan-2"), ("plan", 3))
+
     def test_the_history_tab_polls_its_own_regions(self):
         self.ticket()
         self.start()

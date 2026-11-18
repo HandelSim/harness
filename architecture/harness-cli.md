@@ -803,9 +803,47 @@ is also the fix round's prompt (`implement_words(fix=True)`: the Must fix items 
 `BLOCKED: <why>` (`blocked_line`, only after the prompt's last `<<<END_` block)
 blocks the ticket with `no_go_on` and a `packet`. The review writes
 `## Criteria` lines (`AC1: PASS | `quote` | why`, FAIL, UNKNOWN; `review_verdicts`)
-and tags Must fix items `[exec]`/`[opinion]`; each PASS quote is looked for in the
+and Must fix items, one bullet each (`must_items`: a Steps list under one stays in
+it), tagged with their evidence: `[exec]` (a command in backticks and its output),
+`[bug]` (path:line, a `quote` of the code, `Steps:` a user takes and `Sees:`),
+`[risk]` (path:line, `quote`, `Trigger:`) or `[cleanup]` (path:line, a `quote` of an
+added line). `evidence_gate` checks each (`evidence_problem`: the path in the
+change or the working directory, a child repo's from its tail; the quote, 8
+letters or digits at least, in that file or the diff): a one-agent review is asked
+once a round (`evidenced`), then the item is dropped (the round's `review_verdicts`
+entry's `dropped`; untagged and `[opinion]` are dropped too). The queue's own `[exec]` (the
+review's change fails a check) comes after the gate. Each PASS quote is looked for in the
 change's added lines (`quote_checked`, judge's rules): a miss is asked once more
-per round, then UNKNOWN. After a fix the review runs again (`fix_rounds`);
+per round, then UNKNOWN.
+
+Panels (`run_panel`). A ticket's first plan (attempt 0, no plan.json, no answers,
+not a follow-up: `plan_panel_wanted`) is drafted by `--planners` (`QUEUE_PLANNERS`
+3, at most `PANEL_MAX` 5; `--planner-models`, one model each, round the list), and a
+loop's first review (fix round 0, not the owner's comments) by one reviewer per
+`--reviewers` lens (`QUEUE_REVIEWERS` general,ux,standards; general first and
+needed, the only one that runs checks and gives criterion verdicts). Members run
+one after the other through `run_agent(member=)`: their own `.out`
+(`<stage>-N-<tag>.out`), model and card, never resumed (cut off, a member starts
+again), the stage's session and kept result cleared after each. Files: a member
+writes `KEY-plan-draft-<n>.md` / `KEY-review-<lens>.md` in the vault's ticket notes;
+the queue deletes a stale one first (`panel_file`, dropped on a halt too) and moves
+it to `DIR/panel/<stage>-<tag>.md` as the member ends (`collect`, before the vault
+commit), so no member reads another's and the vault keeps only KEY-plan.md and
+KEY-review.md. `st["panel"]` is the panel at work (members done, so a run that dies
+goes on with the rest; `advance` drops it), `st["panels"][stage]` what it did (the
+Ticket tab's "How it was made"). The plan's drafts that pass `check_plan` are merged
+by one model call (`plan_merge.md`, the planner model) that writes the plan, then
+`=== LEDGER ===` and a line per draft item (`D2-AC3 -> AC5` or `-> dropped: why`);
+`merge_problems` wants every item in the ledger, every plan criterion and question
+from a draft, and the owner-read sections at most 1.2 times the median draft's;
+asked again once with its problems, else the first good draft is the plan. One good
+draft is the plan; none, the stage's own planner plans. The lens reviews are merged
+by the queue (`merge_reviews`): general's Criteria, every lens's items (same file,
+tag and within 10 lines, both passing the gate: folded, "also found by"), every
+lens's notes. Either way the result is the stage's kept result (`kept_from_panel`,
+`verify_only` with a `-panel.out`) and goes through the stage's usual checks; a
+retry is one agent, told what failed. A panel review is not asked again for
+evidence or quotes (no agent to ask): its misses drop at once. After a fix the review runs again (`fix_rounds`);
 `review_decision` gives another round only for [exec] items or unmet criteria,
 with fewer open items than before and no PASS gone back, up to `FIX_ROUNDS` 2;
 else opinion items left go to the result note (`open_opinions`) and unmet ones
