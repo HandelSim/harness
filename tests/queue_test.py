@@ -5933,7 +5933,7 @@ class SpecLoopTest(unittest.TestCase):
         self.assertEqual(d(0, none)[0], "push")
         self.assertEqual(d(0, opinion)[0], "fix")        # the first review's items all get a round
         self.assertEqual(d(1, opinion)[0], "push")       # opinion alone earns no second round
-        self.assertIn("opinion", d(1, opinion)[1])
+        self.assertIn("review item(s) ([bug], [risk], [cleanup]) left", d(1, opinion)[1])
         self.assertEqual(d(1, less, hard)[0], "fix")     # evidence, and fewer open items than before
         self.assertEqual(d(1, hard, hard)[0], "packet")  # no progress
         self.assertIn("no progress", d(1, hard, hard)[1])
