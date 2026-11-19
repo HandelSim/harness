@@ -105,8 +105,8 @@ export interface SettingsData { config: ConfigRow[]; allowlist: { host: string; 
   mcp: { name: string; state: string; status: string }[]; access: { enabled: boolean; names: string[] };
   system: Record<string, unknown> }
 export interface HarnessUpdate { branch: string; local: string; remote: string | null; behind: boolean | null; checked_at: number | null }
-export interface DebugReport { kind: string; name: string; mtime: number; key: string; verdict: string; change: string;
-  title: string; session: string }
+export interface DebugReport { kind: string; name: string; mtime: number; key: string; verdict: string; change: boolean;
+  title: string; session: string; report?: boolean }
 
 export interface TopicMap {
   status: Status; home: Home; queue: Queue; sessions: SessionRow[]; findings: Findings;

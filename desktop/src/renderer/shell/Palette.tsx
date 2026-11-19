@@ -1,5 +1,5 @@
 // Command palette (W17): Mod+K. Prefixes: > commands, # tickets, @ sessions. Fuzzy-ranked, recents first.
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { paletteOpen } from './ui';
 import { commands, recordRecent } from './commands';
 import { rank, parsePrefix, type Command } from '../core/commands';
@@ -38,19 +38,20 @@ export function Palette() {
   const input = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const prevFocus = useRef<Element | null>(null);
-  useEffect(() => {
+  // layout effect, not useEffect: a post-paint reset of q could clobber text typed right after opening
+  useLayoutEffect(() => {
     if (open) { prevFocus.current = document.activeElement; setQ(open.prefix); setSel(0); setTimeout(() => input.current?.focus(), 0); }
   }, [!!open]);
-  const items = useMemo(() => {
-    if (!open) return [];
-    const { mode, query } = parsePrefix(q);
+  const compute = (qv: string): Item[] => {
+    const { mode, query } = parsePrefix(qv);
     const cmds: Item[] = mode === 'all' || mode === 'commands'
       ? commands.available().map((c: Command) => ({ id: c.id, title: c.title, group: c.group, hint: c.hint, chord: c.chord?.split(',')[0].trim(), keywords: c.keywords,
         run: () => { recordRecent(c.id); void commands.run(c.id, { source: 'palette' }); } }))
       : [];
     const all = [...cmds, ...(query || mode !== 'all' ? dynamicItems(mode) : [])];
     return rank(all, query, appState.value?.recents?.commands ?? []).slice(0, 80).map((r) => r.item);
-  }, [q, !!open, commands.version]);
+  };
+  const items = useMemo(() => (open ? compute(q) : []), [q, !!open, commands.version]);
   useEffect(() => { list.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' }); }, [sel]);
   if (!open) return null;
   const close = () => { paletteOpen.value = false; (prevFocus.current as HTMLElement | null)?.focus?.(); };
@@ -59,7 +60,13 @@ export function Palette() {
     if (e.key === 'Escape') { e.preventDefault(); close(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); setSel((s) => Math.min(items.length - 1, s + 1)); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); setSel((s) => Math.max(0, s - 1)); }
-    else if (e.key === 'Enter') { e.preventDefault(); runAt(sel); }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      // the input can be ahead of the last render (fast type + Enter): rank what is actually typed
+      const typed = input.current?.value ?? q;
+      if (typed !== q) { const fresh = compute(typed); paletteOpen.value = false; fresh[0]?.run(); }
+      else runAt(sel);
+    }
     e.stopPropagation();
   };
   let lastGroup = '';
