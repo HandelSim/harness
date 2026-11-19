@@ -20,7 +20,7 @@
 #   - T4: desktop/ changed (new commit) -> rebuild, then launch, new stamp
 #   - T5: node missing / node 20 -> clear error with an install hint, non-zero,
 #         no stamp, nothing built
-#   - T6: build / electron-builder failure keeps the old install and stamp
+#   - T6: build / empty build / electron-builder failure keeps the old install and stamp
 #   - T7: windows: --win nsis --x64 (ARM64 -> --arm64), the installer run with
 #         /S unconverted, launch via `cmd.exe /c start "" <C:\ path>`
 #   - T8: macos: --mac dir, ditto to a temp name, ad-hoc codesign, swap into
@@ -71,7 +71,9 @@ stub() {  # $1 name, $2 body (bash) run after the argv is logged
     chmod +x "$STUBS/$1"
 }
 stub node '[[ "${1:-}" == -v ]] && { echo "${STUB_NODE_VERSION:-v22.11.0}"; exit 0; }
-exit "${STUB_BUILD_RC:-0}"'
+[[ "${STUB_BUILD_RC:-0}" == 0 ]] || exit "$STUB_BUILD_RC"
+[[ "${1:-}" != scripts/build.mjs || -n "${STUB_BUILD_EMPTY:-}" ]] || { mkdir -p out/main && echo built >out/main/index.cjs; }
+exit 0'
 stub npm '[[ "${1:-}" == ci ]] && mkdir -p node_modules
 exit "${STUB_NPM_RC:-0}"'
 stub npx 'echo "npx-env CSC_IDENTITY_AUTO_DISCOVERY=${CSC_IDENTITY_AUTO_DISCOVERY:-}" >>"$LOG"
@@ -271,7 +273,14 @@ ARGS=(install); run HARNESS_DESKTOP_OS=linux STUB_BUILD_RC=2
 [[ $RC != 0 ]] && grep -q "the build failed" <<<"$OUT" || fail "T6: build failure not reported — $OUT"
 ! grep -q '^npx ' "$LOG" || fail "T6: packaged after a failed build"
 [[ "$(STAMP)" == "$old_stamp" && -x "$APP" ]] || fail "T6: install/stamp changed after a build failure"
-ok "T6: build or electron-builder failure -> non-zero, old install and stamp kept, no launch"
+# A build that exits 0 having built nothing (build.mjs's main-module check never matching, as on
+# Windows) stops before packaging, even with a stale entry from an earlier build left in out/.
+mkdir -p "$C/desktop/out/main"; echo stale >"$C/desktop/out/main/index.cjs"
+ARGS=(install); run HARNESS_DESKTOP_OS=linux STUB_BUILD_EMPTY=1
+[[ $RC != 0 ]] && grep -q "produced no out/main/index.cjs" <<<"$OUT" || fail "T6: empty build not caught — $OUT"
+! grep -q '^npx ' "$LOG" || fail "T6: packaged after an empty build"
+[[ "$(STAMP)" == "$old_stamp" && -x "$APP" ]] || fail "T6: install/stamp changed after an empty build"
+ok "T6: build, empty build or electron-builder failure -> non-zero, old install and stamp kept, no launch"
 
 # --- T7: windows -----------------------------------------------------------------
 WAPP="$LOCALAPPDATA/Programs/Harness/Harness.exe"

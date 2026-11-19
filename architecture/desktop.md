@@ -259,7 +259,9 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
 
 - Build and unit tests:
   - `node scripts/build.mjs`: esbuild targets main, pty-host, preload,
-    renderer, bg-worker and bg-demo.
+    renderer, bg-worker and bg-demo. It builds only when run directly, detected by comparing
+    `pathToFileURL(realpath(argv[1]))` with `import.meta.url` (a hand-built `file://` + argv[1]
+    never matches on Windows); `e2e.mjs` imports `build()` instead.
   - `npm test`: node:test over `src/**/*.test.ts`.
 - `npm run e2e`: Playwright `_electron` under `xvfb-run`.
   - Flags: `--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --no-sandbox`.

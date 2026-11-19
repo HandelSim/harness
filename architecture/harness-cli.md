@@ -3253,8 +3253,10 @@ it in tests); anything but windows/macos/linux is refused.
   does it stop with a per-OS hint (`winget install OpenJS.NodeJS.LTS`, `brew
   install node`, …). Host mode's vendored Node 20 is not used. `npm ci` only when `node_modules`
   is missing or the sha256 of `package-lock.json` differs from
-  `state/desktop/lock-hash`; then `node scripts/build.mjs --prod`; then
-  `npx --no-install electron-builder <os target> --<arch> --publish never`
+  `state/desktop/lock-hash`; then `node scripts/build.mjs --prod`, which must
+  leave a non-empty `out/main/index.cjs` (package.json `main`; removed before the build, so a
+  build that exits 0 having built nothing stops here instead of packaging an empty
+  or stale app); then `npx --no-install electron-builder <os target> --<arch> --publish never`
   (arch x64/arm64 from `uname -m`, or `PROCESSOR_ARCHITEW6432` /
   `PROCESSOR_ARCHITECTURE` on Windows). The old output for that OS/arch is
   removed first so a stale artifact is never installed. Per OS:

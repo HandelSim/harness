@@ -14128,8 +14128,15 @@ _desktop_install() {
     fi
 
     echo "harness desktop: building (node scripts/build.mjs --prod)"
+    # The entry is package.json "main". Removed first so a build that exits 0 having built nothing
+    # fails here, not as electron-builder's "app.asar is corrupted" (or by packaging a stale copy).
+    rm -f "$src/out/main/index.cjs"
     if ! (cd "$src" && node scripts/build.mjs --prod); then
         err "desktop: the build failed (output above); the installed app was left as it was"
+        return 1
+    fi
+    if [[ ! -s "$src/out/main/index.cjs" ]]; then
+        err "desktop: the build exited cleanly but produced no out/main/index.cjs; the installed app was left as it was"
         return 1
     fi
 

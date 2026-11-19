@@ -1,9 +1,9 @@
 // Build every bundle with the esbuild API in one process (PLAN 6.3).
 // Missing entries owned by other legs are skipped with a warning in dev and are fatal with --prod.
 import * as esbuild from 'esbuild';
-import { existsSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, rmSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const args = new Set(process.argv.slice(2));
@@ -85,4 +85,7 @@ export async function build({ quiet = false } = {}) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) await build();
+// Run when executed directly (not when imported by e2e.mjs). Compare URLs built the way Node builds
+// import.meta.url: a hand-made `file://${argv[1]}` never matches on Windows (C:\..., not file:///C:/...),
+// which made `node scripts/build.mjs --prod` exit 0 having built nothing.
+if (process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) await build();
