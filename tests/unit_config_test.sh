@@ -14,6 +14,7 @@
 #   - _config_set PROXY_API_URL: writes the key and leaves the allowlist alone
 #     (the proxy's firewall allows upstream hosts from .env itself)
 #   - _config_set KEY --stdin: value from stdin (secrets stay off argv)
+#   - config set keeps .env's mode (600 stays 600 under a umask of 022)
 #   - cmd_config (no args): prints the subcommand usage so the user learns how to
 #     drive it, then the current values (no-tty branch of the picker)
 #   - cmd_uninstall: cancels on a non-"yes" answer (leaves files), tears down on
@@ -285,6 +286,31 @@ printf '0\n' | _config_set QUEUE_PARALLEL --stdin >/dev/null 2>&1 && fail "T18: 
 _config_set DEFAULT_MODEL_NAME two words >/dev/null || fail "T18: argv form broke"
 [[ "$(_config_read_key DEFAULT_MODEL_NAME)" == 'two words' ]] || fail "T18: argv value"
 ok "T18: config set KEY --stdin writes one line from stdin, argv form unchanged"
+
+# --- T19: config set keeps .env owner-only (the copy that replaces it) -----
+# The rewrite is a tmp file + mv: under the caller's umask 022 the tmp was 644,
+# so the keys were group/world-readable after `config set` until the next
+# harness command ran its chmod. Its mode is .env's own; 600 stays 600.
+_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+chmod 600 "$TMP_ROOT/.env"
+(umask 022; _config_set PROXY_TIMEOUT 77 >/dev/null) || fail "T19: set refused"
+[[ "$(_config_read_key PROXY_TIMEOUT)" == 77 ]] || fail "T19: not written"
+[[ "$(_mode "$TMP_ROOT/.env")" == 600 ]] || fail "T19: .env is $(_mode "$TMP_ROOT/.env") after config set, want 600"
+(umask 022; printf 'sk-x\n' | _config_set PROXY_API_KEY --stdin >/dev/null) || fail "T19: stdin set refused"
+[[ "$(_mode "$TMP_ROOT/.env")" == 600 ]] || fail "T19: .env is $(_mode "$TMP_ROOT/.env") after config set --stdin"
+chmod 640 "$TMP_ROOT/.env"
+(umask 077; _config_set PROXY_TIMEOUT 78 >/dev/null) || fail "T19: set refused"
+[[ "$(_mode "$TMP_ROOT/.env")" == 640 ]] || fail "T19: mode not kept: $(_mode "$TMP_ROOT/.env")"
+chmod 600 "$TMP_ROOT/.env"
+# a symlinked .env: the mode is its target's, not the link's 777
+mv "$TMP_ROOT/.env" "$TMP_ROOT/env.real"; ln -s "$TMP_ROOT/env.real" "$TMP_ROOT/.env"
+(umask 022; _config_set PROXY_TIMEOUT 79 >/dev/null) || fail "T19: set through a symlink refused"
+[[ "$(_mode "$TMP_ROOT/.env")" == 600 ]] || fail "T19: symlinked .env became $(_mode "$TMP_ROOT/.env")"
+[[ "$(_config_read_key PROXY_TIMEOUT)" == 79 ]] || fail "T19: not written with a symlinked .env"
+if [[ -L "$TMP_ROOT/.env" ]]; then rm -f "$TMP_ROOT/.env"; mv "$TMP_ROOT/env.real" "$TMP_ROOT/.env"
+else rm -f "$TMP_ROOT/env.real"; fi
+compgen -G "$TMP_ROOT/.env.tmp.*" >/dev/null && fail "T19: tmp file left behind"
+ok "T19: config set leaves .env with its own mode (600 stays 600 under umask 022)"
 
 echo
 echo "CONFIG TEST PASSED"

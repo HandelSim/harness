@@ -967,6 +967,16 @@ def make_handler(cfg):
         def log_message(self, fmt, *args):
             sys.stderr.write("[pub] %s %s\n" % (self.address_string(), fmt % args))
 
+        def log_request(self, code="-", size="-"):
+            # every open client polls for as long as it is open (a tab's /live every 3 s, the
+            # desktop's /api/v1/poll every second): a line each would grow pub.log without
+            # bound, so the polls that went well are not logged. Errors, and the rest, are.
+            path = self.path.split("?", 1)[0]
+            if (self.command in ("GET", "HEAD") and str(getattr(code, "value", code)) in ("200", "304")
+                    and (path in ("/api/v1/poll", "/healthz") or path == "/live" or path.endswith("/live"))):
+                return
+            super().log_request(code, size)
+
         def send(self, code, body, ctype="text/plain; charset=utf-8", extra=None, head=False,
                  cookies=()):
             hdrs = {"Content-Type": ctype, "Content-Length": str(len(body)),

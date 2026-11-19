@@ -522,7 +522,8 @@ with open(sys.argv[1], "w") as fh:
 time.sleep(30)
 PYEOF
     portfile="$TMP_ROOT/listener.port"
-    python3 "$TMP_ROOT/listener.py" "$portfile" &
+    # proxy.py's path on its command line: host_proxy_pid trusts only that pid
+    python3 "$TMP_ROOT/listener.py" "$portfile" "$clone_dir/proxy/proxy.py" &
     listener_pid=$!
     for _ in $(seq 1 50); do [[ -s "$portfile" ]] && break; sleep 0.1; done
     listener_port="$(cat "$portfile" 2>/dev/null || true)"

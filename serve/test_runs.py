@@ -2108,6 +2108,33 @@ class QueuePageTest(RunsServer):
             with open(args) as f:
                 self.assertEqual(f.read().strip(), want)
 
+    def test_a_beat_from_the_future_is_a_run_that_is_gone(self):
+        # the machine went down mid-run and came up with its clock behind the last beat
+        fake = os.path.join(self.tmp.name, "harness")
+        args = os.path.join(self.tmp.name, "args")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho "$@" > {args}\nexit 3\n')
+        self.ticket(status="running", stage="plan")
+        cfg = self.start(harness=fake)
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump({"pid": 1, "beat": time.time() + 3600, "host": True, "single": False, "parallel": 2,
+                       "ticket": "ABC-12", "stage": "plan"}, f)
+        for i in (1, 2):
+            with open(os.path.join(self.queue, f"run-{i}.json"), "w") as f:
+                json.dump({"beat": time.time() + 3600, "ticket": "ABC-12", "stage": "plan"}, f)
+        self.assertFalse(cfg.runs.runner()["running"])
+        # a slot beat from the future is not a ticket in hand either, next to a live run
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump({"pid": 1, "beat": time.time(), "parallel": 2}, f)
+        st = cfg.runs.runner()
+        self.assertTrue(st["running"])
+        self.assertEqual(st["on"], [])
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump({"pid": 1, "beat": time.time() + 3600, "host": True, "single": False}, f)
+        ok, msg = cfg.runs.resume_runner()
+        with open(args) as f:
+            self.assertEqual(f.read().strip(), "queue run --host")
+
     def test_a_run_halted_as_the_machine_went_down_stays_ended(self):
         fake = os.path.join(self.tmp.name, "harness")
         args = os.path.join(self.tmp.name, "args")

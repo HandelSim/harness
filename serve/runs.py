@@ -1449,7 +1449,7 @@ class Runs:
         beat = info.get("beat")
         out["beat"] = beat if isinstance(beat, (int, float)) and not isinstance(beat, bool) else 0
         out["pid"] = info.get("pid") if isinstance(info.get("pid"), int) else 0
-        out["running"] = bool(out["beat"]) and now - out["beat"] < RUN_FRESH
+        out["running"] = bool(out["beat"]) and 0 <= now - out["beat"] < RUN_FRESH  # a beat from the future (clock set back): gone
         out["halting"] = out["running"] and os.path.exists(os.path.join(self.queue_dir, "halt"))
         # "on": the tickets in hand, each {ticket, stage, step}; a parallel run's are its
         # slots' (run-I.json, beating like run.json)
@@ -1463,7 +1463,7 @@ class Runs:
                 if got is None:
                     continue
                 b = got.get("beat") if isinstance(got, dict) else None
-                if isinstance(b, (int, float)) and not isinstance(b, bool) and now - b < RUN_FRESH:
+                if isinstance(b, (int, float)) and not isinstance(b, bool) and 0 <= now - b < RUN_FRESH:
                     slots.append(got)
         out["on"] = [{k: x[k] if isinstance(x.get(k), str) else "" for k in ("ticket", "stage", "step")}
                      for x in slots if isinstance(x.get("ticket"), str) and x["ticket"]]

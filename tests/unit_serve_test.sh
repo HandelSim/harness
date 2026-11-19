@@ -18,6 +18,7 @@
 #   - harness_view_refresh harness upgrade restarts it on the new code
 #   - serve_pub_native_paths its paths as C:/... for Windows Python
 #   - cmd_serve           Ctrl-C, upgrade restart and serve stop leave nothing up
+#   - serve_running       a serve.pid pid that is now another program is no serve
 #
 # Prints "SERVE TEST PASSED" on success.
 
@@ -925,5 +926,39 @@ ok "S12: u runs harness upgrade in serve's terminal (asked first) and serve rest
         || fail "S13: another harness's lease should still keep it: $out"
 ) || exit 1
 ok "S13: the serve that ran the upgrade does not keep the old proxy; another harness does"
+
+# --- S14: serve.pid names a serve only while its pid runs this harness serve ----
+# After a reboot or kill -9 the pid can be any program's, and harness upgrade
+# would USR1 it (default action: terminate). A command line that merely names
+# harness (the host proxy run from the clone, a queue run) is not a serve.
+(
+    state_root="$TMP_ROOT/srun"; mkdir -p "$state_root/serve"
+    mkdir -p "$TMP_ROOT/other"; cp "$HARNESS" "$TMP_ROOT/other/harness"
+    like() {   # a process with that command line (once it has exec'd), its pid
+        local p i
+        "$PY" -c 'import time; time.sleep(60)' "$@" >/dev/null 2>&1 &
+        p=$!
+        for (( i = 0; i < 100; i++ )); do [[ "$(_pid_cmdline "$p")" == *time.sleep* ]] && break; sleep 0.05; done
+        echo "$p"
+    }
+    pids=()
+    trap 'kill ${pids[@]+"${pids[@]}"} 2>/dev/null' EXIT
+    is() {   # is yes|no ARGS...: serve_running for a pid with that command line
+        local expect=$1 p; shift
+        p=$(like "$@"); pids+=("$p")
+        printf '%s 1 2\n' "$p" >"$(serve_pidfile)"
+        if serve_running; then [[ $expect == yes ]]; else [[ $expect == no ]]; fi \
+            || fail "S14: serve_running for '$*' should be $expect"
+    }
+    is yes "$clone_dir/harness" serve --port 1
+    is no  "$clone_dir/proxy/proxy.py"
+    is no  "$clone_dir/harness" queue run
+    is no  "$TMP_ROOT/other/harness" serve
+    # relative, from the process's own folder (where /proc tells it)
+    p=$(cd "$clone_dir" && like ./harness serve); pids+=("$p")
+    printf '%s 1 2\n' "$p" >"$(serve_pidfile)"
+    serve_running || fail "S14: ./harness serve from the clone is a serve"
+) || exit 1
+ok "S14: serve_running trusts a pid only while it runs this harness's serve"
 
 echo "SERVE TEST PASSED"

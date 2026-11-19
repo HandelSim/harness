@@ -544,6 +544,10 @@ _sweep_stale_jq_sidecars() {
 # a detached HEAD. A local branch that origin doesn't have never caches a
 # value, so it never shows a banner.
 #
+# Origin is asked at most once per HARNESS_UPDATE_CHECK_TTL seconds (default
+# 1800; stamp state/.harness-update-asked); in between, the cache answers. A
+# queue stage's launch (HARNESS_QUEUE_LAUNCH) skips the check.
+#
 # Used by run_agent, cmd_shell, cmd_host and cmd_serve at startup with the
 # default 4s budget,
 # and by cmd_check_updates with a longer budget for an explicit foreground
@@ -600,6 +604,9 @@ _update_remote_head() {
 
 _update_check_and_banner() {
     [[ "${HARNESS_SKIP_UPDATE_CHECK:-0}" == "1" ]] && return 0
+    # A queue stage's launch: its banner lands in an output file nobody reads, and
+    # a panel starts several at once.
+    [[ -n "${HARNESS_QUEUE_LAUNCH:-}" ]] && return 0
     [[ -d "${install_root}/.git" ]] || return 0
     local branch
     branch=$(git -C "$install_root" symbolic-ref --short HEAD 2>/dev/null) || return 0
@@ -609,16 +616,32 @@ _update_check_and_banner() {
     local cache="${install_root}/state/.harness-update-check"
     local remote_head
 
-    # Synchronous check, bounded so a flaky network can't stall agent
-    # startup. A failed or timed-out lookup (offline, missing remote) leaves
-    # $remote_head empty and we fall back to the cache.
-    remote_head=$(_update_remote_head "$timeout_secs" "$branch")
-    if [[ -n "$remote_head" ]]; then
-        mkdir -p "${install_root}/state" 2>/dev/null
-        printf '%s %s\n' "$branch" "$remote_head" >"$cache" 2>/dev/null
-    else
-        # Offline / lookup failed — fall back to the last value we saw.
+    # Origin is asked at most once per window (HARNESS_UPDATE_CHECK_TTL seconds,
+    # default 30 min), reachable or not: the stamp is touched before the lookup,
+    # so an offline machine pays the timeout once per window, not every launch.
+    # Inside the window the cache answers. `age >= 0`: a stamp from the future
+    # (clock set back) does not pin the window shut.
+    local ttl="${HARNESS_UPDATE_CHECK_TTL:-1800}" stamp="${install_root}/state/.harness-update-asked"
+    local age=-1 t
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=1800
+    if t=$(stat -c %Y "$stamp" 2>/dev/null || stat -f %m "$stamp" 2>/dev/null) && [[ "$t" =~ ^[0-9]+$ ]]; then
+        age=$(( $(date +%s) - t ))
+    fi
+    if (( age >= 0 && age < ttl )); then
         remote_head=$(_update_cached_head "$branch")
+    else
+        mkdir -p "${install_root}/state" 2>/dev/null || true
+        : >"$stamp" 2>/dev/null || true
+        # Synchronous check, bounded so a flaky network can't stall agent
+        # startup. A failed or timed-out lookup (offline, missing remote) leaves
+        # $remote_head empty and we fall back to the cache.
+        remote_head=$(_update_remote_head "$timeout_secs" "$branch")
+        if [[ -n "$remote_head" ]]; then
+            printf '%s %s\n' "$branch" "$remote_head" >"$cache" 2>/dev/null
+        else
+            # Offline / lookup failed — fall back to the last value we saw.
+            remote_head=$(_update_cached_head "$branch")
+        fi
     fi
     _update_is_behind "$remote_head" || return 0
 
@@ -2401,7 +2424,14 @@ _config_write_key() {
             emit="\"$esc\""
         fi
     fi
-    local tmp="$env_file.tmp.$$" line written=0
+    local tmp="$env_file.tmp.$$" line written=0 mode
+    # .env holds the keys: the copy that replaces it is created owner-only (with the
+    # caller's umask it was 644 after the mv), then given .env's own mode (GNU stat,
+    # then BSD/macOS stat; neither answers: it stays 600). -L: the mode of the file a
+    # symlinked .env points at, not the link's 777.
+    mode=$(stat -L -c %a "$env_file" 2>/dev/null || stat -L -f %Lp "$env_file" 2>/dev/null) || mode=""
+    rm -f "$tmp"
+    (umask 077; : >"$tmp")
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ ^[[:space:]]*${key}= ]]; then
             printf '%s=%s\n' "$key" "$emit"
@@ -2411,6 +2441,9 @@ _config_write_key() {
         fi
     done <"$env_file" >"$tmp"
     (( written )) || printf '%s=%s\n' "$key" "$emit" >>"$tmp"
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        chmod "$mode" "$tmp" 2>/dev/null || true
+    fi
     mv -f "$tmp" "$env_file"
 }
 
@@ -4802,14 +4835,37 @@ host_proxy_fingerprint() {
     fi
 }
 
+# The command line of live pid $1, its arguments joined by spaces: /proc where
+# there is one, else ps (macOS, the BSDs). Empty when neither says.
+_pid_cmdline() {
+    if [[ -r "/proc/$1/cmdline" ]]; then
+        tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null || true
+    else
+        ps -o command= -p "$1" 2>/dev/null || true
+    fi
+}
+
+# Whether live pid $1 still is the host proxy this clone started: one of its
+# arguments is $clone_dir/proxy/proxy.py. A pid the system gave to another
+# program since (a reboot or kill -9 left proxy.pid) is not, so it is neither
+# waited on nor signalled. Taken as before where the command line cannot be
+# read, and on Git Bash (the pid is MSYS's, for a native Windows python).
+_host_proxy_is_ours() {
+    declare -F harness_is_git_bash >/dev/null && harness_is_git_bash && return 0
+    local cmd
+    cmd=$(_pid_cmdline "$1")
+    [[ -z "${cmd//[[:space:]]/}" ]] && return 0
+    [[ " $cmd " == *" $clone_dir/proxy/proxy.py "* ]]
+}
+
 # Echo the live PID for the host proxy, or nothing. Cleans a stale pidfile whose
-# process is gone. Mirrors host_mcp_pid. Always returns 0.
+# process is gone, or is no longer the proxy. Mirrors host_mcp_pid. Always returns 0.
 host_proxy_pid() {
     local pf pid
     pf=$(host_proxy_pidfile)
     [[ -f "$pf" ]] || return 0
     pid=$(tr -d ' \t\r\n' <"$pf" 2>/dev/null)
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && _host_proxy_is_ours "$pid"; then
         printf '%s' "$pid"
         return 0
     fi
@@ -8618,17 +8674,27 @@ harness_view_stop() {
 serve_pidfile() { printf '%s/serve/serve.pid' "$state_root"; }
 
 # Whether the harness serve serve.pid names is running. A pid the system gave
-# to another process since (serve ended without removing the file) is not.
+# to another process since (serve ended without removing the file) is not: the
+# pid must be the shell running `<this harness> serve ...` (the same after its
+# USR1 restart, which execs "$clone_dir/harness" serve). Not merely a command
+# line that names harness: the host proxy, a queue run and anything started from
+# the clone folder do. The script word is resolved (an absolute path; a relative
+# one from the process's cwd where /proc has it) and must be this script; one
+# that cannot be resolved (relative, no /proc) goes by its name, harness.
 serve_running() {
-    local pid cmdline=""
+    local pid cmdline w r=""
     read -r pid _ 2>/dev/null <"$(serve_pidfile)" || return 1
     [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
-    if [[ -r "/proc/$pid/cmdline" ]]; then
-        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
-    else
-        cmdline=$(ps -o command= -p "$pid" 2>/dev/null) || cmdline=""
+    cmdline=$(_pid_cmdline "$pid")
+    [[ "$cmdline" =~ (^|[[:space:]])([^[:space:]]*harness)[[:space:]]+serve([[:space:]]|$) ]] || return 1
+    w=${BASH_REMATCH[2]}
+    [[ "$w" == harness || "$w" == */harness ]] || return 1
+    if [[ "$w" == /* ]]; then
+        r=$(_self_path "$w" 2>/dev/null) || r=""
+    elif [[ -d "/proc/$pid/cwd" ]]; then
+        r=$(cd "/proc/$pid/cwd" 2>/dev/null && _self_path "$w" 2>/dev/null) || r=""
     fi
-    [[ "$cmdline" == *harness* ]]
+    [[ -z "$r" || "$r" == "$real_self" || "$r" == "$(_self_path "$clone_dir/harness" 2>/dev/null)" ]]
 }
 
 # After an upgrade: a harness serve in a terminal serves the old pages and the

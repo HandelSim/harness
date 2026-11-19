@@ -136,6 +136,20 @@ class PubServerTest(LiveServer):
         self.assertEqual(sid, pub.state_id(os.path.join(state, ".", "")))
         self.assertIsNone(pub.pub_health(free_port()))
 
+    def test_polls_that_went_well_are_not_logged(self):
+        # pub.log is every request serve answers: a client polls for as long as it is open
+        port = self.start()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            for path in ("/healthz", "/live", "/api/v1/poll?t=status"):
+                r, _ = self.get(port, path)
+                self.assertEqual(r.status, 200, path)
+        self.assertEqual(err.getvalue(), "")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.get(port, "/")[0].status, 200)
+            self.assertEqual(self.get(port, "/nope/live")[0].status, 404)
+        self.assertIn('"GET / HTTP/1.1" 200', err.getvalue())
+        self.assertIn('"GET /nope/live HTTP/1.1" 404', err.getvalue())
+
     def test_healthz_gives_the_pid_and_the_port_is_its_own(self):
         port = self.start()
         self.assertEqual(pub.pub_pid(port), os.getpid())
@@ -909,8 +923,10 @@ if __name__ == "__main__":
 
 
 FAKE_HARNESS = r'''#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$LOG"
-case "$*" in
+args="$*"
+if [[ "$1 $2 ${4:-}" == "config set --stdin" ]]; then IFS= read -r v || true; args="$args <$v"; fi
+printf '%s\n' "$args" >> "$LOG"
+case "$args" in
   "config list --tsv")
     printf 'PROXY_API_URL\thttps://llm.example\t0\tupstream URL\n'
     printf 'PROXY_API_KEY\t(set, 9 chars)\t1\tupstream key\n'
@@ -919,7 +935,7 @@ case "$*" in
   "net list") printf 'allowlist (/x):\n  pypi.org            # pip\n  gitlab.example.com  [git-push]\n' ;;
   "mcp list --available") printf 'NAME STATE STATUS\nserena installed-enabled running\ngh available -\n' ;;
   doctor) printf '\033[1m[deps]\033[0m\n  \xe2\x9c\x93 git  git version 2\n  \xe2\x9c\x97 docker  not reachable <b>\n' ;;
-  "config set DEFAULT_MODEL_NAME bad") echo "harness: refused" >&2; exit 1 ;;
+  "config set DEFAULT_MODEL_NAME --stdin <bad") echo "harness: refused" >&2; exit 1 ;;
   "net allow"*) echo "added ${3}" ;;
   "ingest --forget"*) echo "forgot ${3}: 2 pages removed" ;;
   ingest*) echo "ingesting"; exec sleep 30 ;;
@@ -1011,10 +1027,11 @@ class SettingsPageTest(LiveServer):
         self.assertEqual(r.status, 303)
         self.assertIn("done=Saved+DEFAULT_MODEL_NAME", r.getheader("Location"))
         sets = [c for c in self.calls() if c.startswith("config set")]
-        self.assertEqual(sets, ["config set DEFAULT_MODEL_NAME other"])
+        self.assertEqual(sets, ["config set DEFAULT_MODEL_NAME --stdin <other"])
         self.post(port, "/settings/config", {"v_PROXY_API_KEY": "sk-new", "clear_HTTPS_PROXY": "1"})
         sets = [c for c in self.calls() if c.startswith("config set")]
-        self.assertEqual(sets[1:], ["config set PROXY_API_KEY sk-new", "config set HTTPS_PROXY "])
+        # values go on stdin: a key typed into Settings is not on argv, where `ps` shows it
+        self.assertEqual(sets[1:], ["config set PROXY_API_KEY --stdin <sk-new", "config set HTTPS_PROXY --stdin <"])
         r, _ = self.post(port, "/settings/config", {"v_DEFAULT_MODEL_NAME": "a\nb"})
         self.assertIn("bad=", r.getheader("Location"))
         r, _ = self.post(port, "/settings/config", {"v_DEFAULT_MODEL_NAME": "bad"})

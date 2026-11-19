@@ -20,6 +20,10 @@
 #         remote that never answers is cut off at the deadline.
 #   - T7: `harness host` and `harness serve` show the banner before their
 #         confirm prompt.
+#   - T8: origin is asked at most once per HARNESS_UPDATE_CHECK_TTL window
+#         (the cache answers in between, a hung remote costs its timeout once,
+#         a stamp from the future does not pin the window); a queue stage's
+#         launch (HARNESS_QUEUE_LAUNCH) skips the check.
 #
 # Prints "UPDATE CHECK TEST PASSED" on success.
 
@@ -40,9 +44,14 @@ trap 'rm -rf "$TMP"' EXIT
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@invalid
 
+# T1-T7 ask origin on every call; T8 tests the window that normally spaces them.
+export HARNESS_UPDATE_CHECK_TTL=0
+unset HARNESS_QUEUE_LAUNCH HARNESS_SKIP_UPDATE_CHECK
+
 REMOTE="$TMP/remote.git"
 ROOT="$TMP/root"
 CACHE="$ROOT/state/.harness-update-check"
+STAMP="$ROOT/state/.harness-update-asked"
 
 git init -q --bare "$REMOTE"
 git init -q "$TMP/seed"
@@ -145,6 +154,41 @@ for c in cmd_host cmd_serve; do
     grep -q "update available on dev" <<<"$out" || fail "T7: $c showed no banner — $out"
 done
 ok "T7: harness host and harness serve show the banner"
+
+# --- T8: one lookup per window; none for a queue stage ------------------------------
+win() { HARNESS_UPDATE_CHECK_TTL=1800 banner "$@"; }
+# the throwaway clone, level with origin/dev (T3 left a local commit on it)
+level() { git -C "$ROOT" fetch -q origin dev && git -C "$ROOT" reset -q --hard FETCH_HEAD; }
+level
+advance dev
+rm -f "$CACHE" "$STAMP"
+out="$(win)"
+grep -q "update available on dev" <<<"$out" || fail "T8: first call in a window did not ask origin — $out"
+[[ -f "$STAMP" ]] || fail "T8: no stamp after asking origin"
+level
+advance dev
+out="$(win)"     # origin is ahead again, but inside the window the cache (= HEAD) answers
+! grep -q "update available" <<<"$out" || fail "T8: origin was asked again inside the window — $out"
+touch -t 209901010000 "$STAMP"      # a stamp from the future (clock set back): asks again
+out="$(win)"
+grep -q "update available on dev" <<<"$out" || fail "T8: a future stamp pinned the window shut — $out"
+# A hung remote: the first call pays its timeout once, the next one in the window does not.
+git -C "$ROOT" remote set-url origin "ext::sleep 30"
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.ext.allow GIT_CONFIG_VALUE_0=always
+rm -f "$STAMP"
+out="$(win 3)"
+grep -q "update available on dev" <<<"$out" || fail "T8: a hung lookup lost the cached banner — $out"
+start=$SECONDS
+out="$(win 3)"     # a lookup would take its 3 s; whole seconds, so <= 1 is "did not ask"
+(( SECONDS - start <= 1 )) || fail "T8: a call inside the window waited on the remote ($((SECONDS - start))s)"
+grep -q "update available on dev" <<<"$out" || fail "T8: cached banner missing inside the window — $out"
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+git -C "$ROOT" remote set-url origin "$REMOTE"
+rm -f "$STAMP"
+out="$(HARNESS_QUEUE_LAUNCH=1 win)"
+! grep -q "update available" <<<"$out" || fail "T8: a queue stage launch showed the banner — $out"
+[[ ! -e "$STAMP" ]] || fail "T8: a queue stage launch asked origin"
+ok "T8: origin asked once per window (cache in between, hung remote once, future stamp ignored); queue launches skip"
 
 echo
 echo "UPDATE CHECK TEST PASSED"

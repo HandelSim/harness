@@ -14,6 +14,8 @@
 #   T5  leases say what holds them: a reused pid does not count, and a serve,
 #       queue run or findings run alone does not keep a config or code change
 #       from restarting the proxy
+#   T6  a proxy.pid whose pid is now another program's (reboot, kill -9): not
+#       the proxy, not waited on, not signalled by the stop
 #
 # Run:  bash tests/unit_host_proxy_lease_test.sh
 
@@ -66,9 +68,10 @@ other_harness() {
         : >"$(host_proxy_usersdir)/$OTHER"
     fi
 }
-# A stand-in for the running proxy: the pidfile points at a sleep.
+# A stand-in for the running proxy: the pidfile points at a sleep whose command
+# line is the proxy's (host_proxy_pid trusts only a pid running proxy.py).
 fake_proxy() {
-    sleep 300 &
+    (exec -a "$clone_dir/proxy/proxy.py" sleep 300) &
     KIDS+=("$!")
     printf '%s\n' "$!" >"$(host_proxy_pidfile)"
     PROXY=$!
@@ -201,5 +204,24 @@ grep -q "harness serve (pid $s)" <<<"$out" || fail "T5: refusal does not name se
 host_proxy_stop 2>/dev/null   # harness_is_git_bash is not sourced here
 kill "$s" "$f"; wait "$s" "$f" 2>/dev/null
 ok "T5: leases name their holder; reused pids drop; background runs alone do not pin a stale proxy"
+
+# --- T6 ----------------------------------------------------------------------
+sleep 300 &
+other=$!
+KIDS+=("$other")
+printf '%s\n' "$other" >"$(host_proxy_pidfile)"
+printf 'fp\n' >"$(host_proxy_fpfile)"
+host_proxy_running && fail "T6: a pid running sleep counted as the host proxy"
+[[ -f "$(host_proxy_pidfile)" ]] && fail "T6: the pidfile naming another program was kept"
+printf '%s\n' "$other" >"$(host_proxy_pidfile)"
+host_proxy_stop 2>/dev/null
+kill -0 "$other" 2>/dev/null || fail "T6: host_proxy_stop signalled a program that is not the proxy"
+fake_proxy
+host_proxy_running || fail "T6: the proxy's own pid was not trusted"
+[[ "$(host_proxy_pid)" == "$PROXY" ]] || fail "T6: wrong pid: $(host_proxy_pid) != $PROXY"
+host_proxy_stop 2>/dev/null
+kill -0 "$PROXY" 2>/dev/null && fail "T6: host_proxy_stop left the proxy up"
+kill "$other"; wait "$other" 2>/dev/null
+ok "T6: proxy.pid naming another program is dropped, never signalled"
 
 echo "[proxy-lease] all $pass checks passed"

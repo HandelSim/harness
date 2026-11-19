@@ -88,16 +88,21 @@ def _launch(harness, install_root):
     return [bash, harness], env, kw
 
 
-def run_harness(harness, install_root, *args, timeout=60):
+def run_harness(harness, install_root, *args, timeout=60, input=None):
     """(exit status, output) of `harness ARGS` with no terminal (it cannot prompt), or
-    (None, why) when it could not run or took too long."""
+    (None, why) when it could not run or took too long. input: text for its stdin
+    (a value kept off argv, where `ps` shows it); none: stdin is /dev/null."""
     head, env, kw = _launch(harness, install_root)
     if head is None:
         return None, env
+    if input is not None:
+        kw.pop("stdin", None)
+        kw["input"] = input.encode("utf-8")
     try:
         r = subprocess.run([*head, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, **kw)
     except subprocess.TimeoutExpired:
-        return None, f"harness {' '.join(args)} took over {timeout} s and was stopped"
+        # the first words only: past them can be a value (and no value goes in a message)
+        return None, f"harness {' '.join(args[:3])} took over {timeout} s and was stopped"
     except OSError as e:
         return None, f"cannot run harness: {e.strerror or e}"
     return r.returncode, ANSI.sub("", r.stdout.decode("utf-8", "replace")).replace("\r\n", "\n")
@@ -255,7 +260,9 @@ def save_config(h, form):
         if "\n" in new or "\r" in new or "\0" in new or len(new) > MAX_VALUE:
             failed.append(f"{key}: one line, at most {MAX_VALUE} characters")
             continue
-        rc, out = run_harness(*h, "config", "set", key, new, timeout=20)
+        # the value on stdin, never argv (`ps` shows argv to every user): secrets, and a
+        # plain setting that can carry one too (HTTPS_PROXY=http://user:pass@...)
+        rc, out = run_harness(*h, "config", "set", key, "--stdin", timeout=20, input=new + "\n")
         (changed if rc == 0 else failed).append(key if rc == 0 else f"{key}: {_last_line(out)}")
     if failed:
         return False, "Not saved: " + "; ".join(failed) + (f" (saved: {', '.join(changed)})" if changed else "")
