@@ -44,7 +44,12 @@ Status: DONE except where listed under Remaining (stop 08:42 UTC).
   `views/session/model.test.ts` 7/7 pass.
 - architecture/desktop.md: Keys (stdin, storeInactive, L10), Updates (confirms, re-attach), new Notifications section.
 - `npx tsc --noEmit -p tsconfig.json`: 0 errors (08:01).
-- e2e (views + keys + update specs, once via the lock): see "e2e" below.
+- e2e (views + keys + update specs, once via the lock, 08:03): 10 passed (1.4m), exit 0; no electron/Xvfb left.
+
+## Note for the parent (git)
+- At 08:03 UTC an outside process made commit `3f05534` on `dev` ("Nightly wiki-ingest sweep (personal) ...", author
+  HandelSim) that swept in ALL legs' uncommitted work (50 files: desktop/, harness, serve/, scripts/, tests/,
+  architecture/). Not pushed (`dev` ahead of origin by 1). I did not touch git; the message is wrong for this content.
 
 ## Contract changes (additive)
 - `src/shared/ipc.ts`: `KeyMeta.chars?: number`; `keys.setStoreInactive(on: boolean): Promise<KeyOpResult>`.

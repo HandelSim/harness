@@ -452,7 +452,13 @@ export class BackendManager {
     this.poller.stop();
     if (!this.st.owned && !this.children.size) return;
     const pol = this.d.settings().backend.onQuit;
-    if (pol === 'keep' || (pol === 'keep-if-busy' && this.busy())) { for (const c of this.children) c.unref(); return; }
+    if (pol === 'keep' || (pol === 'keep-if-busy' && this.busy())) {
+      this.gen++; this.stopping = true;            // the serve outlives us: no respawn / reprobe from here on
+      if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
+      if (this.reprobeTimer) { clearTimeout(this.reprobeTimer); this.reprobeTimer = null; }
+      for (const c of this.children) c.unref();
+      return;
+    }
     await this.stopServe(true);
   }
 }

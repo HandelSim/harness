@@ -32,6 +32,12 @@ main (Node 24, out/main/index.cjs)
   the payload. API paths must start with `/api/v1/` and contain no traversal.
 - Top-level navigation, redirects and `window.open` are refused. External
   links open in the OS browser, and only for http, https and mailto.
+- Permission requests are denied on both sessions except
+  `clipboard-sanitized-write`; both handlers are installed at ready.
+- A second instance exits at once (`app.exit`) before loading any store.
+- A crashed renderer is reloaded (not on `clean-exit`), at most 3 times a
+  minute; then main shows a static error page. PTYs survive a reload.
+- `consent-host` asks a native confirm in main before it persists.
 - The packaged app turns off the Electron fuses for runAsNode, NODE_OPTIONS and
   inspect, and only loads the app from the asar (`electron-builder.yml`).
 
@@ -55,6 +61,15 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   use, python missing). A locked key restarts serve with
   `HARNESS_SKIP_AUTH_PROBE=1`. Respawns back off 1, 5 and 15 s, at most 3 in
   5 minutes.
+- `start()` is single-flight: a retry, restart, set-root or create-env during
+  a start joins it or adopts the serve already spawned. Every spawned serve
+  is tracked until it exits, so quit can stop it.
+- Serve writes straight to `<root>/logs/serve.log` (a file fd, not a pipe;
+  rotated to `serve.log.1` above 5 MB), so a busy serve never blocks on main.
+  Main tails the file while starting to classify failures.
+- When the configured port is held by another install, main first probes the
+  next 10 ports for a serve of this install and attaches to it, then picks a
+  free port.
 - `HARNESS_DESKTOP_SERVE_URL` sets attach-only mode, which never spawns serve.
 - Live data comes from one multiplexed conditional poll
   (`/api/v1/poll?t=topic~sig`) of the topics visible panels subscribe to.
@@ -68,7 +83,8 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
 - The queue list renders only the rows in view above 200 tickets; the
   transcript renders the newest 200 messages, with "Show earlier".
 - Quit policy: keep-if-busy (default), stop, or keep. An attached serve that
-  the app did not start is never stopped.
+  the app did not start is never stopped. Stop sends SIGTERM to each owned
+  serve's process group, then runs `harness serve stop` (5 s cap).
 
 ## Terminals (`src/main/pty/`)
 
@@ -82,8 +98,11 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
 - The host coalesces output to one message per 8 ms. It pauses a PTY above
   1 MiB of output the renderer has not acknowledged and resumes below
   256 KiB.
-- Main keeps a 256 KiB replay ring per terminal for re-attach. If the host
-  dies, every terminal is marked exited.
+- Main keeps a 256 KiB replay ring per terminal for re-attach (a chunk list,
+  flattened on attach). If the host dies, every terminal is marked exited.
+- `pty:kill` drops the terminal's record at once; the host sends SIGHUP, then
+  SIGKILL after 3 s. An exited terminal stays in `pty:list` and attachable for
+  60 s, then is dropped.
 - A terminal panel removed without its close confirm (layout undo or reset)
   kills its PTY unless the new layout re-attaches to it. At renderer start,
   PTYs from an earlier page that no restored panel claims are killed.
@@ -118,8 +137,18 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   - updates are off
   - the app is a dev build
   - on Linux, the app is not an AppImage
+- `settings.updates.auto` turns both the background checks (30 s after start,
+  then every 6 h) and auto-download on or off; a manual check always works.
+- Restart to update first runs the quit shutdown (state and settings flushed,
+  serve per the quit policy, PTYs killed, 8 s cap) and releases the
+  single-instance lock, then calls `quitAndInstall`. The AppImage starts the
+  new version at once, so the lock must already be free. If the install is
+  refused after that, the app relaunches the current version.
 - Harness itself updates through the CLI runner: `harness check-updates`, then
-  `harness upgrade --no-prompt`.
+  `harness upgrade --no-prompt`. One job of each kind runs at a time (a second
+  request gets the running job's id); the last 8 jobs keep a 64 KB output tail
+  (`harness:jobs`). CLI children run in their own process group, and a
+  timeout kills the whole group.
 - The Updates view confirms Restart to update and Upgrade first, listing what
   they interrupt (`app:busy`: open terminals, a running queue run, running
   jobs). Opening the view re-attaches to a running upgrade / check job
@@ -138,9 +167,14 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
 ## Where state lives
 
 - `userData/settings.json` and `userData/state.json`: written atomically,
-  mode 600. A corrupt file is moved aside and defaults are loaded.
+  mode 600. A corrupt file is moved aside and defaults are loaded. Settings
+  apply at once; the file write is debounced (400 ms) and flushed on quit.
 - `userData/keys.json` and `userData/logs/app.log` (rotated at 5 MB).
-- `<root>/logs/serve.log`: output of an owned serve.
+- `<root>/logs/serve.log` (mode 600): output of an owned serve.
+- `shell:path-info` is async and realpath'd. It returns `real` and `repo`
+  (`isRepo`, `root`, `branch` (empty when detached), `detached`,
+  `hasCommits`, `inSubfolder`) from one git probe; each fs or git step gives
+  up after 1.5 s.
 - Environment overrides are all `HARNESS_DESKTOP_*`:
   - `ROOT`, `SERVE_URL`, `SERVE_PORT`
   - `USER_DATA`

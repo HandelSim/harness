@@ -45,7 +45,14 @@ port.on('message', ({ data: m }) => {
     else if (m.t === 'ack') {
       const s = ptys.get(m.id);
       if (s) { s.unacked = Math.max(0, s.unacked - m.chars); if (s.paused && s.unacked < LOW) { s.paused = false; s.p.resume(); } }
-    } else if (m.t === 'kill') { const s = ptys.get(m.id); if (s) { try { s.p.kill(); } catch { /* gone */ } } }
+    } else if (m.t === 'kill') {
+      // SIGHUP first; a process that ignores it (or sits paused by flow control) gets SIGKILL after 3 s
+      const s = ptys.get(m.id);
+      if (s) {
+        try { s.p.kill(); } catch { /* gone */ }
+        setTimeout(() => { if (ptys.get(m.id) === s) { try { s.p.kill('SIGKILL'); } catch { /* gone */ } } }, 3000).unref();
+      }
+    }
     else if (m.t === 'killall') { for (const s of ptys.values()) { try { s.p.kill(); } catch { /* gone */ } } }
     else if (m.t === 'ping') post({ t: 'pong', n: m.n, mem: process.memoryUsage().rss, unacked: [...ptys.values()].reduce((a, s) => a + s.unacked, 0) });
   } catch (e) {

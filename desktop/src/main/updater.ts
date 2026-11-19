@@ -20,7 +20,18 @@ export class Updater {
   st: AppUpdateState;
   private au: AU | null = null;
   private timer: NodeJS.Timeout | null = null;
-  constructor(private d: { env: Env; packaged: boolean; version: string; emit: (s: AppUpdateState) => void }) {
+  private first: NodeJS.Timeout | null = null;
+  private auto = true;
+  private installing = false;
+  constructor(private d: { env: Env; packaged: boolean; version: string; emit: (s: AppUpdateState) => void;
+    /** settings.updates.auto (M10): background checks + auto-download on, or neither. */
+    auto?: () => boolean;
+    /** H2: before quitAndInstall: stop serve per policy, kill ptys, flush state, release the single-instance lock. */
+    beforeInstall?: () => Promise<void>;
+    /** quitAndInstall refused after beforeInstall already ran (terminals are gone): restart the current version. */
+    installFailed?: () => void;
+    /** tests: the electron-updater instance. */
+    au?: AU }) {
     const reason = unsupportedReason({ packaged: d.packaged, feedFromEnv: !!d.env.updateUrl, noUpdate: d.env.noUpdate,
       platform: process.platform, appImage: !!process.env.APPIMAGE });
     this.st = { phase: reason ? 'unsupported' : 'idle', current: d.version, next: null, notes: '', percent: 0, reason,
@@ -33,9 +44,8 @@ export class Updater {
     if (this.au || this.st.phase === 'unsupported') return this.au;
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { autoUpdater } = require('electron-updater') as typeof import('electron-updater');
-      const au = autoUpdater;
-      au.autoDownload = false;
+      const au = this.d.au ?? (require('electron-updater') as typeof import('electron-updater')).autoUpdater;
+      au.autoDownload = this.auto;
       au.autoInstallOnAppQuit = true;
       au.logger = { info: (m: unknown) => log('info', `updater: ${m}`), warn: (m: unknown) => log('warn', `updater: ${m}`),
         error: (m: unknown) => log('error', `updater: ${m}`), debug: () => {} };
@@ -55,9 +65,28 @@ export class Updater {
   }
 
   init(): void {
+    this.auto = this.d.auto ? this.d.auto() : true;
     if (this.st.phase === 'unsupported' || this.d.env.e2e) return;
+    this.schedule();
+  }
+
+  /** settings:changed: updates.auto turns the background checks and auto-download on or off. */
+  setAuto(on: boolean): void {
+    if (on === this.auto) return;
+    this.auto = on;
+    if (this.au) this.au.autoDownload = on;
+    if (this.st.phase === 'unsupported' || this.d.env.e2e) return;
+    this.schedule();
+  }
+
+  scheduled(): boolean { return !!this.timer; }
+
+  private schedule(): void {
+    if (this.first) { clearTimeout(this.first); this.first = null; }
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (!this.auto) return;
     const run = () => { void this.check(); };
-    setTimeout(run, 30000).unref();
+    this.first = setTimeout(run, 30000); this.first.unref();
     this.timer = setInterval(run, 6 * 3600 * 1000);
     this.timer.unref();
   }
@@ -78,13 +107,24 @@ export class Updater {
     return this.st;
   }
 
-  install(): void { if (this.au && this.st.phase === 'ready') this.au.quitAndInstall(false, true); }
+  /** Restart to update (H2). AppImage's doInstall spawns the new instance at once, so everything that blocks a
+   * clean handover (the single-instance lock, serve, ptys) is released first; the app then quits normally. */
+  async install(): Promise<void> {
+    const au = this.au;
+    if (!au || this.st.phase !== 'ready' || this.installing) return;
+    this.installing = true;
+    try { await this.d.beforeInstall?.(); } catch (e) { log('error', `before install: ${e}`); }
+    au.quitAndInstall(false, true);
+    // electron-updater reports a refused install through 'error' (synchronously) and does not quit
+    // (phase is set by the 'error' listener during the call)
+    if ((this.st as AppUpdateState).phase === 'error') { this.installing = false; this.d.installFailed?.(); }
+  }
 
   register(handle: typeof Handle, v: typeof V): void {
     handle('update:get', v.none, () => this.st, () => this.st);
     handle('update:check', v.none, () => this.check(), () => this.st);
     handle('update:download', v.none, () => this.download(), () => this.st);
-    handle('update:install', v.none, () => { this.install(); }, () => undefined);
+    handle('update:install', v.none, () => this.install(), () => undefined);
   }
 }
 

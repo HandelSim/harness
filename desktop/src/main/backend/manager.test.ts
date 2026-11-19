@@ -31,7 +31,7 @@ function mk(root: string, port: number, onQuit: Settings['backend']['onQuit'] = 
   const m = new BackendManager({
     env: { ...readEnv({}), root }, appPath: '/nowhere', packaged: false, home: tmpdir(), logDir: join(root, 'logs'),
     settings: () => settings, patchSettings: (p) => { settings = { ...settings, backend: { ...settings.backend, ...p.backend } }; },
-    emit: (s) => states.push(s), live: () => {}, health: () => {}, accessCode: () => null, saveAccessCode: () => {}, lastProject: () => null,
+    emit: (s) => { states.push(s); if (process.env.DEBUG_W1A) console.error('state', s.phase, s.port, s.owned, s.problem?.message); }, live: () => {}, health: () => {}, accessCode: () => null, saveAccessCode: () => {}, lastProject: () => null,
   });
   return { m, states };
 }
@@ -115,10 +115,13 @@ test('L3: with the port taken by another install, a serve of ours on a fallback 
     await a.m.onQuit();                                 // 'keep': serve stays up
     assert.ok(alive(keptPid));
     const b = mk(root, port, 'stop');
-    await b.m.start();
-    assert.equal(b.m.st.phase, 'up');
-    assert.equal(b.m.st.port, a.m.st.port);
-    assert.equal(serveCalls(root), 1);
+    try {
+      await b.m.start();
+      assert.equal(b.m.st.phase, 'up');
+      assert.equal(b.m.st.port, a.m.st.port);
+      assert.equal(serveCalls(root), 1);
+    } finally { await b.m.onQuit(); }               // attached, not spawned by b: left running
+    assert.ok(alive(keptPid));
   } finally {
     other.close();
     if (keptPid) { try { process.kill(-keptPid, 'SIGTERM'); } catch { /* gone */ } }

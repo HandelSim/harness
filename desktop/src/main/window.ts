@@ -54,3 +54,18 @@ function fitBounds(st: AppState['window']): { x?: number; y?: number; width: num
     return visible ? { x: st.x, y: st.y, width: Math.min(width, d.width), height: Math.min(height, d.height) } : { width, height };
   } catch { return { width, height }; }
 }
+
+/** M5: reload a crashed renderer unless it exited cleanly, at most `max` times per `windowMs`; past that the
+ * caller shows an error page. `times` is the caller's history of reloads (mutated). */
+export function crashReload(times: number[], reason: string, now: number, max = 3, windowMs = 60000): 'ignore' | 'reload' | 'give-up' {
+  if (reason === 'clean-exit') return 'ignore';
+  while (times.length && now - times[0] > windowMs) times.shift();
+  if (times.length >= max) return 'give-up';
+  times.push(now);
+  return 'reload';
+}
+
+export const CRASH_PAGE = 'data:text/html;charset=utf-8,' + encodeURIComponent(
+  '<!doctype html><meta charset=utf-8><title>Harness</title><body style="background:#0b0d12;color:#d8dee9;font:14px system-ui;padding:40px">' +
+  '<h2>The window keeps crashing</h2><p>Terminals and the backend are still running. Quit and reopen the app; ' +
+  'if it happens again, the log is in the app\'s logs folder.</p>');

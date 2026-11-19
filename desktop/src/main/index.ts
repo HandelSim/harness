@@ -1,22 +1,22 @@
 // Main process entry: env, userData, scheme, window, IPC handlers, backend manager, quit policy.
-import { app, BrowserWindow, dialog, Notification, powerMonitor, safeStorage, shell, ipcMain } from 'electron';
-import { existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { app, BrowserWindow, dialog, Notification, powerMonitor, safeStorage, session, shell, ipcMain } from 'electron';
+import { writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
-import type { AppInfo, AppState, BackendAction, PathInfo, Settings } from '../shared/ipc';
+import type { AppBusy, AppInfo, AppState, BackendAction, PathInfo, Settings } from '../shared/ipc';
 import type { Topic } from '../shared/api';
 import { readEnv, defaultSettings, coerceSettings, mergeSettings } from './settings';
 import { defaultState, coerceState, mergeState } from './state';
 import { loadJson, saveJson } from './store';
 import { initLog, log } from './log';
 import { registerScheme, serveApp } from './protocol';
-import { createWindow } from './window';
+import { createWindow, crashReload, CRASH_PAGE } from './window';
 import { handle, listen, emit, setEventTargets, recordEvents, sentLog, v, BadPayload, unavailable } from './ipc';
 import { apiPathOk, bytesPathOk, externalUrlOk, APP_PREFIX } from './security';
 import { BackendManager } from './backend/manager';
 import { apiError } from './backend/http';
-import { runHarness, parseConfigTsv, startJob, parseCheckUpdates } from './cli';
+import { runHarness, parseConfigTsv, startJob, parseCheckUpdates, Jobs } from './cli';
+import { pathInfo } from './pathinfo';
 import { hardenWebviews, setupWebSession, copyCookies, setGuestCss, WEB_PARTITION } from './webview';
 import { KeyVault } from './keys/vault';
 import { PtyClient } from './pty/client';
@@ -28,7 +28,9 @@ if (env.userData) app.setPath('userData', resolve(env.userData));
 if (env.disableGpu) app.disableHardwareAcceleration();
 registerScheme();
 
-if (!env.e2e && !app.requestSingleInstanceLock()) app.quit();
+// L6: a second instance exits at once and touches nothing (no store loads / corrupt-file moves, no ready work).
+const secondary = !env.e2e && !app.requestSingleInstanceLock();
+if (secondary) app.exit(0);
 
 const userData = app.getPath('userData');
 initLog(join(userData, 'logs'), env.logLevel);
@@ -36,10 +38,10 @@ const appPath = app.getAppPath();
 
 const sFile = join(userData, 'settings.json');
 const aFile = join(userData, 'state.json');
-const sl = loadJson(sFile, defaultSettings, coerceSettings);
+const sl = secondary ? { value: defaultSettings(), recovered: null } : loadJson(sFile, defaultSettings, coerceSettings);
 let settings: Settings = sl.value;
 if (sl.recovered) log('warn', `settings.json was unreadable; moved to ${sl.recovered}`);
-const al = loadJson(aFile, defaultState, coerceState);
+const al = secondary ? { value: defaultState(), recovered: null } : loadJson(aFile, defaultState, coerceState);
 let appState: AppState = al.value;
 if (al.recovered) log('warn', `state.json was unreadable; moved to ${al.recovered}`);
 let stateDirty = false;
@@ -50,10 +52,21 @@ let win: BrowserWindow | null = null;
 setEventTargets(() => (win && !win.isDestroyed() ? [win.webContents] : []));
 recordEvents(env.e2e);
 
+// L16: settings apply and broadcast at once; the fsync'd write is debounced (a slider drag is one write) and
+// flushed on quit.
+let settingsTimer: NodeJS.Timeout | null = null;
+const flushSettings = () => {
+  if (!settingsTimer) return;
+  clearTimeout(settingsTimer); settingsTimer = null;
+  try { saveJson(sFile, settings); } catch (e) { log('error', `settings save: ${e}`); }
+};
 const saveSettings = (patch: unknown) => {
   settings = mergeSettings(settings, patch);
-  saveJson(sFile, settings);
+  if (settingsTimer) clearTimeout(settingsTimer);
+  settingsTimer = setTimeout(() => { settingsTimer = null; try { saveJson(sFile, settings); } catch (e) { log('error', `settings save: ${e}`); } }, 400);
+  settingsTimer.unref?.();
   emit('settings:changed', settings);
+  updater?.setAuto(settings.updates.auto);
   return settings;
 };
 
@@ -69,11 +82,22 @@ const backend = new BackendManager({
   accessCode: () => vault.accessCode(),
   saveAccessCode: (c) => vault.saveAccessCode(c),
   lastProject: () => appState.recents.projects[0] || null,
+  confirmHost: async () => {
+    if (env.e2e) { e2eRecord.dialogs.push({ confirmHost: true }); return true; }
+    const o = { type: 'warning' as const, buttons: ['Cancel', 'Allow host mode'], defaultId: 0, cancelId: 0, title: 'Host mode',
+      message: 'Allow agents to run directly on this machine?',
+      detail: 'Host sessions run without the container sandbox, with your user\'s full access to files and network.' };
+    const r = win ? await dialog.showMessageBox(win, o) : await dialog.showMessageBox(o);
+    return r.response === 1;
+  },
 });
 
 const pty = new PtyClient({ hostPath: join(appPath, 'out/main/pty-host.cjs'), root: () => backend.st.root,
   hostConsent: () => settings.backend.hostConsent, emit });
-const updater = new Updater({ env, packaged: app.isPackaged, version: app.getVersion(), emit: (s) => emit('update:state', s) });
+const updater: Updater = new Updater({ env, packaged: app.isPackaged, version: app.getVersion(), emit: (s) => emit('update:state', s),
+  auto: () => settings.updates.auto,
+  beforeInstall: async () => { await shutdown(); app.releaseSingleInstanceLock(); },
+  installFailed: () => { app.relaunch(); app.exit(0); } });
 
 // e2e hooks (only with HARNESS_DESKTOP_E2E=1): recorded renderer-bound events, stubbed dialogs/notifications.
 const e2eRecord: { notifications: unknown[]; dialogs: unknown[] } = { notifications: [], dialogs: [] };
@@ -87,6 +111,8 @@ handle('app:info', v.none, (): AppInfo => ({
   keyStorage: vault.storageInfo(), reducedMotion: systemReducedMotion(), onBattery: powerMonitor.isOnBatteryPower(),
 }));
 handle('backend:get', v.none, () => backend.get());
+handle('app:busy', v.none, (): AppBusy => ({ terminals: pty.liveCount(), queueRunning: backend.busy(),
+  ownedServe: backend.st.owned, onQuit: settings.backend.onQuit, jobs: jobs.running() }));
 handle('backend:action', (p): BackendAction => {
   const o = obj(p);
   const a = v.oneOf(o.action, 'action', ['start', 'restart', 'stop', 'retry', 'create-env', 'consent-host', 'create-code', 'set-root', 'login'] as const);
@@ -155,20 +181,13 @@ handle('harness:config-set', (p) => {
   const r = await runHarness(root, ['config', 'set', key, value], { timeoutMs: 30000 });
   return { ok: r.code === 0, msg: (r.code === 0 ? r.stdout : r.stderr || r.stdout).trim().slice(-500) || (r.code === 0 ? `${key} saved` : 'failed') };
 }, (m) => ({ ok: false, msg: m }));
-let jobSeq = 0;
 let harnessUpdate = { branch: '', local: '', available: null as boolean | null, text: '', checkedAt: null as number | null };
-handle('harness:job', (p) => v.oneOf(obj(p).job, 'job', ['doctor', 'check-updates', 'upgrade', 'serve-stop'] as const), (job) => {
-  const id = `job-${++jobSeq}`;
-  const root = backend.st.root;
-  const args = { doctor: ['doctor'], 'check-updates': ['check-updates'], upgrade: ['upgrade', '--no-prompt'], 'serve-stop': ['serve', 'stop'] }[job];
-  if (!root) { setTimeout(() => { emit('job:output', { id, chunk: 'no harness install\n' }); emit('job:exit', { id, code: 127 }); }, 0); return { id }; }
-  let all = '';
-  setTimeout(() => startJob(root, args, (chunk) => { all += chunk; emit('job:output', { id, chunk }); }, (code) => {
-    if (job === 'check-updates') harnessUpdate = parseCheckUpdates(all, code, Date.now());
-    emit('job:exit', { id, code });
-  }), 0);
-  return { id };
-}, () => ({ id: '' }));
+// M3: one running job per kind (a second request re-attaches to it), recent jobs kept with an output tail
+const jobs = new Jobs({ start: (root, args, onChunk, onExit) => { startJob(root, args, onChunk, onExit); }, emit,
+  done: (job, all, code) => { if (job === 'check-updates') harnessUpdate = parseCheckUpdates(all, code, Date.now()); } });
+handle('harness:job', (p) => v.oneOf(obj(p).job, 'job', ['doctor', 'check-updates', 'upgrade', 'serve-stop'] as const),
+  (job) => jobs.run(job, backend.st.root), () => ({ id: '' }));
+handle('harness:jobs', v.none, () => jobs.list(), () => []);
 handle('harness:update-get', v.none, () => harnessUpdate);
 
 // keys
@@ -231,19 +250,9 @@ handle('shell:pick-folder', (p) => v.optStr(obj(p ?? {}).defaultPath, 'defaultPa
   const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'], defaultPath });
   return r.canceled ? null : r.filePaths[0] ?? null;
 }, () => null);
-handle('shell:path-info', (p) => { const o = obj(p); return { path: v.str(o.path, 'path', 4096), list: o.list === true }; }, ({ path, list }): PathInfo => {
-  const abs = resolve(path.replace(/^~(?=$|\/)/, homedir()));
-  let st; try { st = statSync(abs); } catch { return { exists: false, dir: false, git: null }; }
-  const info: PathInfo = { exists: true, dir: st.isDirectory(), git: null };
-  if (info.dir) {
-    try {
-      const b = execFileSync('git', ['-C', abs, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-      if (b) info.git = { branch: b };
-    } catch { /* not a repo */ }
-    if (list) { try { info.entries = readdirSync(abs, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.')).map((d) => d.name).sort().slice(0, 500); } catch { info.entries = []; } }
-  }
-  return info;
-}, () => ({ exists: false, dir: false, git: null }));
+// M2 / F1 / F2: async (no sync fs or git on main), realpath'd, one git probe with root / branch / detached / commits.
+handle('shell:path-info', (p) => { const o = obj(p); return { path: v.str(o.path, 'path', 4096), list: o.list === true }; },
+  ({ path, list }): Promise<PathInfo> => pathInfo(path, list), () => ({ exists: false, dir: false, git: null }));
 handle('shell:save-file', (p) => { const o = obj(p); return { name: v.str(o.name, 'name', 255), text: v.str(o.text, 'text', 50_000_000) }; }, async ({ name, text }) => {
   if (env.e2e) { const f = join(userData, 'saved-' + name.replace(/[^A-Za-z0-9._-]/g, '_')); writeFileSync(f, text); e2eRecord.dialogs.push({ saveFile: f }); return f; }
   if (!win) return null;
@@ -292,6 +301,17 @@ function systemReducedMotion(): boolean {
 let closeAllowed = false;
 let quitting = false;
 
+/** Quit work shared by before-quit and restart-to-update: state flushed, serve per policy, ptys killed (<= 8 s). */
+let shutdownP: Promise<void> | null = null;
+function shutdown(): Promise<void> {
+  if (shutdownP) return shutdownP;
+  quitting = true;
+  flushState(); flushSettings();
+  shutdownP = Promise.race([Promise.all([backend.onQuit(), pty.shutdown()]).then(() => undefined),
+    new Promise<void>((r) => setTimeout(r, 8000))]).catch((e) => log('error', `shutdown: ${e}`));
+  return shutdownP;
+}
+
 app.on('second-instance', () => { if (win) { if (win.isMinimized()) win.restore(); win.focus(); } });
 app.on('web-contents-created', (_e, wc) => {
   wc.on('will-attach-webview', () => { /* handled per host in hardenWebviews */ });
@@ -299,6 +319,12 @@ app.on('web-contents-created', (_e, wc) => {
 });
 
 app.whenReady().then(async () => {
+  if (secondary) return;
+  // L7: permissions denied on the default session except clipboard writes (terminal / copy buttons); the web
+  // partition's handlers are installed now, not on the first web:url
+  session.defaultSession.setPermissionRequestHandler((_wc, perm, cb) => cb(perm === 'clipboard-sanitized-write'));
+  session.defaultSession.setPermissionCheckHandler((_wc, perm) => perm === 'clipboard-sanitized-write');
+  setupWebSessionOnce();
   serveApp(join(appPath, 'out/renderer'));
   buildMenu((command) => emit('menu:command', { command }));
   win = createWindow(appPath, appState.window, (w) => { appState = { ...appState, window: w }; stateDirty = true; });
@@ -315,10 +341,21 @@ app.whenReady().then(async () => {
     setTimeout(() => { closeAllowed = true; win?.close(); }, 1500).unref();
   });
   win.on('closed', () => { win = null; });
-  win.webContents.on('render-process-gone', (_e, d) => log('error', `renderer gone: ${d.reason}`));
+  // M5: a crashed renderer is reloaded (ptys survive and re-attach from the replay ring), capped at 3 a minute
+  const crashes: number[] = [];
+  win.webContents.on('render-process-gone', (_e, d) => {
+    log('error', `renderer gone: ${d.reason}`);
+    if (quitting || !win || win.isDestroyed()) return;
+    const act = crashReload(crashes, d.reason, Date.now());
+    if (act === 'reload') { rendererReady = false; void win.loadURL(`${APP_PREFIX}index.html`).catch((e) => log('error', `reload: ${e}`)); }
+    else if (act === 'give-up') void win.loadURL(CRASH_PAGE).catch(() => undefined);
+  });
   win.webContents.on('did-finish-load', () => { rendererReady = true; });
   const pm = () => emit('power:state', { onBattery: powerMonitor.isOnBatteryPower(), idle: powerMonitor.getSystemIdleState(300) !== 'active' });
   powerMonitor.on('on-battery', pm); powerMonitor.on('on-ac', pm); powerMonitor.on('lock-screen', pm); powerMonitor.on('unlock-screen', pm);
+  // L12: after sleep / unlock poll now instead of waiting out the current backoff (up to 15 s)
+  const wake = () => { pm(); backend.poller.kick(0); };
+  powerMonitor.on('resume', wake); powerMonitor.on('unlock-screen', () => backend.poller.kick(0));
   await win.loadURL(`${APP_PREFIX}index.html`).catch((e) => log('error', `load: ${e}`));
   // the packaged smoke never starts or attaches a backend (it must not find and start a real install's serve)
   if (process.argv.includes('--smoke-test')) { void smokeTest(); return; }
@@ -329,15 +366,12 @@ let rendererReady = false;
 
 app.on('window-all-closed', () => { app.quit(); });
 app.on('before-quit', (e) => {
-  if (quitting) return;
-  quitting = true;
+  if (quitting) return;                       // second pass, or restart-to-update already ran shutdown()
   e.preventDefault();
-  flushState();
-  void Promise.race([Promise.all([backend.onQuit(), pty.shutdown()]), new Promise((r) => setTimeout(r, 8000))]).finally(() => app.exit(0));
+  void shutdown().finally(() => app.exit(0));
 });
 process.on('uncaughtException', (e) => log('error', `uncaught: ${e?.stack || e}`));
 process.on('unhandledRejection', (e) => log('error', `unhandled: ${(e as Error)?.stack || e}`));
-void existsSync;
 
 /** Packaged smoke (CI, PLAN 8): the window loaded app://, the preload bridge exists and a PTY echoes. Exit 0 or 1. */
 async function smokeTest(): Promise<void> {
