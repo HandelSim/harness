@@ -2017,12 +2017,12 @@ host-MCP supervision they reuse the shape of.
 
 What it does, in order:
 
-1. **`host_require_python3`** — Python 3 is the one host-mode dependency harness
-   does **not** auto-provision: it bootstraps the proxy venv, so it must already
-   exist before harness can fetch anything else. Checked **before** the confirm
-   gate so a Python-less host fails fast without prompting or downloading. The
+1. **`host_require_python3`** — Python 3 bootstraps the proxy venv. Checked
+   **before** the confirm gate; fails only when there is no system Python and
+   harness could not fetch its own. The
    interpreter is resolved by `host_python_bin` (used everywhere harness needs to
-   call Python): `python3`, then `python`, then `py -3` — because Windows Git
+   call Python): `python3`, then `python`, then `py -3`, then **harness's own
+   Python** (below) — because Windows Git
    Bash often has no `python3` (python.org ships `python` / the `py` launcher;
    only the MS Store build provides `python3`). Each candidate is **verified by
    running `--version`** and confirming it reports `Python 3`, not trusted on
@@ -2031,6 +2031,19 @@ What it does, in order:
    of running, so a bare `command -v python3` would pick the stub and the later
    `python3 -m venv` would fail as if Python were absent even with a working
    `python` present. Probing `--version` rejects the stub and falls through.
+   **Private Python** (`harness_ensure_python`): when no system Python works,
+   harness fetches a python-build-standalone `install_only` CPython
+   (`HARNESS_PYTHON_VERSION` 3.12.16, release `HARNESS_PYTHON_BUILD` 20261110;
+   win/mac/linux x x86_64/aarch64), sha256-checked against that release's
+   `SHA256SUMS`, into `state/tools/python-<ver>-<build>/python/` (once; no admin,
+   nothing outside the install root). It unpacks into `<dir>.part.<pid>` and
+   `mv`s into place, so concurrent harness calls (the desktop app runs several)
+   never see a half tree. At launch `harness_python_on_path` puts that dir first
+   on `PATH` (a missing dir costs nothing), so once fetched it is the Python for
+   every harness command and child; a path containing whitespace is returned as
+   the bare name because callers word-split the result (`py -3`).
+   `HARNESS_NO_AUTO_DEPS=1` turns every automatic download off; doctor and
+   preflight never download.
 2. **`host_require_config`** — a lighter `require_runtime_config`: the same three
    REQUIRED proxy vars (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`,
    read from the already-sourced `.env`), but **no allowlist check** — the
@@ -3228,9 +3241,14 @@ it in tests); anything but windows/macos/linux is refused.
   launch, and taken before the build, so a missing git never loops and a
   commit landing mid-build reads as stale. Uncommitted edits to `desktop/` do
   not count — use `harness desktop install` (or `npm run dev`) for those.
-- **Install** (`_desktop_install`): needs `node` >= 22 plus `npm`/`npx` (else a
-  per-OS hint: `winget install OpenJS.NodeJS.LTS`, `brew install node`, …;
-  host mode's vendored Node 20 is not used). `npm ci` only when `node_modules`
+- **Install** (`_desktop_install`): needs `node` >= 22 plus `npm`/`npx`. The
+  PATH node is used when new enough; otherwise `_desktop_check_node` fetches the
+  official nodejs.org build `HARNESS_DESKTOP_NODE_VERSION` (22.23.5; zip on
+  Windows, tar.gz elsewhere), sha256-checked against `SHASUMS256.txt`, into
+  `state/tools/node-v<ver>-<plat>/` (once, temp dir + `mv`) and puts it first on
+  PATH for the build. Only when that fails (offline, `HARNESS_NO_AUTO_DEPS=1`)
+  does it stop with a per-OS hint (`winget install OpenJS.NodeJS.LTS`, `brew
+  install node`, …). Host mode's vendored Node 20 is not used. `npm ci` only when `node_modules`
   is missing or the sha256 of `package-lock.json` differs from
   `state/desktop/lock-hash`; then `node scripts/build.mjs --prod`; then
   `npx --no-install electron-builder <os target> --<arch> --publish never`
@@ -3474,8 +3492,9 @@ breaks the recursion.
 - `cmd_preflight` — validates `.env`, allowlist, and docker daemon
   reachability BEFORE `harness start`. Fails loudly on config errors so
   the user doesn't get an opaque compose error. On a host-only box it
-  prints an `ⓘ … validating host mode` note, checks the host-mode prereqs
-  (`python3`/`jq`/`node`/`opencode`, Node >= 20) instead of the daemon, and
+  prints an `ⓘ … validating host mode` note, lists the host-mode deps
+  (`python3`/`jq`/`node`/`opencode`; all fetched on first use, so a miss is a
+  `•` note, not an error, and nothing is downloaded) instead of the daemon, and
   skips the allowlist file-exists and `PROXY_API_URL`-in-allowlist checks
   (the firewall allowlist only governs container mode).
 

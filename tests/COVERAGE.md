@@ -107,7 +107,9 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   helpers, sourced via `HARNESS_SOURCE_ONLY=1`: `host_require_config`,
   `host_confirm_gate`, `host_preflight`, `host_write_opencode_config` (JSON shape +
   jq guard), `host_proxy_fingerprint`, `host_python_bin` interpreter
-  verification (Windows alias-stub rejection), and the stderr-preservation
+  verification (Windows alias-stub rejection) and its private-Python fallback
+  (fetched once against a fake SHA256SUMS, `%2B` URL, checksum mismatch refused,
+  no temp dir left), and the stderr-preservation
   invariant of the two loopback `/dev/tcp` probes (T15, against a real
   throwaway listener). Covers Ho001–Ho007, Ho018, Ho019.
 - `tests/unit_host_upgrade_test.sh` (no docker) — host-only upgrade transition
@@ -133,7 +135,8 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   pty via `script` for the prompt) and `host_win_location_hint`. Covers I052, Ho023.
 - `tests/unit_desktop_cmd_test.sh` (no docker, no network, no real build) — `harness desktop`:
   install-then-launch when missing, launch only when the stamp is current, rebuild when
-  `desktop/` changed, `npm ci` only on a new lock hash, node missing/too old, a failed build
+  `desktop/` changed, `npm ci` only on a new lock hash, node missing/too old with auto-fetch off,
+  no node 22 -> its own Node fetched (fake nodejs.org) into state/tools and reused, a failed build
   keeping the old install and stamp, the Windows (NSIS `/S`, `cmd.exe /c start`), macOS
   (ditto, ad-hoc codesign, `open -a`) and Linux (.desktop Exec/Icon, `--no-sandbox` rule,
   `setsid -f`) branches, `where`, and the no-git version stamp. Stubs on PATH, throwaway clone.

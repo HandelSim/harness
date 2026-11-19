@@ -13001,13 +13001,14 @@ cmd_doctor() {
     host_venv=$(host_venv_dir)
     if (( host_only )) || host_proxy_running || [[ -d "$host_venv" ]]; then
         doctor_section host
-        # python3 is the one dep the user must supply; on Windows (Git Bash) it
-        # may be 'python' or 'py -3', so resolve it rather than probing python3.
+        # On Windows (Git Bash) Python may be 'python' or 'py -3', so resolve it
+        # rather than probing python3. Never download from doctor: a miss means
+        # harness fetches its own on first use.
         local pybin
-        if pybin=$(host_python_bin 2>/dev/null); then
+        if pybin=$(HARNESS_NO_AUTO_DEPS=1 host_python_bin 2>/dev/null); then
             doctor_check ok "python3" "$pybin"
         else
-            doctor_check warn "python3" "no Python 3 (python3/python/py) on PATH (needed for 'harness host')"
+            doctor_check warn "python3" "none on PATH (harness fetches its own on first use)"
         fi
         # jq / node / opencode are auto-provisioned on first run, so a miss here
         # is informational, not a hard requirement.

@@ -111,7 +111,8 @@ harness mcp ...               manage MCP servers (see MCPs)
 harness net ...               manage the egress allowlist (see Firewall)
 harness desktop               run the desktop app; builds and installs it on first
                               use and after an upgrade changes desktop/ (Start menu +
-                              Desktop shortcut on Windows). Needs Node.js 22+
+                              Desktop shortcut on Windows). Fetches its own
+                              Node.js 22 when the machine has none
 harness doctor                environment + network diagnostics
 harness preflight             validate .env and allowlist
 harness test [section]        run the test suite
@@ -123,7 +124,8 @@ Any flag harness doesn't recognize is passed straight through to opencode.
 
 `harness host` runs the proxy + opencode as plain host processes, no docker. The
 first run auto-fetches its deps (jq, Node >= 20, opencode) into
-`state/host/toolchain/`; you only need Python 3. Host mode has **no egress
+`state/host/toolchain/`, and Python 3 into `state/tools/` when the machine has
+none (`HARNESS_NO_AUTO_DEPS=1` turns these downloads off). Host mode has **no egress
 firewall** and runs as your full host user, so it prompts to confirm on every
 launch (`HARNESS_HOST_CONFIRM=1` to skip in automation). Prefer the sandboxed
 container mode; host mode is the fallback. With no docker or podman installed,
