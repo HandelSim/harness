@@ -231,6 +231,49 @@ class Interrupted(Exception):
         self.kind = kind
 
 
+class Terminated(KeyboardInterrupt):
+    """SIGTERM (a shutdown, a kill) or SIGHUP (the terminal closed) on a run: it ends as
+    a Ctrl-C ends it (the agent and its container stopped, the ticket back at its stage
+    to go on in its session), but its run.json is left, the beat going stale, as a run
+    the machine took down leaves it: harness serve starts that run again at its start
+    (RunsView.resume_runner). Without this the run died at once and its agent, in a
+    session of its own, worked on with no one watching it."""
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def catch_term():
+    """cmd_run's handlers: the first SIGTERM or SIGHUP raises Terminated in the main
+    thread; one more while the run puts its ticket back does not cut that short.
+    A signal already ignored (nohup) stays ignored. Returns the handlers to put back
+    (none off the main thread, where Python allows none)."""
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    seen = []
+
+    def on(signum, frame):
+        if signum == getattr(signal, "SIGHUP", None):   # the terminal is gone: a write to it fails (EIO)
+            with contextlib.suppress(OSError):          # and would cut the putting back short; the logs
+                sys.stdout = sys.stderr = open(os.devnull, "w")   # keep the record (log.md, run.log)
+        if not seen:
+            seen.append(signum)
+            raise Terminated(signum)
+    old = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None and signal.getsignal(sig) is not signal.SIG_IGN:
+            with contextlib.suppress(OSError, ValueError):
+                old[sig] = signal.signal(sig, on)
+    return old
+
+
+def uncatch_term(old):
+    for sig, h in old.items():
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            signal.signal(sig, h)
+
+
 # --- files and state ----------------------------------------------------------
 
 def now_iso():
@@ -313,7 +356,9 @@ class Queue:
             st = json.loads(read(os.path.join(self.dir(key), "state.json")))
         except ValueError:
             return None
-        if isinstance(st, dict) and os.path.exists(self.notes_path(key)):
+        if not isinstance(st, dict):   # valid JSON but not a ticket's ([], "x"): as unreadable as a cut one
+            return None
+        if os.path.exists(self.notes_path(key)):
             st["notes"] = self.notes(key)
         return st
 
@@ -390,7 +435,14 @@ def unlock(f):
 def run_going(q):
     """True when a 'run' holds run.lock. Takes the lock for a moment, so call it only
     from a command that needs to know (stop, halt), not from a poll."""
-    with open(os.path.join(q.root, "run.lock"), "a") as f:
+    path = os.path.join(q.root, "run.lock")
+    try:
+        f = open(path, "a")
+    except OSError:   # a state folder this user cannot write (list, status still answer)
+        if not os.path.exists(path):
+            return False   # none could be made, so no run holds one
+        f = open(path)     # a lock is taken on a file open for reading too
+    with f:
         if try_lock(f):
             unlock(f)
             return False
@@ -5707,6 +5759,16 @@ def interrupted(ctx, st, e):
 
 
 def cmd_run(q, a):
+    old = catch_term()
+    try:
+        return run_held(q, a)
+    except Terminated as e:   # before the run beat, or after it ended: nothing of its own to put back
+        return 128 + e.signum
+    finally:
+        uncatch_term(old)
+
+
+def run_held(q, a):
     if a.slot:   # a slot of a parallel run: the run that started it holds run.lock
         return run_locked(q, a, time.time())
     lock = open(os.path.join(q.root, "run.lock"), "a")
@@ -5773,7 +5835,12 @@ def beating_run(ctx):
         ctx.beating.set()
         with ctx.beat_lock:
             try:
-                os.remove(ctx.run_file)
+                if not getattr(ctx, "terminated", 0):
+                    os.remove(ctx.run_file)
+                else:   # left for harness serve to start the run again (Terminated), its beat already
+                    # stale: a serve started again within 30 s (its own restart) would see a run going
+                    ctx.run_info.update(beat=int(time.time()) - 60, ended=f"signal {ctx.terminated}")
+                    write_atomic(ctx.run_file, json.dumps(ctx.run_info) + "\n")
             except OSError:
                 pass
 
@@ -5804,10 +5871,19 @@ def run_parallel(q, a, locked_at):
                 kids.append(subprocess.Popen([*argv, "--slot", str(i)]))
             rcs = [k.wait() for k in kids]
             drop(q.sentinel())   # a halt, seen by every slot
-        except KeyboardInterrupt:   # the slots have it too: wait for each to put its ticket back
+        except KeyboardInterrupt as e:   # the slots have it too: wait for each to put its ticket back
+            if isinstance(e, Terminated):   # a kill reaches this process alone: each slot is sent it
+                ctx.terminated = e.signum
+                for k in kids:
+                    with contextlib.suppress(OSError):
+                        k.send_signal(e.signum)
             for k in kids:
                 with contextlib.suppress(KeyboardInterrupt):
                     k.wait()
+            if isinstance(e, Terminated):
+                print(f"\n[queue] ended by signal {e.signum}; 'harness queue run' (or harness serve's start) "
+                      "carries on from the same stage", file=sys.stderr)
+                return 128 + e.signum
             print("\n[queue] interrupted; 'harness queue run' carries on from the same stage", file=sys.stderr)
             return 130
     return next((rc for rc in (130, RESTART, 3) if rc in rcs), max(rcs, default=0))
@@ -6239,9 +6315,10 @@ def run_tickets(q, ctx):
                              if not n else f"{str(e)[:300]}; the run waits and carries on")
                     done.pop(key, None)
                     outage = e
-            except KeyboardInterrupt:
-                go_on_later(st, "the queue run was interrupted (Ctrl-C)")
-                put_back(ctx, st, "the run was interrupted (Ctrl-C); start the queue again to carry on")
+            except KeyboardInterrupt as e:
+                how = f"ended by signal {e.signum}" if isinstance(e, Terminated) else "interrupted (Ctrl-C)"
+                go_on_later(st, f"the queue run was {how}")
+                put_back(ctx, st, f"the run was {how}; start the queue again to carry on")
                 put_away(q, st)
                 raise
             except Exception as e:  # noqa: BLE001 - one ticket's failure must not stop the queue
@@ -6273,10 +6350,15 @@ def run_tickets(q, ctx):
         print(f"[queue] stopped: {str(e)[:300]}. The ticket keeps its place; check 'harness unlock' and "
               "'harness usage', then run 'harness queue run' again.", file=sys.stderr)
         return 3
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
         for p in [ctx.child] + list(getattr(ctx, "children", ())):   # a panel's: all of them
             if p is not None:
                 stop(p)
+        if isinstance(e, Terminated):
+            ctx.terminated = e.signum   # run.json stays (beating_run)
+            print(f"\n[queue] ended by signal {e.signum}; 'harness queue run' (or harness serve's start) carries "
+                  "on from the same stage", file=sys.stderr)
+            return 128 + e.signum
         print("\n[queue] interrupted; 'harness queue run' carries on from the same stage", file=sys.stderr)
         return 130
     print_list(q)
@@ -7132,15 +7214,27 @@ def end_run(q, a):
     back) is killed with its agent, and its ticket goes back to the queue at its
     stage (stopped, when the owner had asked that)."""
     r = runner(q)
+    end = time.time() + 10
+    while run_going(q) and not trusted(r) and time.time() < end:   # a run that has just taken run.lock
+        time.sleep(0.5)                                             # names itself within seconds
+        r = runner(q)
     pid, agent = r.get("pid"), r.get("agent")
     if run_going(q):
+        if not trusted(r):
+            # Not the run's pid: a run.json with no beat is one a run the machine took down (or
+            # a kill) left, and after a restart its pid may be any other process by now.
+            print("[queue] a run holds the queue but its run.json has not beaten in 30 s (a run still "
+                  "starting, or a stopped process); try again in a few seconds, or end the python process "
+                  "running ticket_queue.py run by hand", file=sys.stderr)
+            return 1
         if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
             print("[queue] a run holds the queue but run.json does not say which process it is; "
                   "end the python process running ticket_queue.py run by hand", file=sys.stderr)
             return 1
         # the run first: it would take its agent's end for a failed launch and go on
-        # (a parallel run: each slot is a run, then the run that started them)
-        for s in [*slot_runs(q, all_files=True), r]:
+        # (a parallel run: each slot is a run, then the run that started them; only a slot
+        # that beats: a run-I.json a killed run left names a pid that may be someone else's)
+        for s in [*(s for s in slot_runs(q, all_files=True) if trusted(s)), r]:
             if s is not r and not (isinstance(s.get("pid"), int) and s["pid"] > 0):
                 continue
             if os.name == "nt":
@@ -7273,6 +7367,21 @@ def run_file(path):
     except (OSError, ValueError):
         return None
     return info if isinstance(info, dict) else None
+
+
+def trusted(info):
+    """halt --force may kill the pid run.json (run-I.json) names: it beats, or (a run
+    frozen whole, its beat thread too) /proc says it is a ticket_queue.py process."""
+    if beating(info):
+        return True
+    pid = info.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return any(arg.endswith(b"ticket_queue.py") for arg in f.read().split(b"\0"))
+    except OSError:   # no /proc (macOS, Windows), or gone: the beat alone decides
+        return False
 
 
 def beating(info):
@@ -7836,6 +7945,18 @@ def main(argv):
     except Busy as e:
         print(f"[queue] {e}; try again", file=sys.stderr)
         return 1
+    except OSError as e:
+        if e.errno not in NO_WRITE:
+            raise
+        # a full disk, or a state folder this user cannot write: said, not a traceback; a ticket
+        # is left as its last whole write had it (write_atomic), and the next run carries on
+        print(f"[queue] could not write the queue's files ({e}): the disk may be full, or {q.root} not "
+              "writable by this user; free space or fix its owner, then try again", file=sys.stderr)
+        return 1
+
+
+NO_WRITE = {getattr(__import__("errno"), n) for n in ("EACCES", "EPERM", "ENOSPC", "EROFS", "EDQUOT")
+            if hasattr(__import__("errno"), n)}
 
 
 if __name__ == "__main__":

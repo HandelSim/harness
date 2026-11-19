@@ -14,6 +14,7 @@ This document enumerates every atomic, testable behavior of the harness project.
 - **Ho###** — Host mode, containerless (`harness host`, the `host_*` helpers)
 - **B###** — Bootstrap (`harness-bootstrap.sh`, the version-stable fetch/handoff entrypoint)
 - **C###** — ChatGPT backend, CLI side (`harness chatgpt`, backend selection, per-backend config/fingerprint/dispatch helpers in the `harness` wrapper)
+- **Q###** — Ticket queue robustness (`harness queue`, `scripts/ticket_queue.py`): signals, stale files, the state folder, project shapes. The queue's full workflow map is `tests/QUEUE_WORKFLOWS.md`; these rows are not in COVERAGE.md's totals
 
 Rows are intended to be atomic: one behavior, one row. Compound behaviors are split.
 
@@ -630,3 +631,23 @@ proxy-side ChatGPT backend-api translation lives under P065–P081.)
 | C038 | `ensure_services_up` skips the whole backend/fingerprint reconciliation block (`_chatgpt_in_play`) on an install that never configured `CHATGPT_BASE_URL`: the probes cost a `compose ps` plus a `docker inspect` each, and an install with no chatgpt config cannot have a chatgpt proxy running. It resumes when the key is configured OR when this launch explicitly selects the backend |
 | C039 | bare `cmd_preflight` on a chatgpt-only `.env` prints a pointer to `harness chatgpt preflight` alongside the three OpenAI-key failures, and does NOT print it when the OpenAI keys are the ones configured |
 | C040 | `harness chatgpt doctor` fails the `CHATGPT_COOKIE_STRING` line when the sourced value is a strict prefix of the value `_config_read_key` reads off disk (`_config_value_truncated`), reporting `truncated: N of M chars` plus the fix — the unquoted-`.env` fault previously rendered as a green `set, N chars` with the wrong N. Identical values, a non-prefix difference, and either side empty are all left alone |
+
+## Ticket queue robustness (Q###)
+
+The robustness cases of `harness queue`. Every queue workflow and edge case,
+with its covering test or gap, is in `tests/QUEUE_WORKFLOWS.md`; the queue's
+main suite is `tests/queue_test.py`.
+
+| ID | Behavior |
+|----|----------|
+| Q001 | SIGTERM or SIGHUP mid-stage ends the run as Ctrl-C does: agent and its container stopped, ticket back to `queued` at its stage with an `interrupted` entry, exit 128+N, `run.json` left with a stale beat for serve's resume |
+| Q002 | SIGTERM to a parallel parent reaches each slot, and each slot puts its ticket back |
+| Q003 | SIGHUP from a closed terminal still puts the ticket back (stdout/stderr to /dev/null first); an ignored SIGHUP (`nohup`) stays ignored |
+| Q004 | SIGTERM while `--watch-queue` waits on an empty queue ends with exit 143 and a stale run.json that keeps `watch` |
+| Q005 | SIGKILL mid-stage leaves the ticket `running`; the next run ends the orphan agent and finishes the ticket |
+| Q006 | `halt --force` kills only a pid it trusts (its file beats, or /proc names `ticket_queue.py`); a stale run.json / run-I.json naming another process is refused with exit 1 within about 10 s |
+| Q007 | A `state.json` that is JSON but not an object is skipped like an unparsable one: `list`, `status --json`, `stats` and `run` go on, `remove` works |
+| Q008 | A full disk or an unwritable state folder is one `[queue] could not write the queue's files` line and exit 1, not a traceback; `list`/`status` still read a read-only folder |
+| Q009 | A disk that fills mid-run leaves the ticket `running` with `run.lock` freed and run.json removed; the next run finishes it |
+| Q010 | A second `run` is refused while one holds `run.lock`; a run after a restart gets past the stale run.json, lock and agent record the dead run left |
+| Q011 | Project shapes: a `trunk` default branch, a path with spaces and unicode, a symlinked folder, a named second remote, and a base branch deleted since the add (blocked with the reason) |

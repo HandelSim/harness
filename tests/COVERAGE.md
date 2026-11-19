@@ -789,6 +789,26 @@ non-green rows — the gap.
 | C039 | green  | tests/unit_chatgpt_test.sh (T20)            | `.env` rewritten to the CHATGPT_* trio only; `cmd_preflight` output must match `harness chatgpt preflight`. The original `.env` is restored and the same grep must NOT match. | |
 | C040 | green  | tests/unit_config_test.sh (T14)             | `_config_value_truncated` is asserted true for `('a=1', 'a=1; b=2')` and false for identical values, a non-prefix difference (`'a=1'` vs `'z=9; a=1'`), an empty sourced value, and an empty on-disk value. | The `doctor_check fail` rendering that consumes the predicate is verified by hand, not by a test: `cmd_doctor` needs `harness_container_runtime`, which `HARNESS_SOURCE_ONLY=1` does not load. |
 
+## Q — Ticket queue robustness (`scripts/ticket_queue.py`, 11 IDs)
+
+Not counted in the summary stats above (added after that audit). All are
+driven docker-free by `tests/queue_edge_test.py` (run as Q1b of
+`tests/unit_queue_test.sh`); the queue's full map is `tests/QUEUE_WORKFLOWS.md`.
+
+| ID    | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
+|-------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
+| Q001 | green  | tests/queue_edge_test.py (SignalTest) | `test_sigterm_stops_the_agent_and_puts_the_ticket_back` and `test_sighup_...` assert rc 128+N, the agent's process group gone, the status/history/stop-launch call, a stale run.json, and that the next run finishes the ticket. | |
+| Q002 | green  | tests/queue_edge_test.py (SignalTest) | `test_sigterm_to_a_parallel_run_reaches_its_slots`: two projects, two slots; rc 143, both tickets `queued`. | |
+| Q003 | green  | tests/queue_edge_test.py (SignalTest) | `test_a_closed_terminal_still_puts_the_ticket_back` (pty master closed; rc 129, "ended by signal" in log.md); `test_a_nohup_run_is_not_ended_by_sighup` (SIG_IGN kept; SIGTERM then gives 143). | |
+| Q004 | green  | tests/queue_edge_test.py (SignalTest) | `test_sigterm_while_watching_an_empty_queue`. | |
+| Q005 | green  | tests/queue_edge_test.py (SignalTest) | `test_sigkill_leaves_what_the_next_run_ends`. | |
+| Q006 | green  | tests/queue_edge_test.py (HaltForceTest) | `test_halt_force_spares_a_pid_a_stale_run_json_names` (an innocent pid survives, rc 1, under 15 s); `test_halt_force_ends_a_frozen_run_that_no_longer_beats` (a stale run.json whose pid is a `ticket_queue.py` process is SIGKILLed at once). | |
+| Q007 | green  | tests/queue_edge_test.py (UnreadableStateTest) | `test_a_state_file_that_is_not_a_ticket_is_skipped_not_a_crash`. | |
+| Q008 | green  | tests/queue_edge_test.py (StateDirTest) | `test_a_full_disk_is_said_not_a_traceback` (ENOSPC from `write_atomic` for add/note/move); `test_an_unwritable_state_folder_is_a_clear_error` (chmod 555; skipped as root). | |
+| Q009 | green  | tests/queue_edge_test.py (StateDirTest) | `test_a_disk_that_fills_mid_run_leaves_the_ticket_for_the_next_run`. | |
+| Q010 | green  | tests/queue_edge_test.py (ConcurrencyTest, RestartTest) | `test_a_second_run_is_refused_while_one_goes`; `test_the_run_after_a_restart_gets_past_what_the_dead_run_left`. | |
+| Q011 | green  | tests/queue_edge_test.py (ProjectShapeTest) | the four `ProjectShapeTest` tests. | |
+
 ---
 
 ## Changes from previous audit

@@ -11,6 +11,10 @@
 #                              made-up quote, a .github/ change, the upstream
 #                              down (exit 3, the ticket keeps its place), plan
 #                              review, the gates and the prompts
+#   - tests/queue_edge_test.py its edge cases (tests/QUEUE_WORKFLOWS.md maps
+#                              them): SIGTERM/SIGHUP/SIGKILL of a run, a restart's
+#                              stale files, two runs, halt --force and a stale
+#                              pid, unreadable/unwritable state, project shapes
 #   - cmd_queue                the CLI around it: help, add/list/remove through
 #                              the sourced harness, the internal _sync/_pull
 #                              doing nothing without a vault, run and answer
@@ -46,6 +50,11 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 out=$(python3 "$SCRIPT_DIR/queue_test.py" 2>&1) || { echo "$out" | grep -v '^20[0-9][0-9]-' >&2; fail "Q1: tests/queue_test.py"; }
 grep -q '^OK' <<<"$out" || fail "Q1: no OK from tests/queue_test.py — $(tail -5 <<<"$out")"
 ok "Q1: ticket_queue.py: $(grep -o 'Ran [0-9]* tests' <<<"$out")"
+
+# --- Q1b: its edge cases: signals, a restart's leftovers, two runs, unreadable or unwritable state --
+out=$(python3 "$SCRIPT_DIR/queue_edge_test.py" 2>&1) || { echo "$out" | grep -v '^20[0-9][0-9]-' >&2; fail "Q1b: tests/queue_edge_test.py"; }
+grep -q '^OK' <<<"$out" || fail "Q1b: no OK from tests/queue_edge_test.py — $(tail -5 <<<"$out")"
+ok "Q1b: ticket_queue.py edge cases: $(grep -o 'Ran [0-9]* tests' <<<"$out")"
 
 # shellcheck disable=SC1090
 HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT/install" source "$HARNESS" 2>/dev/null

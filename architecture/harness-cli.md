@@ -1111,8 +1111,13 @@ for as long as a slow `_sync` takes),
 the run kills its agent, puts the ticket back at its stage uncounted and
 exits; a halt file older than the run's lock is stale and dropped), `halt
 --force` (`end_run`, for a run that does not halt: kills the run's pid and
-its agent's process group from run.json, `taskkill /T` on Windows, waits for
-`run.lock`, then puts every running ticket back, `stopped` when it had a
+its agent's process group from run.json, and each slot's from a `run-I.json`,
+`taskkill /T` on Windows, waits for
+`run.lock`; a pid is trusted (`trusted`) when its file beats or, on Linux,
+`/proc/PID/cmdline` names `ticket_queue.py` (a run frozen whole); otherwise,
+while `run.lock` is held, it waits 10 s for the run that has just taken the
+lock to beat, then refuses (exit 1): a stale file's pid may be another
+process's after a restart; then puts every running ticket back, `stopped` when it had a
 stop sentinel, else `queued` with an `interrupted` entry, and stops the
 held launch's container), `move KEY
 up|down|top|bottom` or `move KEY --before OTHER` (just above OTHER, `''` the
@@ -1140,7 +1145,18 @@ for the same reason) and keeps `run.json` (`pid`, `started`, `beat` every 3 s,
 `host`, `single`, `model`, `watch`, `ticket`, `stage`, and `step`: cloning, the agent
 is working, the agent ended, asking the verifier, a verifier retry's wait,
 checking that the upstream answers, waiting for work), deleted on exit; a `beat` over 30 s old
-means no run. A run that ends on an upstream outage (exit 3) or Ctrl-C (130)
+means no run. SIGTERM (a shutdown, serve's `end_process`, a kill) and SIGHUP (the
+terminal closed) end a run as Ctrl-C does (`Terminated`, a `KeyboardInterrupt`;
+a parallel parent sends it on to each slot), exit 128+N, but leave `run.json`
+with its beat already stale (`ended: "signal N"`), so serve's start runs it
+again (`resume_runner`) even within the 30 s a beat counts as fresh. A signal
+already ignored (`nohup`) stays ignored; on SIGHUP stdout/stderr go to
+`/dev/null` first, since a write to the closed terminal would fail (EIO). A full
+disk or a state folder this user cannot write (EACCES/EPERM/ENOSPC/EROFS/EDQUOT
+from any command) is one `[queue] could not write the queue's files` line and
+exit 1, not a traceback; `run_going` answers "no run" for a `run.lock` that
+cannot be made, so `list` and `status` work on a read-only folder.
+A run that ends on an upstream outage (exit 3), Ctrl-C (130) or one of those signals
 puts the ticket it was on back to `queued` at its stage, uncounted, with the
 reason and an `interrupted` history entry; after a halt or Ctrl-C an in-place
 ticket's folder is put back (`put_away`, as for a parked one) and the
