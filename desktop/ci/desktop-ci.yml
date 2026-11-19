@@ -1,0 +1,61 @@
+# Desktop app CI. FOR THE OWNER TO MOVE to .github/workflows/desktop-ci.yml (agents may not write under .github/).
+name: desktop-ci
+on:
+  push:
+    branches: [dev, main]
+    paths: ['desktop/**', 'serve/**']
+  pull_request:
+    branches: [dev, main]
+    paths: ['desktop/**', 'serve/**']
+permissions:
+  contents: read
+concurrency:
+  group: desktop-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults: { run: { working-directory: desktop } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: desktop/package-lock.json }
+      - run: sudo apt-get update && sudo apt-get install -y xvfb libnss3 libgbm1 libasound2t64 libgtk-3-0
+      - run: npm ci
+      - run: npm run check
+      - run: node scripts/build.mjs --prod
+      - run: npm run e2e
+        env: { CI: '1' }
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e
+          path: |
+            desktop/test-results/
+          if-no-files-found: ignore
+  package:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults: { run: { working-directory: desktop } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: desktop/package-lock.json }
+      - run: npm ci
+      # native arch only: node-pty is rebuilt per target and does not cross-compile on Linux/Windows runners
+      - run: npm run dist:dir -- --$(node -p process.arch)
+        shell: bash
+        env: { CSC_IDENTITY_AUTO_DISCOVERY: 'false' }
+      - name: packaged smoke (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
+          bin=$(ls -d dist/linux*-unpacked | head -1)/harness-desktop   # executable = package.json name
+          HARNESS_DESKTOP_E2E=1 HARNESS_DESKTOP_NO_UPDATE=1 HARNESS_DESKTOP_USER_DATA=$RUNNER_TEMP/ud \
+            timeout 60 xvfb-run -a "$bin" --no-sandbox --smoke-test

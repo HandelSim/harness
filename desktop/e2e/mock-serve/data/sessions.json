@@ -1,0 +1,48 @@
+{
+ "data": [
+  {
+   "agent": "yolo",
+   "cost": 0,
+   "created": 1795071827364,
+   "directory": "/home/user/harness-fixture/proj",
+   "id": "ses_root1",
+   "kids": 1,
+   "kind": "session",
+   "label": "",
+   "live": false,
+   "model": "harness/big",
+   "parent": null,
+   "source": "host",
+   "ticket": null,
+   "title": "Fix the <b>parser</b>",
+   "tokens_in": 1200,
+   "tokens_out": 300,
+   "updated": 1795071832364,
+   "web": "http://127.0.0.1:4096/server/aHR0cDovLzEyNy4wLjAuMTo0MDk2/session/ses_root1",
+   "working": true
+  },
+  {
+   "agent": "yolo",
+   "cost": 0,
+   "created": 1795071767364,
+   "directory": "/home/user/harness-fixture/state/queue/ABC-12/repo",
+   "id": "ses_queue1",
+   "kids": 0,
+   "kind": "queue",
+   "label": "",
+   "live": false,
+   "model": "harness/big",
+   "parent": null,
+   "source": "host",
+   "ticket": "ABC-12",
+   "title": "plan ABC-12",
+   "tokens_in": 1200,
+   "tokens_out": 300,
+   "updated": 1795071772364,
+   "web": "http://127.0.0.1:4096/server/aHR0cDovLzEyNy4wLjAuMTo0MDk2/session/ses_queue1",
+   "working": false
+  }
+ ],
+ "ok": true,
+ "sig": "bed74b3a44e1d1a10bcc332188a633ff843e1017"
+}

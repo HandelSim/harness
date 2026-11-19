@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fake `harness` for e2e (PLAN 7.5): copied into a temp install root by e2e/fixtures.ts; steered by fake.json there.
+# The real logic lives in fake-harness.mjs next to the original of this file (FAKE_HARNESS_DIR is filled in on copy).
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${HARNESS_FAKE_NODE:-node}" "${FAKE_HARNESS_DIR:-$here}/fake-harness.mjs" "$here" "$@"

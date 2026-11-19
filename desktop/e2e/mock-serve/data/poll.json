@@ -1,0 +1,1091 @@
+{
+ "now": 1795071887,
+ "ok": true,
+ "stale": false,
+ "topics": {
+  "debug": {
+   "data": [],
+   "sig": "97d170e1550eee4afc0af065b78cda302a97674c"
+  },
+  "findings": {
+   "data": {
+    "items": [],
+    "order": []
+   },
+   "sig": "1ec1efb4a63661580b2ae4ec6ccbecf40c321125"
+  },
+  "findings-agent": {
+   "data": {
+    "folders": [],
+    "heartbeat": null,
+    "knowledge": [],
+    "last_repos": [],
+    "notes": "",
+    "passes": [],
+    "running": false,
+    "status": {}
+   },
+   "sig": "9f4e78181262340fe95276649614f4bc0571ff9f"
+  },
+  "home": {
+   "data": {
+    "activity": [],
+    "live": [],
+    "pages": [],
+    "usage": null
+   },
+   "sig": "4a65d9939992a9696850a0be680d7456b3acac0d"
+  },
+  "ingest": {
+   "data": {
+    "out_tail": "",
+    "run": null,
+    "summary": {
+     "failed": [],
+     "has": false,
+     "last": "",
+     "nfailed": 0,
+     "sources": []
+    }
+   },
+   "sig": "173a6a0669b02784e12363f31c8220c6844070a2"
+  },
+  "queue": {
+   "data": {
+    "archived": [],
+    "modes": [
+     "container",
+     "host",
+     "single"
+    ],
+    "runner": {
+     "beat": 1795071887.4032705,
+     "exited": null,
+     "halting": false,
+     "host": false,
+     "model": "big",
+     "on": [
+      {
+       "stage": "implement",
+       "step": "agent",
+       "ticket": "DEMO-2"
+      }
+     ],
+     "parallel": 0,
+     "pid": 0,
+     "running": true,
+     "since": null,
+     "single": false,
+     "stage": "implement",
+     "started": "2026-11-19T06:00:00Z",
+     "starting": false,
+     "step": "agent",
+     "ticket": "DEMO-2",
+     "watch": false
+    },
+    "start": {
+     "ok": false,
+     "reason": "the queue is running"
+    },
+    "tickets": [
+     {
+      "actions": {
+       "answer": {
+        "ok": true,
+        "reason": ""
+       },
+       "approve": {
+        "ok": false,
+        "reason": "ABC-12 is needs-answers, not a plan waiting for approval"
+       },
+       "archive": {
+        "ok": true,
+        "reason": ""
+       },
+       "continue": {
+        "ok": false,
+        "reason": "ABC-12 is needs-answers; there is no stage to go on"
+       },
+       "edit": {
+        "ok": true,
+        "reason": ""
+       },
+       "fix": {
+        "ok": false,
+        "reason": "ABC-12 is needs-answers; review comments go to a done, blocked or stopped ticket"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "ABC-12 is needs-answers, not done; a follow-up is for a done ticket"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": true,
+        "reason": ""
+       },
+       "retry": {
+        "ok": true,
+        "reason": ""
+       },
+       "stop": {
+        "ok": true,
+        "reason": ""
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "ABC-12 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "ABC-12",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "plan",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "needs-answers",
+      "step": "",
+      "stopping": false,
+      "stuck": false,
+      "title": "Fix it",
+      "updated": "",
+      "why": "1 blocking question(s) in the plan"
+     },
+     {
+      "actions": {
+       "answer": {
+        "ok": false,
+        "reason": "DEMO-1 is queued, not waiting on answers"
+       },
+       "approve": {
+        "ok": false,
+        "reason": "DEMO-1 is queued, not a plan waiting for approval"
+       },
+       "archive": {
+        "ok": true,
+        "reason": ""
+       },
+       "continue": {
+        "ok": false,
+        "reason": "DEMO-1's work is gone (or was never set up): harness queue retry DEMO-1 starts it again"
+       },
+       "edit": {
+        "ok": true,
+        "reason": ""
+       },
+       "fix": {
+        "ok": false,
+        "reason": "DEMO-1 is queued; review comments go to a done, blocked or stopped ticket"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "DEMO-1 is queued, not done; a follow-up is for a done ticket"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": true,
+        "reason": ""
+       },
+       "retry": {
+        "ok": false,
+        "reason": "DEMO-1 is queued; only a blocked, stopped, done, waiting or interrupted ticket is retried"
+       },
+       "stop": {
+        "ok": true,
+        "reason": ""
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "DEMO-1 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "DEMO-1",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "implement",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "queued",
+      "step": "",
+      "stopping": false,
+      "stuck": false,
+      "title": "A queued ticket",
+      "updated": "",
+      "why": "1 blocking question(s) in the plan"
+     },
+     {
+      "actions": {
+       "answer": {
+        "ok": false,
+        "reason": "DEMO-2 is running, not waiting on answers"
+       },
+       "approve": {
+        "ok": false,
+        "reason": "DEMO-2 is running, not a plan waiting for approval"
+       },
+       "archive": {
+        "ok": false,
+        "reason": "DEMO-2 is running; stop it first"
+       },
+       "continue": {
+        "ok": false,
+        "reason": "DEMO-2 is running; there is no stage to go on"
+       },
+       "edit": {
+        "ok": false,
+        "reason": "It is running: stop it to change its settings."
+       },
+       "fix": {
+        "ok": false,
+        "reason": "DEMO-2 is running; review comments go to a done, blocked or stopped ticket"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "DEMO-2 is running, not done; a follow-up is for a done ticket"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": false,
+        "reason": "DEMO-2 is running; stop it first"
+       },
+       "retry": {
+        "ok": false,
+        "reason": "DEMO-2 is running; only a blocked, stopped, done, waiting or interrupted ticket is retried"
+       },
+       "stop": {
+        "ok": true,
+        "reason": ""
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "DEMO-2 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "DEMO-2",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "implement",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "running",
+      "step": "agent",
+      "stopping": false,
+      "stuck": false,
+      "title": "A running ticket",
+      "updated": "",
+      "why": "implement, attempt 1: agent"
+     },
+     {
+      "actions": {
+       "answer": {
+        "ok": false,
+        "reason": "DEMO-3 is interrupted, not waiting on answers"
+       },
+       "approve": {
+        "ok": false,
+        "reason": "DEMO-3 is interrupted, not a plan waiting for approval"
+       },
+       "archive": {
+        "ok": true,
+        "reason": ""
+       },
+       "continue": {
+        "ok": false,
+        "reason": "DEMO-3 is interrupted: there is no stage to go on"
+       },
+       "edit": {
+        "ok": true,
+        "reason": ""
+       },
+       "fix": {
+        "ok": false,
+        "reason": "DEMO-3 is interrupted; review comments go to a done, blocked or stopped ticket"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "DEMO-3 is interrupted, not done; a follow-up is for a done ticket"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": true,
+        "reason": ""
+       },
+       "retry": {
+        "ok": true,
+        "reason": ""
+       },
+       "stop": {
+        "ok": true,
+        "reason": ""
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "DEMO-3 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "DEMO-3",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "implement",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "interrupted",
+      "step": "",
+      "stopping": false,
+      "stuck": false,
+      "title": "A interrupted ticket",
+      "updated": "",
+      "why": "the queue run ended while it was at implement; start the queue to carry on there"
+     },
+     {
+      "actions": {
+       "answer": {
+        "ok": true,
+        "reason": ""
+       },
+       "approve": {
+        "ok": true,
+        "reason": ""
+       },
+       "archive": {
+        "ok": true,
+        "reason": ""
+       },
+       "continue": {
+        "ok": false,
+        "reason": "DEMO-5 is plan-review; there is no stage to go on"
+       },
+       "edit": {
+        "ok": true,
+        "reason": ""
+       },
+       "fix": {
+        "ok": false,
+        "reason": "DEMO-5 is plan-review; review comments go to a done, blocked or stopped ticket"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "DEMO-5 is plan-review, not done; a follow-up is for a done ticket"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": true,
+        "reason": ""
+       },
+       "retry": {
+        "ok": false,
+        "reason": "DEMO-5 is plan-review; only a blocked, stopped, done, waiting or interrupted ticket is retried"
+       },
+       "stop": {
+        "ok": true,
+        "reason": ""
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "DEMO-5 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "DEMO-5",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "implement",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "plan-review",
+      "step": "",
+      "stopping": false,
+      "stuck": false,
+      "title": "A plan-review ticket",
+      "updated": "",
+      "why": "1 blocking question(s) in the plan"
+     },
+     {
+      "actions": {
+       "answer": {
+        "ok": true,
+        "reason": ""
+       },
+       "approve": {
+        "ok": false,
+        "reason": "DEMO-6 is blocked, not a plan waiting for approval"
+       },
+       "archive": {
+        "ok": true,
+        "reason": ""
+       },
+       "continue": {
+        "ok": false,
+        "reason": "DEMO-6's work is gone (or was never set up): harness queue retry DEMO-6 starts it again"
+       },
+       "edit": {
+        "ok": true,
+        "reason": ""
+       },
+       "fix": {
+        "ok": false,
+        "reason": "DEMO-6's work is gone (or was never made), so there is nothing to review: harness queue retry DEMO-6"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "DEMO-6 is blocked, not done; a follow-up is for a done ticket"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": true,
+        "reason": ""
+       },
+       "retry": {
+        "ok": true,
+        "reason": ""
+       },
+       "stop": {
+        "ok": true,
+        "reason": ""
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "DEMO-6 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "DEMO-6",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "implement",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "blocked",
+      "step": "",
+      "stopping": false,
+      "stuck": false,
+      "title": "A blocked ticket",
+      "updated": "",
+      "why": "1 blocking question(s) in the plan"
+     },
+     {
+      "actions": {
+       "answer": {
+        "ok": false,
+        "reason": "DEMO-7 is stopped, not waiting on answers"
+       },
+       "approve": {
+        "ok": false,
+        "reason": "DEMO-7 is stopped, not a plan waiting for approval"
+       },
+       "archive": {
+        "ok": true,
+        "reason": ""
+       },
+       "continue": {
+        "ok": false,
+        "reason": "DEMO-7's work is gone (or was never set up): harness queue retry DEMO-7 starts it again"
+       },
+       "edit": {
+        "ok": true,
+        "reason": ""
+       },
+       "fix": {
+        "ok": false,
+        "reason": "DEMO-7's work is gone (or was never made), so there is nothing to review: harness queue retry DEMO-7"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "DEMO-7 is stopped, not done; a follow-up is for a done ticket"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": true,
+        "reason": ""
+       },
+       "retry": {
+        "ok": true,
+        "reason": ""
+       },
+       "stop": {
+        "ok": false,
+        "reason": "DEMO-7 is stopped; there is nothing to stop"
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "DEMO-7 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "DEMO-7",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "implement",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "stopped",
+      "step": "",
+      "stopping": false,
+      "stuck": false,
+      "title": "A stopped ticket",
+      "updated": "",
+      "why": "1 blocking question(s) in the plan"
+     },
+     {
+      "actions": {
+       "answer": {
+        "ok": false,
+        "reason": "DEMO-8 is done, not waiting on answers"
+       },
+       "approve": {
+        "ok": false,
+        "reason": "DEMO-8 is done, not a plan waiting for approval"
+       },
+       "archive": {
+        "ok": true,
+        "reason": ""
+       },
+       "continue": {
+        "ok": false,
+        "reason": "DEMO-8 is done; there is no stage to go on"
+       },
+       "edit": {
+        "ok": true,
+        "reason": ""
+       },
+       "fix": {
+        "ok": false,
+        "reason": "DEMO-8's work is gone (or was never made), so there is nothing to review: harness queue retry DEMO-8"
+       },
+       "followup": {
+        "ok": false,
+        "reason": "DEMO-8's work is gone, so a follow-up has nothing to build on: harness queue retry DEMO-8 starts it over"
+       },
+       "move": {
+        "ok": true,
+        "reason": ""
+       },
+       "note": {
+        "ok": true,
+        "reason": ""
+       },
+       "remove": {
+        "ok": true,
+        "reason": ""
+       },
+       "retry": {
+        "ok": true,
+        "reason": ""
+       },
+       "stop": {
+        "ok": false,
+        "reason": "DEMO-8 is done; there is nothing to stop"
+       },
+       "unarchive": {
+        "ok": false,
+        "reason": "DEMO-8 is in the queue, not archived"
+       }
+      },
+      "attempt": 0,
+      "branch": "",
+      "created": "",
+      "debug": false,
+      "finished": false,
+      "in_place": false,
+      "key": "DEMO-8",
+      "plan_review": false,
+      "project": "/p",
+      "reason": "1 blocking question(s) in the plan",
+      "session": null,
+      "stage": "implement",
+      "stages": [
+       "plan",
+       "implement",
+       "review",
+       "fix",
+       "push"
+      ],
+      "status": "done",
+      "step": "",
+      "stopping": false,
+      "stuck": false,
+      "title": "A done ticket",
+      "updated": "",
+      "why": "1 blocking question(s) in the plan"
+     }
+    ]
+   },
+   "sig": "63d54e535d7a2f22b4557f01c5fec65820d12ee8"
+  },
+  "session:ses_root1": {
+   "data": {
+    "children": [
+     {
+      "agent": "explore",
+      "created": 1795071829364,
+      "id": "ses_child1",
+      "title": "explore subagent",
+      "updated": 1795071834364
+     }
+    ],
+    "count": 2,
+    "inbox": [],
+    "row": {
+     "agent": "yolo",
+     "cost": 0,
+     "created": 1795071827364,
+     "directory": "/home/user/harness-fixture/proj",
+     "id": "ses_root1",
+     "kids": 1,
+     "kind": "session",
+     "label": "",
+     "live": false,
+     "model": "harness/big",
+     "parent": null,
+     "source": "host",
+     "ticket": null,
+     "title": "Fix the <b>parser</b>",
+     "tokens_in": 1200,
+     "tokens_out": 300,
+     "updated": 1795071832364,
+     "web": "http://127.0.0.1:4096/server/aHR0cDovLzEyNy4wLjAuMTo0MDk2/session/ses_root1",
+     "working": true
+    },
+    "send": {
+     "ok": false,
+     "reason": "this run is not live (finished, or not a headless run)"
+    },
+    "stop": {
+     "ok": false,
+     "reason": "this is not a queue stage; stop a harness -p run from its terminal, and an interactive one from opencode"
+    }
+   },
+   "sig": "1bf6fb4146d186b84cc3a214176f36721ebb782b"
+  },
+  "sessions": {
+   "data": [
+    {
+     "agent": "yolo",
+     "cost": 0,
+     "created": 1795071827364,
+     "directory": "/home/user/harness-fixture/proj",
+     "id": "ses_root1",
+     "kids": 1,
+     "kind": "session",
+     "label": "",
+     "live": false,
+     "model": "harness/big",
+     "parent": null,
+     "source": "host",
+     "ticket": null,
+     "title": "Fix the <b>parser</b>",
+     "tokens_in": 1200,
+     "tokens_out": 300,
+     "updated": 1795071832364,
+     "web": "http://127.0.0.1:4096/server/aHR0cDovLzEyNy4wLjAuMTo0MDk2/session/ses_root1",
+     "working": true
+    },
+    {
+     "agent": "yolo",
+     "cost": 0,
+     "created": 1795071767364,
+     "directory": "/home/user/harness-fixture/state/queue/ABC-12/repo",
+     "id": "ses_queue1",
+     "kids": 0,
+     "kind": "queue",
+     "label": "",
+     "live": false,
+     "model": "harness/big",
+     "parent": null,
+     "source": "host",
+     "ticket": "ABC-12",
+     "title": "plan ABC-12",
+     "tokens_in": 1200,
+     "tokens_out": 300,
+     "updated": 1795071772364,
+     "web": "http://127.0.0.1:4096/server/aHR0cDovLzEyNy4wLjAuMTo0MDk2/session/ses_queue1",
+     "working": false
+    }
+   ],
+   "sig": "bed74b3a44e1d1a10bcc332188a633ff843e1017"
+  },
+  "status": {
+   "data": {
+    "api": 1,
+    "codes": false,
+    "mode": "serve",
+    "modes": [],
+    "opencode": {
+     "port": 4096,
+     "url": "http://127.0.0.1:4096"
+    },
+    "pid": 1769951,
+    "proxy": null,
+    "root": "/home/user/harness",
+    "runs": true,
+    "stale": false,
+    "state_dir": "",
+    "state_id": "",
+    "user": null,
+    "vault": {
+     "dir": "/home/user/harness-fixture/vault",
+     "name": "notes"
+    },
+    "version": {
+     "branch": "dev",
+     "describe": "v1.1-276-gf4ffea2",
+     "sha": "f4ffea2cd2f450c2e8fe4b1e4341ba50c5154434"
+    }
+   },
+   "sig": "f12101c4cc0c0dbb88c3f45a533640bf7f0fa731"
+  },
+  "ticket:ABC-12": {
+   "data": {
+    "actions": {
+     "answer": {
+      "ok": true,
+      "reason": ""
+     },
+     "approve": {
+      "ok": false,
+      "reason": "ABC-12 is needs-answers, not a plan waiting for approval"
+     },
+     "archive": {
+      "ok": true,
+      "reason": ""
+     },
+     "continue": {
+      "ok": false,
+      "reason": "ABC-12 is needs-answers; there is no stage to go on"
+     },
+     "edit": {
+      "ok": true,
+      "reason": ""
+     },
+     "fix": {
+      "ok": false,
+      "reason": "ABC-12 is needs-answers; review comments go to a done, blocked or stopped ticket"
+     },
+     "followup": {
+      "ok": false,
+      "reason": "ABC-12 is needs-answers, not done; a follow-up is for a done ticket"
+     },
+     "move": {
+      "ok": true,
+      "reason": ""
+     },
+     "note": {
+      "ok": true,
+      "reason": ""
+     },
+     "remove": {
+      "ok": true,
+      "reason": ""
+     },
+     "retry": {
+      "ok": true,
+      "reason": ""
+     },
+     "stop": {
+      "ok": true,
+      "reason": ""
+     },
+     "unarchive": {
+      "ok": false,
+      "reason": "ABC-12 is in the queue, not archived"
+     }
+    },
+    "archived": false,
+    "continue_mode": "container",
+    "edit_lock": [
+     "all",
+     "Nothing has run yet: every setting can change."
+    ],
+    "key": "ABC-12",
+    "log": "12:00 plan-1 started\n12:01 verifier: pass\n",
+    "outs": [
+     {
+      "mtime": 1795071887.3616333,
+      "name": "plan-1.out",
+      "size": 9
+     }
+    ],
+    "retry_choices": [
+     {
+      "label": "where it was",
+      "value": ""
+     },
+     {
+      "label": "plan",
+      "value": "plan"
+     },
+     {
+      "label": "implement",
+      "value": "implement"
+     },
+     {
+      "label": "review",
+      "value": "review"
+     },
+     {
+      "label": "fix",
+      "value": "fix"
+     },
+     {
+      "label": "push",
+      "value": "push"
+     }
+    ],
+    "retry_why": "",
+    "sessions": [
+     {
+      "created": 1795071767364,
+      "kind": "queue",
+      "label": "plan-2",
+      "sid": "ses_queue1",
+      "stage": "plan",
+      "working": false
+     }
+    ],
+    "state": {
+     "assumptions": [],
+     "attempt": 0,
+     "base": "main",
+     "criteria": [],
+     "debug": {},
+     "finished": false,
+     "history": [
+      {
+       "at": "2026-10-26T20:00:00Z",
+       "attempt": 2,
+       "details": [
+        "the plan file was not written"
+       ],
+       "result": "failed",
+       "stage": "plan"
+      }
+     ],
+     "in_place": false,
+     "no_branch": false,
+     "notes": [],
+     "owner_reviews": [],
+     "packet": {},
+     "panels": {},
+     "parts": [],
+     "plan_approved": false,
+     "plan_review": false,
+     "plan_sig": "",
+     "project": "/p",
+     "questions": [
+      {
+       "ask": "Which db?",
+       "blocking": true,
+       "default": "",
+       "id": "Q1",
+       "options": [],
+       "text": "Which db?"
+      },
+      {
+       "ask": "Log level? Default: info",
+       "blocking": false,
+       "default": "",
+       "id": "Q2",
+       "options": [],
+       "text": "Log level? Default: info"
+      }
+     ],
+     "reason": "1 blocking question(s) in the plan",
+     "repos": {},
+     "resume": false,
+     "review_dropped": [],
+     "review_verdicts": [],
+     "rounds": [],
+     "session": {},
+     "stage": "plan",
+     "stages": [
+      "plan",
+      "implement",
+      "review",
+      "fix",
+      "push"
+     ],
+     "start": "",
+     "start_sha": "",
+     "status": "needs-answers",
+     "stopping": false,
+     "take_defaults": false,
+     "title": "Fix it"
+    },
+    "why": "1 blocking question(s) in the plan"
+   },
+   "sig": "66c4d25ae3e793f78b7cd4c729fcbc58f6d825a5"
+  },
+  "vault": {
+   "data": {
+    "dir": "/home/user/harness-fixture/vault",
+    "facts": {
+     "ahead": null,
+     "behind": null,
+     "branch": "",
+     "dirty": null,
+     "head": [
+      ""
+     ],
+     "remote": ""
+    },
+    "ingest": {
+     "out_tail": "",
+     "run": null,
+     "summary": {
+      "failed": [],
+      "has": false,
+      "last": "",
+      "nfailed": 0,
+      "sources": []
+     }
+    },
+    "log": [],
+    "name": "notes",
+    "pages": [
+     {
+      "mtime": 1795071887.3616333,
+      "rel": "wiki/index.md",
+      "title": "index"
+     }
+    ]
+   },
+   "sig": "ac29531309c40f9a08237d2aba4584a17e75a0ee"
+  }
+ }
+}

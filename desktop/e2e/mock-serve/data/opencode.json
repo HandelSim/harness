@@ -1,0 +1,10 @@
+{
+ "data": {
+  "password": "",
+  "port": 4096,
+  "url": "http://127.0.0.1:4096",
+  "user": "opencode"
+ },
+ "ok": true,
+ "sig": "aed1a90f9ef5b3374a40a68acf8ecc2389083724"
+}

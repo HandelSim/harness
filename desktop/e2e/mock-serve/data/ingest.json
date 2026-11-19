@@ -1,0 +1,15 @@
+{
+ "data": {
+  "out_tail": "",
+  "run": null,
+  "summary": {
+   "failed": [],
+   "has": false,
+   "last": "",
+   "nfailed": 0,
+   "sources": []
+  }
+ },
+ "ok": true,
+ "sig": "173a6a0669b02784e12363f31c8220c6844070a2"
+}

@@ -94,6 +94,9 @@ Read the relevant one(s) before changing code in that area:
   `scripts/upgrade-manifest.json`, and `scripts/lib/upgrade_actions.sh`
   (envfile_merge / linefile_merge / directory_overwrite /
   userfile_sync). Where the B3-MANAGED comment markers anchor.
+- [`desktop.md`](desktop.md) — the Electron desktop app under `desktop/`:
+  main/preload/renderer/background split, backend manager, key vault,
+  auto-update, build and e2e. Talks to serve's JSON API (`/api/v1`).
 - [`tests.md`](tests.md) — test layout and conventions. The detailed
   inventory and coverage tables live alongside the tests at
   `tests/INVENTORY.md` and `tests/COVERAGE.md`.

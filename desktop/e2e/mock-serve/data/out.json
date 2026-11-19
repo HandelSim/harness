@@ -1,0 +1,12 @@
+{
+ "data": {
+  "from": 0,
+  "name": "plan-1.out",
+  "next": 9,
+  "reset": false,
+  "size": 9,
+  "text": "the plan\n"
+ },
+ "ok": true,
+ "sig": "bf59bc17af6bc7f5d65a7d1a977a5c64a3f927f6"
+}

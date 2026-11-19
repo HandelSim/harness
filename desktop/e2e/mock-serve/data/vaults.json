@@ -1,0 +1,9 @@
+{
+ "data": {
+  "active": "notes",
+  "dir": "/home/user/harness-fixture/vault",
+  "vaults": []
+ },
+ "ok": true,
+ "sig": "ef9acb6d6dd52f064fbb4ce1dee1f33fb56032c8"
+}

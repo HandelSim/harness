@@ -1,0 +1,46 @@
+{
+ "data": {
+  "children": [
+   {
+    "agent": "explore",
+    "created": 1795071829364,
+    "id": "ses_child1",
+    "title": "explore subagent",
+    "updated": 1795071834364
+   }
+  ],
+  "count": 2,
+  "inbox": [],
+  "row": {
+   "agent": "yolo",
+   "cost": 0,
+   "created": 1795071827364,
+   "directory": "/home/user/harness-fixture/proj",
+   "id": "ses_root1",
+   "kids": 1,
+   "kind": "session",
+   "label": "",
+   "live": false,
+   "model": "harness/big",
+   "parent": null,
+   "source": "host",
+   "ticket": null,
+   "title": "Fix the <b>parser</b>",
+   "tokens_in": 1200,
+   "tokens_out": 300,
+   "updated": 1795071832364,
+   "web": "http://127.0.0.1:4096/server/aHR0cDovLzEyNy4wLjAuMTo0MDk2/session/ses_root1",
+   "working": true
+  },
+  "send": {
+   "ok": false,
+   "reason": "this run is not live (finished, or not a headless run)"
+  },
+  "stop": {
+   "ok": false,
+   "reason": "this is not a queue stage; stop a harness -p run from its terminal, and an interactive one from opencode"
+  }
+ },
+ "ok": true,
+ "sig": "1bf6fb4146d186b84cc3a214176f36721ebb782b"
+}

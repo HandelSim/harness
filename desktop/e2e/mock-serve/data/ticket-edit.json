@@ -1,0 +1,24 @@
+{
+ "data": {
+  "can": "all",
+  "form": {
+   "after_plan": "go",
+   "base": "main",
+   "branch": "",
+   "cont": "",
+   "keys": "ABC-12",
+   "preset": "full",
+   "project": "/p",
+   "repo_mode:.": "branch",
+   "stage_fix": "fix",
+   "stage_implement": "implement",
+   "stage_plan": "plan",
+   "stage_push": "push",
+   "stage_review": "review",
+   "start": "new"
+  },
+  "why": "Nothing has run yet: every setting can change."
+ },
+ "ok": true,
+ "sig": "ca457e73533a65cce47c190b792fb45b3e289f89"
+}

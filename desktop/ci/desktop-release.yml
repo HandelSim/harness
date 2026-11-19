@@ -1,0 +1,81 @@
+# Desktop release (PLAN 6.3, D10). FOR THE OWNER TO MOVE to .github/workflows/desktop-release.yml.
+# Manual trigger. Builds installers on native runners and replaces the assets of the rolling `desktop-latest` release,
+# whose tag points at a commit on the orphan branch `desktop-release` (so `harness downgrade` never sees it).
+# The app's generic update provider reads latest*.yml from that release.
+name: desktop-release
+on:
+  workflow_dispatch:
+    inputs:
+      version: { description: 'version (x.y.z); must match desktop/package.json', required: true }
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults: { run: { working-directory: desktop, shell: bash } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: desktop/package-lock.json }
+      - name: version matches
+        run: test "$(node -p 'require("./package.json").version')" = "${{ inputs.version }}"
+      - run: npm ci
+      - run: npm run check
+      - name: build installers
+        run: |
+          node scripts/build.mjs --prod
+          case "${{ runner.os }}" in
+            # native arch per runner (node-pty is rebuilt per target); macOS builds x64 and arm64 (clang cross-compiles)
+            Linux)   npx electron-builder --linux AppImage --$(node -p process.arch) --publish never ;;
+            macOS)   npx electron-builder --mac dmg zip --x64 --arm64 --publish never ;;
+            Windows) npx electron-builder --win nsis --x64 --publish never ;;
+          esac
+        env:
+          # Signing: set these secrets to sign (macOS notarisation needs APPLE_ID etc.); unsigned builds still build.
+          CSC_LINK: ${{ secrets.DESKTOP_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.DESKTOP_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.DESKTOP_CSC_LINK != '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: |
+            desktop/dist/*.AppImage
+            desktop/dist/*.dmg
+            desktop/dist/*.zip
+            desktop/dist/*.exe
+            desktop/dist/*.blockmap
+            desktop/dist/latest*.yml
+          if-no-files-found: ignore
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/download-artifact@v4
+        with: { path: assets, merge-multiple: true }
+      # latest-linux.yml (x64) and latest-linux-arm64.yml come from different runners and do not collide
+      - name: list assets
+        run: ls -la assets
+      - name: move the desktop-latest tag onto the orphan release branch
+        run: |
+          git config user.name "github-actions"; git config user.email "github-actions@users.noreply.github.com"
+          if git ls-remote --exit-code origin desktop-release >/dev/null; then git fetch origin desktop-release; git checkout desktop-release
+          else git checkout --orphan desktop-release; git rm -rf . >/dev/null; fi
+          echo "${{ inputs.version }}" > VERSION
+          git add VERSION; git commit -m "desktop release ${{ inputs.version }}" --allow-empty
+          git push origin desktop-release
+          git tag -f desktop-latest; git push -f origin desktop-latest
+      - name: replace release assets
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release view desktop-latest >/dev/null 2>&1 \
+            || gh release create desktop-latest --title "Harness desktop (latest)" --notes "Rolling desktop build" --target desktop-release
+          gh release edit desktop-latest --title "Harness desktop ${{ inputs.version }}" --prerelease=false --latest=false
+          for a in $(gh release view desktop-latest --json assets -q '.assets[].name'); do gh release delete-asset desktop-latest "$a" -y; done
+          gh release upload desktop-latest assets/* --clobber

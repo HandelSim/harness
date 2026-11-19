@@ -1,0 +1,31 @@
+{
+ "data": {
+  "api": 1,
+  "codes": false,
+  "mode": "serve",
+  "modes": [],
+  "opencode": {
+   "port": 4096,
+   "url": "http://127.0.0.1:4096"
+  },
+  "pid": 1769951,
+  "proxy": null,
+  "root": "/home/user/harness",
+  "runs": true,
+  "stale": false,
+  "state_dir": "",
+  "state_id": "",
+  "user": null,
+  "vault": {
+   "dir": "/home/user/harness-fixture/vault",
+   "name": "notes"
+  },
+  "version": {
+   "branch": "dev",
+   "describe": "v1.1-276-gf4ffea2",
+   "sha": "f4ffea2cd2f450c2e8fe4b1e4341ba50c5154434"
+  }
+ },
+ "ok": true,
+ "sig": "f12101c4cc0c0dbb88c3f45a533640bf7f0fa731"
+}

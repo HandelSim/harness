@@ -1,0 +1,166 @@
+{
+ "data": {
+  "actions": {
+   "answer": {
+    "ok": true,
+    "reason": ""
+   },
+   "approve": {
+    "ok": false,
+    "reason": "ABC-12 is needs-answers, not a plan waiting for approval"
+   },
+   "archive": {
+    "ok": true,
+    "reason": ""
+   },
+   "continue": {
+    "ok": false,
+    "reason": "ABC-12 is needs-answers; there is no stage to go on"
+   },
+   "edit": {
+    "ok": true,
+    "reason": ""
+   },
+   "fix": {
+    "ok": false,
+    "reason": "ABC-12 is needs-answers; review comments go to a done, blocked or stopped ticket"
+   },
+   "followup": {
+    "ok": false,
+    "reason": "ABC-12 is needs-answers, not done; a follow-up is for a done ticket"
+   },
+   "move": {
+    "ok": true,
+    "reason": ""
+   },
+   "note": {
+    "ok": true,
+    "reason": ""
+   },
+   "remove": {
+    "ok": true,
+    "reason": ""
+   },
+   "retry": {
+    "ok": true,
+    "reason": ""
+   },
+   "stop": {
+    "ok": true,
+    "reason": ""
+   },
+   "unarchive": {
+    "ok": false,
+    "reason": "ABC-12 is in the queue, not archived"
+   }
+  },
+  "archived": false,
+  "continue_mode": "container",
+  "edit_lock": [
+   "all",
+   "Nothing has run yet: every setting can change."
+  ],
+  "key": "ABC-12",
+  "log": "12:00 plan-1 started\n12:01 verifier: pass\n",
+  "outs": [
+   {
+    "mtime": 1795071887.3616333,
+    "name": "plan-1.out",
+    "size": 9
+   }
+  ],
+  "retry_choices": [
+   {
+    "label": "where it was",
+    "value": ""
+   },
+   {
+    "label": "plan",
+    "value": "plan"
+   }
+  ],
+  "retry_why": "",
+  "sessions": [
+   {
+    "created": 1795071767364,
+    "kind": "queue",
+    "label": "plan-2",
+    "sid": "ses_queue1",
+    "stage": "plan",
+    "working": false
+   }
+  ],
+  "state": {
+   "assumptions": [],
+   "attempt": 0,
+   "base": "main",
+   "criteria": [],
+   "debug": {},
+   "finished": false,
+   "history": [
+    {
+     "at": "2026-10-26T20:00:00Z",
+     "attempt": 2,
+     "details": [
+      "the plan file was not written"
+     ],
+     "result": "failed",
+     "stage": "plan"
+    }
+   ],
+   "in_place": false,
+   "no_branch": false,
+   "notes": [],
+   "owner_reviews": [],
+   "packet": {},
+   "panels": {},
+   "parts": [],
+   "plan_approved": false,
+   "plan_review": false,
+   "plan_sig": "",
+   "project": "/p",
+   "questions": [
+    {
+     "ask": "Which db?",
+     "blocking": true,
+     "default": "",
+     "id": "Q1",
+     "options": [],
+     "text": "Which db?"
+    },
+    {
+     "ask": "Log level? Default: info",
+     "blocking": false,
+     "default": "",
+     "id": "Q2",
+     "options": [],
+     "text": "Log level? Default: info"
+    }
+   ],
+   "reason": "1 blocking question(s) in the plan",
+   "repos": {},
+   "resume": false,
+   "review_dropped": [],
+   "review_verdicts": [],
+   "rounds": [],
+   "session": {},
+   "stage": "plan",
+   "stages": [
+    "plan",
+    "implement",
+    "review",
+    "fix",
+    "push"
+   ],
+   "start": "",
+   "start_sha": "",
+   "status": "needs-answers",
+   "stopping": false,
+   "take_defaults": false,
+   "title": "Fix it"
+  },
+  "why": "1 blocking question(s) in the plan"
+ },
+ "ok": true,
+ "sig": "16f10e2048e6f2b4df57e8b7eeedf39944891f58"
+}

@@ -1,0 +1,37 @@
+{
+ "data": {
+  "dir": "/home/user/harness-fixture/vault",
+  "facts": {
+   "ahead": null,
+   "behind": null,
+   "branch": "",
+   "dirty": null,
+   "head": [
+    ""
+   ],
+   "remote": ""
+  },
+  "ingest": {
+   "out_tail": "",
+   "run": null,
+   "summary": {
+    "failed": [],
+    "has": false,
+    "last": "",
+    "nfailed": 0,
+    "sources": []
+   }
+  },
+  "log": [],
+  "name": "notes",
+  "pages": [
+   {
+    "mtime": 1795071887.3616333,
+    "rel": "wiki/index.md",
+    "title": "index"
+   }
+  ]
+ },
+ "ok": true,
+ "sig": "ac29531309c40f9a08237d2aba4584a17e75a0ee"
+}

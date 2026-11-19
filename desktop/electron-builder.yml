@@ -1,0 +1,62 @@
+# electron-builder 26.18.0 config (PLAN 6.3). Build with `npm run dist` / `npm run dist:dir` (runs build.mjs --prod first).
+appId: dev.harness.desktop
+productName: Harness
+copyright: harness contributors
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**
+  - "!out/test/**"
+  - "!out/renderer/bg-demo.html"
+  - "!out/renderer/assets/bg-demo.js*"
+  - "!**/*.map"
+  - package.json
+asar: true
+# node-pty is a native N-API module: it must live outside the asar to be loaded, and is rebuilt for each target at pack time.
+asarUnpack:
+  - node_modules/node-pty/**
+npmRebuild: true
+# Fuses (key verified in app-builder-lib 26.18.0 FuseOptionsV1). runAsNode off: nothing here forks with ELECTRON_RUN_AS_NODE
+# (the PTY host is a utilityProcess).
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
+  grantFileProtocolExtraPrivileges: false
+# Generic provider on the rolling `desktop-latest` release (D10). electron-updater reads latest*.yml from here.
+publish:
+  - provider: generic
+    url: https://github.com/HandelSim/harness/releases/download/desktop-latest/
+linux:
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: dir
+      arch: [x64, arm64]
+  category: Development
+  icon: build/icon.png
+  artifactName: Harness-${version}-${arch}.${ext}
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  icon: build/icon.png
+  artifactName: Harness-${version}-mac-${arch}.${ext}
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.png
+  artifactName: Harness-${version}-win-${arch}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
