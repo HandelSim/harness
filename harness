@@ -5137,6 +5137,30 @@ harness_python_triple() {
     esac
 }
 
+# Move a freshly unpacked tree $1 to $2 (which must not exist). On Windows a
+# virus scanner (Defender) holds just-written files open for a few seconds and
+# renaming their folder fails with "Permission denied" meanwhile, so retry like
+# npm's graceful-fs does, then fall back to copying. HARNESS_PLACE_TRIES
+# (default 30, one second apart) bounds the wait.
+harness_place_dir() {
+    local src="$1" dst="$2" tries="${HARNESS_PLACE_TRIES:-30}" i=0 out=""
+    [[ -e "$dst" ]] && { err "harness: $dst already exists"; return 1; }
+    while :; do
+        out=$(mv "$src" "$dst" 2>&1) && return 0
+        [[ -e "$dst" && ! -e "$src" ]] && return 0
+        i=$((i+1)); (( i >= tries )) && break
+        (( i == 1 )) && echo "[harness] the unpacked files are still locked (a virus scanner checking them?); retrying for up to ${tries}s: $out" >&2
+        sleep 1
+        [[ -e "$dst" ]] && rm -rf "$dst"   # a half-done rename
+    done
+    echo "[harness] renaming still fails ($out); copying instead" >&2
+    rm -rf "$dst"
+    if out=$(cp -R "$src" "$dst" 2>&1); then rm -rf "$src" 2>/dev/null; return 0; fi
+    err "harness: could not move $src to $dst: $out"
+    rm -rf "$dst"
+    return 1
+}
+
 # 0 when the private Python is ready, fetching it the first time. Concurrent
 # callers (the desktop app runs several harness commands at once) each unpack
 # into their own temp dir and the first complete tree wins, so none runs a
@@ -5163,7 +5187,7 @@ harness_ensure_python() {
     rm -f "$tmpd/python.tar.gz"
     if [[ -x "$exe" ]] && "$exe" --version >/dev/null 2>&1; then rm -rf "$tmpd"; return 0; fi   # another run won
     rm -rf "$dir"
-    mv "$tmpd" "$dir" 2>/dev/null || rm -rf "$tmpd"
+    harness_place_dir "$tmpd" "$dir" || rm -rf "$tmpd"
     out=$("$exe" --version 2>&1) || rc=$?
     if (( rc == 0 )) && [[ "$out" == "Python 3"* ]]; then
         echo "[harness] Python ready ($out, $exe)" >&2; return 0
@@ -13874,14 +13898,16 @@ _desktop_check_node() {
                 archive="node-v${HARNESS_DESKTOP_NODE_VERSION}-${plat}.${ext}"
                 base="https://nodejs.org/dist/v${HARNESS_DESKTOP_NODE_VERSION}"
                 tmpd="$root.part.$$"; rm -rf "$tmpd"
-                if sha=$(host_sha_from_manifest "$base/SHASUMS256.txt" "${archive//./\\.}") \
-                    && mkdir -p "$tmpd" \
-                    && host_fetch "$base/$archive" "$tmpd/$archive" "$sha" \
-                    && host_extract_archive "$tmpd/$archive" "$tmpd" "$ext" \
-                    && [[ -d "$tmpd/${archive%."$ext"}" ]]; then
-                    rm -rf "$root"; mv "$tmpd/${archive%."$ext"}" "$root" 2>/dev/null || true
-                else
-                    err "desktop: could not fetch Node.js from $base (offline, or a proxy blocked it?)"
+                if ! sha=$(host_sha_from_manifest "$base/SHASUMS256.txt" "${archive//./\\.}"); then
+                    err "desktop: could not read $base/SHASUMS256.txt (offline, or a proxy blocked it?)"
+                elif mkdir -p "$tmpd" && host_fetch "$base/$archive" "$tmpd/$archive" "$sha"; then
+                    echo "harness desktop: unpacking Node..."
+                    if ! host_extract_archive "$tmpd/$archive" "$tmpd" "$ext" || [[ ! -d "$tmpd/${archive%."$ext"}" ]]; then
+                        err "desktop: $archive did not unpack to ${archive%."$ext"}/"
+                    else
+                        rm -rf "$root"
+                        harness_place_dir "$tmpd/${archive%."$ext"}" "$root" || true
+                    fi
                 fi
                 rm -rf "$tmpd"
             fi
@@ -13892,6 +13918,7 @@ _desktop_check_node() {
                 echo "harness desktop: building with harness's own Node $_desktop_node_v"
                 return 0
             fi
+            err "desktop: harness's own Node in $root does not work (node -v: '${_desktop_node_v:-no output}'; npm: $(command -v npm || echo missing); npx: $(command -v npx || echo missing))"
         fi
     fi
     if [[ "$had" == none ]]; then

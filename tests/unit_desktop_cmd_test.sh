@@ -230,13 +230,33 @@ ARGS=(install); run HARNESS_DESKTOP_OS=linux HOME="$TMP/home5b"
 [[ $RC == 0 ]] || fail "T5b: second build failed — $OUT"
 ! grep -q '^curl' "$LOG" || fail "T5b: node fetched again — $(cat "$LOG")"
 grep -q '^vnpx ' "$LOG" || fail "T5b: second build not on the kept node"
+# Windows Defender holds freshly unpacked files open, so renaming their folder
+# into state/tools fails for a few seconds: retried, and copied if it never clears.
+REALMV=$(PATH="$SYS" command -v mv)
+stub mv 'n=$(cat "'"$TMP"'/mvfail" 2>/dev/null || echo 0)
+case "${@: -1}" in */state/tools/node-v*-linux-x64)
+  if (( n > 0 )); then echo $((n-1)) >"'"$TMP"'/mvfail"; echo "mv: cannot move: Permission denied" >&2; exit 1; fi ;;
+esac
+exec "'"$REALMV"'" "$@"'
+rm -rf "$C/state/tools"; rm -f "$C/state/desktop/installed"; echo 2 >"$TMP/mvfail"
+ARGS=(install); run HARNESS_DESKTOP_OS=linux HOME="$TMP/home5b"
+[[ $RC == 0 ]] || fail "T5b: locked rename not retried (rc $RC) — $OUT"
+grep -q "still locked (a virus scanner" <<<"$OUT" || fail "T5b: no locked-files notice — $OUT"
+[[ "$(cat "$TMP/mvfail")" == 0 ]] && grep -q '^vnpx ' "$LOG" || fail "T5b: not built after the retry — $(cat "$LOG")"
+rm -rf "$C/state/tools"; rm -f "$C/state/desktop/installed"; echo 99 >"$TMP/mvfail"
+ARGS=(install); run HARNESS_DESKTOP_OS=linux HOME="$TMP/home5b" HARNESS_PLACE_TRIES=2
+[[ $RC == 0 ]] && grep -q "copying instead" <<<"$OUT" && grep -q '^vnpx ' "$LOG" \
+    || fail "T5b: rename never clearing did not fall back to a copy (rc $RC) — $OUT"
+[[ -x "$C/state/tools/node-v$NV-linux-x64/bin/node" ]] || fail "T5b: copied node missing"
+compgen -G "$C/state/tools/*.part.*" >/dev/null && fail "T5b: temp dir left after the copy"
+rm -f "$STUBS/mv" "$TMP/mvfail"
 # A node on PATH that is new enough wins; nothing is fetched or used from state.
 mv "$TMP/node.off" "$STUBS/node"; rm -f "$C/state/desktop/installed"
 ARGS=(install); run HARNESS_DESKTOP_OS=linux HOME="$TMP/home5b"
 [[ $RC == 0 ]] && ! grep -q '^curl\|^vnp' "$LOG" && grep -q '^npx ' "$LOG" || fail "T5b: PATH node 22 not preferred — $(cat "$LOG")"
 rm -f "$STUBS/curl"
 C="$C2"
-ok "T5b: no node 22 -> harness fetches Node $NV (checksum-verified) into state/tools, builds with it, reuses it; a PATH node 22 wins"
+ok "T5b: no node 22 -> harness fetches Node $NV (checksum-verified) into state/tools, builds with it, reuses it; a locked rename is retried, then copied; a PATH node 22 wins"
 
 # --- T6: failures keep the old install ------------------------------------------
 subst 's/0.1.1/0.1.2/' "$C/desktop/package.json"; (cd "$C" && "${GIT[@]}" commit -qam bump2)

@@ -2037,8 +2037,11 @@ What it does, in order:
    win/mac/linux x x86_64/aarch64), sha256-checked against that release's
    `SHA256SUMS`, into `state/tools/python-<ver>-<build>/python/` (once; no admin,
    nothing outside the install root). It unpacks into `<dir>.part.<pid>` and
-   `mv`s into place, so concurrent harness calls (the desktop app runs several)
-   never see a half tree. At launch `harness_python_on_path` puts that dir first
+   moves it into place (`harness_place_dir`), so concurrent harness calls (the
+   desktop app runs several) never see a half tree. On Windows Defender holds
+   freshly unpacked files open and the folder rename fails with "Permission
+   denied" for a few seconds, so `harness_place_dir` retries once a second up to
+   `HARNESS_PLACE_TRIES` (30), then copies. At launch `harness_python_on_path` puts that dir first
    on `PATH` (a missing dir costs nothing), so once fetched it is the Python for
    every harness command and child; a path containing whitespace is returned as
    the bare name because callers word-split the result (`py -3`).
@@ -3245,7 +3248,7 @@ it in tests); anything but windows/macos/linux is refused.
   PATH node is used when new enough; otherwise `_desktop_check_node` fetches the
   official nodejs.org build `HARNESS_DESKTOP_NODE_VERSION` (22.23.5; zip on
   Windows, tar.gz elsewhere), sha256-checked against `SHASUMS256.txt`, into
-  `state/tools/node-v<ver>-<plat>/` (once, temp dir + `mv`) and puts it first on
+  `state/tools/node-v<ver>-<plat>/` (once, temp dir + `harness_place_dir`) and puts it first on
   PATH for the build. Only when that fails (offline, `HARNESS_NO_AUTO_DEPS=1`)
   does it stop with a per-OS hint (`winget install OpenJS.NodeJS.LTS`, `brew
   install node`, …). Host mode's vendored Node 20 is not used. `npm ci` only when `node_modules`
