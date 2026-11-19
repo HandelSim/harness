@@ -1,0 +1,55 @@
+/* Terminal panel: opaque --surface-0 host (DR(g): no transparency behind glyphs), hover toolbar, find bar,
+   inline exit / paste bars that never cover the prompt line's start. */
+.term-panel { position: relative; display: flex; flex-direction: column; min-height: 0; height: 100%; background: var(--surface-0); overflow: hidden; }
+.term-host { flex: 1 1 auto; min-height: 0; padding: var(--sp-2) 0 0 var(--sp-3); background: var(--surface-0); }
+.term-host .xterm { height: 100%; }
+.term-host .xterm-viewport { background-color: var(--surface-0) !important; }
+.term-host .xterm .xterm-scrollable-element > .scrollbar > .slider { border-radius: 4px; }
+
+/* top-right hover toolbar */
+.term-tools {
+  position: absolute; top: var(--sp-2); right: var(--sp-4); z-index: 3;
+  display: flex; gap: 2px; padding: 2px;
+  background: var(--glass-bg, var(--surface-1)); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+  box-shadow: var(--shadow-2), inset 0 1px 0 var(--glass-highlight, transparent);
+  backdrop-filter: blur(16px) saturate(1.4);
+  opacity: 0; transform: translateY(-2px); pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
+}
+.term-panel:hover .term-tools, .term-tools:focus-within { opacity: 1; transform: none; pointer-events: auto; }
+.term-panel:has(.term-find) .term-tools { display: none; }
+
+/* find bar */
+.term-find {
+  position: absolute; top: var(--sp-2); right: var(--sp-4); z-index: 4;
+  display: flex; align-items: center; gap: var(--sp-1); padding: 3px 3px 3px var(--sp-2);
+  width: min(380px, calc(100% - 2 * var(--sp-4)));
+  border: 1px solid var(--border); border-radius: var(--r-md); box-shadow: var(--shadow-3);
+  color: var(--text-2);
+}
+.term-find__input {
+  flex: 1 1 auto; min-width: 0; height: 26px; border: 0; outline: 0; background: transparent;
+  color: var(--text-1); font: inherit; font-size: var(--text-13);
+}
+.term-find__count { font-size: var(--text-11); color: var(--text-3); min-width: 56px; text-align: right; padding-right: var(--sp-1); white-space: nowrap; }
+
+/* starting line */
+.term-starting {
+  position: absolute; left: var(--sp-3); bottom: var(--sp-2); z-index: 2; display: flex; align-items: center; gap: var(--sp-2);
+  max-width: calc(100% - 2 * var(--sp-3)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; pointer-events: none;
+}
+.term-starting .spin { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--border-strong); border-top-color: var(--accent-9); display: inline-block; animation: spin 0.8s linear infinite; }
+
+/* inline bars (exit, error, paste confirm) sit under the terminal and push it up rather than overlay it */
+.term-bar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-2);
+  margin: var(--sp-2) var(--sp-3) var(--sp-3); padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+  background: var(--surface-1); color: var(--text-2); font-size: var(--text-13);
+  animation: term-bar-in var(--dur-base) var(--ease-out);
+}
+.term-bar--err { border-color: color-mix(in srgb, var(--err-solid) 40%, transparent); background: var(--err-bg, var(--surface-1)); color: var(--err-text, var(--text-1)); }
+.term-bar--ask { border-color: color-mix(in srgb, var(--warn-solid) 40%, transparent); background: var(--warn-bg, var(--surface-1)); color: var(--warn-text, var(--text-1)); }
+@keyframes term-bar-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+:root[data-reduce-motion="1"] .term-bar, :root[data-reduce-motion="1"] .term-tools { animation: none; transition: none; }
+@media (prefers-reduced-motion: reduce) { .term-bar, .term-tools { animation: none; transition: none; } }

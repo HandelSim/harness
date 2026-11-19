@@ -1,0 +1,113 @@
+/* dockview themed onto the design tokens. Panels are floating glass cards separated by a 6px gap. */
+.dockview-theme-harness {
+  color-scheme: inherit;
+  --dv-paneview-active-outline-color: var(--accent-9);
+  --dv-tabs-and-actions-container-font-size: var(--text-12);
+  --dv-tabs-and-actions-container-height: var(--tab-h);
+  --dv-drag-over-background-color: color-mix(in oklab, var(--accent-9) 14%, transparent);
+  --dv-drag-over-border-color: color-mix(in oklab, var(--accent-9) 60%, transparent);
+  --dv-drag-over-border: 1px solid var(--dv-drag-over-border-color);
+  --dv-tabs-container-scrollbar-color: var(--border-strong);
+  --dv-icon-hover-background-color: var(--surface-hover);
+  --dv-floating-box-shadow: var(--shadow-3);
+  --dv-floating-border: 1px solid var(--border-strong);
+  --dv-floating-group-border: 1px solid var(--border-strong);
+  --dv-overlay-z-index: 999;
+  --dv-tab-font-size: var(--text-12);
+  --dv-border-radius: var(--r-lg);
+  --dv-tab-margin: 0;
+  --dv-sash-color: transparent;
+  --dv-active-sash-color: var(--accent-9);
+  --dv-active-sash-transition-duration: var(--dur-base);
+  --dv-active-sash-transition-delay: 150ms;
+  --dv-spacing-padding: 0;
+  --dv-tab-border-radius: var(--r-sm);
+  --dv-sash-border-radius: var(--r-pill);
+  --dv-dropdown-border-radius: var(--r-md);
+  --dv-tab-close-icon-size: 12px;
+  --dv-edge-dock-indicator-color: var(--accent-9);
+  --dv-edge-drop-strip-size: 6px;
+  --dv-floating-group-dragging-opacity: 0.85;
+  --dv-floating-titlebar-height: 28px;
+  --dv-floating-titlebar-background-color: var(--surface-2);
+  --dv-floating-titlebar-border-bottom: 1px solid var(--border);
+  --dv-group-view-background-color: var(--surface-panel);
+  --dv-tabs-and-actions-container-background-color: var(--surface-1);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--surface-panel);
+  --dv-activegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--surface-panel);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-tab-divider-color: transparent;
+  --dv-activegroup-visiblepanel-tab-color: var(--text-1);
+  --dv-activegroup-hiddenpanel-tab-color: var(--text-2);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--text-2);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--text-3);
+  --dv-separator-border: transparent;
+  --dv-paneview-header-border-color: var(--border);
+  --dv-tab-group-color-default: var(--accent-9);
+  --dv-tab-group-chip-background: var(--surface-2);
+  --dv-tab-group-line-color: var(--accent-9);
+  font-family: var(--font-ui);
+  background: transparent;
+  padding: var(--dock-gap);
+  box-sizing: border-box;
+}
+.dockview-theme-harness .dv-resize-container:has(> .dv-groupview),
+.dockview-theme-harness .dv-groupview {
+  border-radius: var(--r-lg);
+}
+.dockview-theme-harness .dv-groupview {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), var(--shadow-1);
+  background: var(--surface-panel);
+}
+.dockview-theme-harness .dv-groupview.dv-active-group {
+  border-color: var(--border-strong);
+}
+.dockview-theme-harness .dv-tabs-and-actions-container {
+  border-bottom: 1px solid var(--border);
+  padding: 0 4px;
+  gap: 2px;
+}
+.dockview-theme-harness .dv-tab {
+  padding: 0 !important;
+  margin: 5px 1px;
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-fast) var(--ease-out, ease-out), color var(--dur-fast);
+}
+.dockview-theme-harness .dv-tab:hover { background: var(--surface-hover); }
+.dockview-theme-harness .dv-tab.dv-active-tab { box-shadow: inset 0 0 0 1px var(--border); }
+.dockview-theme-harness .dv-groupview.dv-active-group .dv-tab.dv-active-tab { box-shadow: inset 0 0 0 1px var(--border-strong), inset 0 -2px 0 var(--accent-9); }
+.dockview-theme-harness .dv-tab:focus-visible { outline: 2px solid var(--accent-9); outline-offset: -2px; }
+.dockview-theme-harness .dv-sash { border-radius: var(--r-pill); }
+.dockview-theme-harness .dv-watermark { background: transparent; }
+
+/* custom tab content */
+.htab {
+  display: flex; align-items: center; gap: 6px; height: 100%; padding: 0 6px 0 10px; max-width: 220px;
+  font-size: var(--text-12); white-space: nowrap; user-select: none;
+}
+.htab-label { overflow: hidden; text-overflow: ellipsis; }
+.htab-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: transparent; }
+.htab-dot--running, .htab-dot--working { background: var(--ok-solid); }
+.htab-dot--working { animation: dv-pulse 1.4s ease-in-out infinite; }
+.htab-dot--starting { background: var(--warn-solid); }
+.htab-dot--error { background: var(--err-solid); }
+.htab-dot--attention { background: var(--accent-9); }
+.htab-dot--ended { background: var(--text-3); }
+.htab-dot--idle { display: none; }
+.htab-close {
+  display: grid; place-items: center; width: 18px; height: 18px; border: 0; border-radius: var(--r-xs);
+  background: transparent; color: var(--text-3); opacity: 0; cursor: pointer; padding: 0;
+  transition: opacity var(--dur-fast), background-color var(--dur-fast);
+}
+.dv-tab:hover .htab-close, .dv-active-tab .htab-close { opacity: 1; }
+.htab-close:hover { background: var(--surface-hover); color: var(--text-1); }
+@keyframes dv-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+.dockview-theme-harness .dv-content-container { position: relative; }
+.panel-body { position: absolute; inset: 0; overflow: hidden; }
+.dock-watermark { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text-3); }
+.dock-watermark-inner { display: grid; gap: 10px; min-width: 220px; }
+.dock-watermark-inner .row { justify-content: space-between; gap: 24px; font-size: var(--text-12); }

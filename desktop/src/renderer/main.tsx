@@ -1,0 +1,40 @@
+// Renderer entry. All CSS is imported here (esbuild does not load CSS of lazy chunks).
+import '@fontsource-variable/inter';
+import '@fontsource-variable/jetbrains-mono';
+import '@xterm/xterm/css/xterm.css';
+import './styles/dockview-base.css';
+import './styles/tokens.css';
+import './styles/base.css';
+import './styles/glass.css';
+import './styles/dockview.css';
+import './styles/shell.css';
+import './styles/views.css';
+import './views/queue/queue.css';
+import './views/ticket/ticket.css';
+import './views/terminal/terminal.css';
+import './views/session/session.css';
+import './views/settings/settings.css';
+import './views/keys/keys.css';
+import './views/transcript/transcript.css';
+import { render } from 'preact';
+import { App } from './shell/App';
+import { bindAppearance, startApp } from './core/app';
+import { registerDefaultCommands, bindKeymap, commands } from './shell/commands';
+import { registerPanels } from './shell/registry';
+import { startBackground } from './core/background';
+import { on } from './core/bridge';
+import { flushState } from './core/app';
+import { saveLayoutNow } from './shell/dock';
+
+bindAppearance();
+registerPanels();
+registerDefaultCommands();
+bindKeymap();
+on('menu:command', ({ command }) => { void commands.run(command, { source: 'menu' }); });
+on('app:will-quit', () => { saveLayoutNow(); flushState(); });
+window.addEventListener('beforeunload', () => { saveLayoutNow(); flushState(); });
+const bgRoot = document.getElementById('bg-root');
+if (bgRoot) void startBackground(bgRoot);
+void Promise.race([startApp(), new Promise((r) => setTimeout(r, 1500))]).finally(() => {
+  render(<App />, document.getElementById('app')!);
+});

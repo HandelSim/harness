@@ -1,0 +1,44 @@
+/* New session dialog (W2): 480 px, folder row + path status + recents chips, mode cards, options grid. */
+.dialog.ns { width: min(480px, calc(100vw - 32px)); }
+.ns .dialog-body { gap: var(--sp-4); }
+.ns-folder-row { display: flex; gap: var(--sp-2); align-items: center; }
+.ns-folder-row .input { min-width: 0; }
+.ns-path-line { min-height: 18px; display: flex; align-items: center; }
+.ns-path { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--text-12); color: var(--ok-text, var(--text-2)); }
+.ns-path--err { color: var(--err-text, var(--err-solid)); }
+.ns-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: var(--sp-1); }
+.ns-dot--wait { background: var(--text-3); animation: ns-pulse 1s ease-in-out infinite; }
+@keyframes ns-pulse { 50% { opacity: 0.35; } }
+
+.ns-recents { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: 2px; }
+.ns-recent {
+  display: inline-flex; align-items: center; gap: var(--sp-1); max-width: 160px; height: 24px; padding: 0 var(--sp-2);
+  border: 1px solid var(--border-subtle); border-radius: var(--r-sm); background: var(--surface-1);
+  color: var(--text-2); font: inherit; font-size: var(--text-12); cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.ns-recent:hover { background: var(--surface-hover); color: var(--text-1); }
+.ns-recent.is-on { border-color: color-mix(in oklab, var(--accent-9) 55%, transparent); background: var(--accent-3); color: var(--accent-11); }
+
+.ns-kinds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-2); }
+.ns-kind {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-subtle); border-radius: var(--r-md); background: var(--surface-1);
+  color: var(--text-1); font: inherit; text-align: left; cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+.ns-kind:hover { background: var(--surface-hover); border-color: var(--border); }
+.ns-kind.is-on { border-color: var(--accent-9); background: var(--accent-3); box-shadow: 0 0 0 1px var(--accent-9) inset; }
+.ns-kind:focus-visible { outline: 2px solid var(--accent-9); outline-offset: 1px; }
+.ns-kind__label { font-size: var(--text-13); font-weight: var(--weight-medium, 500); }
+.ns-kind__cmd { font-size: var(--text-11); color: var(--text-3); }
+.ns-kind.is-on .ns-kind__cmd { color: var(--accent-11); }
+
+.ns-opts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-2) var(--sp-4); font-size: var(--text-13); }
+.ns-ticket { display: flex; flex-direction: column; gap: var(--sp-1); margin-top: var(--sp-2); }
+.ns-consent { align-items: flex-start; }
+.ns-consent .col { gap: var(--sp-2); font-size: var(--text-13); }
+.ns footer { align-items: center; }
+.ns-keys kbd { font-size: var(--text-11); }
+:root[data-reduce-motion="1"] .ns-dot--wait { animation: none; }
+@media (prefers-reduced-motion: reduce) { .ns-dot--wait { animation: none; } }

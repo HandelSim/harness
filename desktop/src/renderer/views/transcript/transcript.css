@@ -1,0 +1,27 @@
+/* Transcript panel (3.7) and Sessions view (3.6) */
+.transcript { display: flex; flex-direction: column; height: 100%; min-height: 0; position: relative; }
+.transcript-list { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-3) var(--sp-4) var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); }
+.tmsg { display: flex; flex-direction: column; gap: var(--sp-2); max-width: 860px; width: 100%; margin: 0 auto; }
+.tmsg--user { padding: var(--sp-3) var(--sp-4); border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 0 var(--glass-highlight); }
+.tmsg-head { display: flex; gap: var(--sp-3); align-items: baseline; }
+.tmsg-role { color: var(--text-2); font-weight: 600; }
+.tpart { border: 1px solid var(--border-subtle); border-radius: var(--r-sm); background: var(--surface-1); }
+.tpart > summary { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-3); cursor: pointer; color: var(--text-2);
+  font-size: var(--text-12); list-style: none; }
+.tpart > summary::-webkit-details-marker { display: none; }
+.tpart[open] > summary { border-bottom: 1px solid var(--border-subtle); }
+.tpart--think { border-style: dashed; }
+.tpart--think > :not(summary) { padding: var(--sp-2) var(--sp-3); color: var(--text-2); }
+.tpre { margin: 0; padding: var(--sp-2) var(--sp-3); max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: var(--text-12); }
+.tpre + .tpre { border-top: 1px solid var(--border-subtle); }
+.transcript-compose { display: flex; gap: var(--sp-2); align-items: flex-end; padding: var(--sp-2) var(--sp-3); border-top: 1px solid var(--border-subtle); background: var(--surface-1); }
+.transcript-compose textarea { flex: 1; resize: vertical; min-height: 40px; max-height: 200px; }
+.transcript-why { padding: var(--sp-2) var(--sp-4); border-top: 1px solid var(--border-subtle); }
+.transcript .tk-newpill { position: absolute; left: 50%; bottom: 72px; transform: translateX(-50%); }
+.sessions-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.slist { overflow: auto; padding: var(--sp-2); }
+.srow { display: grid; grid-template-columns: 8px minmax(0, 1fr) minmax(0, 160px) minmax(0, 110px) 120px 72px; gap: var(--sp-3); }
+.srow-num { text-align: right; }
+@container (max-width: 640px) { .srow { grid-template-columns: 8px minmax(0, 1fr) 72px; } .srow > :nth-child(3), .srow > :nth-child(4), .srow > :nth-child(5) { display: none; } }
+.sessions-view { container-type: inline-size; }

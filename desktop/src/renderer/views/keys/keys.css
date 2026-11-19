@@ -1,0 +1,10 @@
+/* Keys view (3.11) */
+.keys-body { overflow: auto; padding: var(--sp-5) var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-5); max-width: 880px; }
+.keys-group { display: flex; flex-direction: column; gap: var(--sp-2); }
+.keys-card { padding: 0; overflow: hidden; }
+.key-row { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--border-subtle); }
+.key-row:last-child { border-bottom: 0; }
+.key-row[data-active="1"] { background: linear-gradient(90deg, color-mix(in oklab, var(--accent-9) 8%, transparent), transparent 60%); }
+.key-warn { color: var(--warn-text); }
+.progress { height: 4px; border-radius: var(--r-pill); background: var(--surface-2); overflow: hidden; margin: var(--sp-2) 0; }
+.progress > span { display: block; height: 100%; background: var(--accent-9); transform-origin: left; transition: transform var(--dur-base) var(--ease-out); }

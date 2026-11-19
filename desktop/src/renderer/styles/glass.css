@@ -1,0 +1,32 @@
+/* Glass recipe (DR (c)). Chrome panels: translucent fill + crisp borders + inner highlight, NO backdrop-filter
+   (the background is rendered soft at low resolution). Real backdrop-filter only on .glass--overlay. */
+.glass {
+  position: relative;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-lg);
+  box-shadow: inset 0 1px 0 0 var(--glass-highlight), inset 0 0 0 1px rgba(255,255,255,0.015), var(--shadow-2);
+  isolation: isolate;
+}
+.glass::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background-image: var(--noise-url, none); background-size: 128px;
+  opacity: var(--noise-opacity); mix-blend-mode: overlay; z-index: -1;
+}
+.glass--flat { border-radius: 0; border-width: 0; box-shadow: none; }
+.glass--overlay {
+  position: relative;
+  background: var(--glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-xl);
+  box-shadow: inset 0 1px 0 0 var(--glass-highlight), var(--shadow-4);
+  isolation: isolate;
+}
+[data-glass="off"] .glass, [data-glass="off"] .glass--flat { background: var(--surface-1); }
+[data-glass="off"] .glass--overlay { -webkit-backdrop-filter: none; backdrop-filter: none; background: var(--surface-1); }
+@media (prefers-reduced-transparency: reduce) {
+  .glass, .glass--flat { background: var(--surface-1); }
+  .glass--overlay { -webkit-backdrop-filter: none; backdrop-filter: none; background: var(--surface-1); }
+}
