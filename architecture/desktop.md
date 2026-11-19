@@ -15,6 +15,18 @@ main (Node 24, out/main/index.cjs)
  └─ child: `bash <root>/harness <cmd>` (CLI runner: config, unlock, check-updates, upgrade, doctor)
 ```
 
+- Windows: `bash` is Git Bash's `Git\bin\bash.exe`, resolved once by
+  `src/main/bash.ts`. It checks `HARNESS_DESKTOP_BASH`, then Program Files,
+  then per-user and scoop installs, then a `git.exe` on PATH. It never uses
+  WSL's `System32\bash.exe`, which is what `bash` on a shortcut's PATH
+  usually is.
+  - Children start with `windowsHide` and are stopped with `taskkill /T`,
+    since Windows has no process groups.
+  - The plain terminal is `bash --login -i`.
+  - `stateId` applies `ntpath.normcase` (lowercase, backslashes) so that it
+    matches `pub.py`.
+  - `app.setAppUserModelId('dev.harness.desktop')` matches the NSIS
+    shortcut, so a pinned taskbar icon groups the running window.
 - The renderer does no network I/O. Main talks to serve over `node:http` on
   loopback, so requests carry no Origin/Referer/Sec-Fetch headers. Serve's
   session cookie is kept in main's memory only.
@@ -258,5 +270,15 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
     one with `setRoute(key, data, status)`.
 - `--smoke-test` is the packaged smoke. It loads the window, checks the
   bridge, echoes through a PTY and exits 0 or 1, and never starts a backend.
+- Installing on this machine: `harness desktop install` builds this OS's
+  target and installs it (see `harness-cli.md`):
+  - Windows: per-user NSIS, with Start-menu and desktop shortcuts named Harness.
+  - macOS: `~/Applications`, ad-hoc signed.
+  - Linux: `~/.local/share` plus a `.desktop` entry.
+  - `harness desktop` launches the app detached, and reinstalls first when
+    `desktop/` changed.
+- Icon: `build/icon.png` (1024px, a Lorenz attractor) comes from
+  `scripts/gen-icon.py` via `rsvg-convert`. electron-builder derives the
+  `.ico` and `.icns` from it.
 - CI workflows ship as `desktop/ci/*.yml`, for the owner to move into
   `.github/workflows/`.

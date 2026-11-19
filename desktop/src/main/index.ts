@@ -27,6 +27,8 @@ const env = readEnv();
 if (env.userData) app.setPath('userData', resolve(env.userData));
 if (env.disableGpu) app.disableHardwareAcceleration();
 registerScheme();
+// Windows: the taskbar groups windows, pins and notifications by this id; it matches the NSIS shortcut's (appId).
+if (process.platform === 'win32') app.setAppUserModelId('dev.harness.desktop');
 
 // L6: a second instance exits at once and touches nothing (no store loads / corrupt-file moves, no ready work).
 const secondary = !env.e2e && !app.requestSingleInstanceLock();

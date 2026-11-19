@@ -38,7 +38,8 @@ export function locateRoot(i: LocateIn, fs: Fs = realFs): { root: string | null;
 }
 
 /** serve's state_id: sha256(normcase(realpath(state_dir)))[:16] (pub.py state_id). */
-export function stateId(root: string, fs: Fs = realFs): string {
-  const p = fs.realpath(join(root, 'state'));
+export function stateId(root: string, fs: Fs = realFs, platform: NodeJS.Platform = process.platform): string {
+  let p = fs.realpath(join(root, 'state'));
+  if (platform === 'win32') p = p.replace(/\//g, '\\').toLowerCase(); // ntpath.normcase
   return createHash('sha256').update(p, 'utf8').digest('hex').slice(0, 16);
 }

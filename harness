@@ -2904,6 +2904,13 @@ commands:
   serve [--port N]      serve the pub page (the active vault's pub/*.html and
                         service links) and opencode web on 127.0.0.1, over the
                         host-mode proxy (see 'harness serve --help')
+  desktop [install|where]
+                        run the desktop app (the GUI for agent sessions, the
+                        queue, settings and keys), detached. The first run, and
+                        the first after an upgrade changed desktop/, builds and
+                        installs it (Windows: Start menu + Desktop shortcut;
+                        macOS: ~/Applications; Linux: app menu). Needs Node.js
+                        22+. See 'harness desktop --help'.
   vault [subcmd]        register git repos as vaults (the agent's notes and
                         docs) or make a new one, and pick the active one;
                         launches clone it into
@@ -13655,6 +13662,420 @@ cmd_benchmark() {
     esac
 }
 
+# --- desktop ------------------------------------------------------------------
+#
+# `harness desktop` turns desktop/ (the Electron app) into an installed app for
+# this OS and launches it detached: Windows gets electron-builder's per-user
+# NSIS install with Start-menu and Desktop shortcuts, macOS
+# ~/Applications/Harness.app, Linux an unpacked app under ~/.local/share plus a
+# .desktop entry. The build stamp (state/desktop/installed) is desktop/'s git
+# tree hash at HEAD, so the first launch after `harness upgrade` changed
+# desktop/ rebuilds first. See architecture/harness-cli.md "`desktop`".
+#
+# Test hooks: HARNESS_DESKTOP_OS forces the OS branch and
+# HARNESS_DESKTOP_PROC_SYS replaces /proc/sys/kernel (the Linux sandbox probe);
+# every external command (node, npm, npx, git, cygpath, cmd.exe, open, ditto,
+# codesign, xattr, setsid) is looked up on PATH.
+
+_desktop_help() {
+    cat <<'HELP'
+usage: harness desktop [start]   launch the desktop app; installs it first when
+                                 it is missing, or rebuilds it when desktop/
+                                 changed since it was built (after an upgrade)
+       harness desktop install   build desktop/ and install it for this OS
+       harness desktop where     print the installed app and whether it is current
+
+The desktop app is the Electron GUI in desktop/: tabbed agent sessions, the
+ticket queue, settings and keys. Building needs Node.js 22 or newer with npm.
+'install' runs npm ci (only when package-lock.json changed), the production
+build and electron-builder, then installs:
+  Windows  per user, %LOCALAPPDATA%\Programs\Harness\Harness.exe, with
+           "Harness" shortcuts in the Start menu and on the Desktop (right-click
+           either, or the running app's taskbar button, to pin it)
+  macOS    ~/Applications/Harness.app (ad-hoc signed)
+  Linux    ~/.local/share/harness-desktop/app, with a "Harness" entry in the
+           application menu (~/.local/share/applications/harness-desktop.desktop)
+A failed build leaves the previous install as it was. The app is started
+detached, so closing this terminal does not close it.
+HELP
+}
+
+_desktop_os() {
+    local o="${HARNESS_DESKTOP_OS:-}"
+    [[ -n "$o" ]] || o=$(harness_detect_os 2>/dev/null) || o=unknown
+    printf '%s' "${o:-unknown}"
+}
+
+_desktop_unsupported() {
+    err "desktop: not supported on '$1' (Windows Git Bash, macOS and Linux are)"
+}
+
+# The installed app's executable (macOS: the .app bundle) for OS $1.
+_desktop_app_path() {
+    case "$1" in
+        windows) printf '%s/Programs/Harness/Harness.exe' \
+                     "$(harness_posix_path "${LOCALAPPDATA:-$HOME/AppData/Local}")" ;;
+        macos)   printf '%s/Applications/Harness.app' "$HOME" ;;
+        linux)   printf '%s/harness-desktop/app/harness-desktop' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+        *)       return 1 ;;
+    esac
+}
+
+# The stamp of the current desktop/ source: its git tree hash at HEAD, else
+# (no git, not a clone) package.json's version. Always prints something and is
+# computed the same way at install and at launch, so it never rebuilds in a loop.
+_desktop_source_stamp() {
+    local t v
+    t=$(git -C "$clone_dir" rev-parse -q --verify 'HEAD:./desktop' 2>/dev/null) || t=""
+    if [[ -n "$t" ]]; then
+        printf 'tree:%s' "$t"
+        return 0
+    fi
+    v=$(grep -m1 '"version"' "$clone_dir/desktop/package.json" 2>/dev/null \
+        | sed 's/.*"version"[^"]*"\([^"]*\)".*/\1/') || v=""
+    printf 'version:%s' "${v:-unknown}"
+}
+
+# 0 = installed and built from the current source, 1 = not installed, 2 = stale.
+_desktop_status() {
+    local app have
+    app=$(_desktop_app_path "$1") || return 1
+    [[ -e "$app" ]] || return 1
+    have=$(cat "$state_root/desktop/installed" 2>/dev/null) || return 2
+    [[ "$have" == "$(_desktop_source_stamp)" ]] || return 2
+}
+
+_desktop_node_hint() {
+    case "$1" in
+        windows) echo "  install it:  winget install OpenJS.NodeJS.LTS   (then open a new Git Bash window)" ;;
+        macos)   echo "  install it:  brew install node   (or the LTS installer from https://nodejs.org)" ;;
+        *)       echo "  install Node.js 22 or newer with your package manager, nvm, or from https://nodejs.org" ;;
+    esac
+}
+
+_desktop_check_node() {
+    local v major
+    if ! command -v node >/dev/null 2>&1; then
+        err "desktop: building the app needs Node.js 22 or newer, and node is not on PATH"
+        _desktop_node_hint "$1" >&2
+        return 1
+    fi
+    v=$(node -v 2>/dev/null) || v=""
+    v=${v//$'\r'/}
+    major=${v#v}; major=${major%%.*}
+    if [[ ! "$major" =~ ^[0-9]+$ ]] || (( major < 22 )); then
+        err "desktop: building the app needs Node.js 22 or newer; this node is ${v:-unknown}"
+        _desktop_node_hint "$1" >&2
+        return 1
+    fi
+    if ! command -v npm >/dev/null 2>&1 || ! command -v npx >/dev/null 2>&1; then
+        err "desktop: npm/npx not found next to node $v (they ship with Node.js)"
+        _desktop_node_hint "$1" >&2
+        return 1
+    fi
+}
+
+# electron-builder's name for this machine's CPU (x64 or arm64).
+_desktop_arch() {
+    local m
+    if [[ "$1" == windows ]]; then
+        m="${PROCESSOR_ARCHITEW6432:-${PROCESSOR_ARCHITECTURE:-AMD64}}"
+    else
+        m=$(uname -m 2>/dev/null) || m=""
+    fi
+    case "$m" in
+        x86_64|amd64|AMD64|x64) echo x64 ;;
+        arm64|aarch64|ARM64)    echo arm64 ;;
+        *) err "desktop: no desktop build for CPU '$m' (x64 and arm64 are supported)"; return 1 ;;
+    esac
+}
+
+_desktop_file_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        cksum "$1" | cut -d' ' -f1,2
+    fi
+}
+
+# Prints --no-sandbox when Electron's Chromium sandbox cannot start on this
+# Linux: chrome-sandbox is not setuid root (a copy made as the user never is)
+# AND unprivileged user namespaces are blocked (Ubuntu 23.10+'s AppArmor
+# restriction, or Debian's unprivileged_userns_clone=0). Otherwise the sandbox
+# works and stays on. $1 is the app directory.
+_desktop_linux_sandbox_flag() {
+    local sb="$1/chrome-sandbox" k="${HARNESS_DESKTOP_PROC_SYS:-/proc/sys/kernel}" v
+    if [[ -u "$sb" && "$(stat -c %u "$sb" 2>/dev/null)" == 0 ]]; then
+        return 0
+    fi
+    v=$(cat "$k/apparmor_restrict_unprivileged_userns" 2>/dev/null) || v=""
+    if [[ "$v" == 1 ]]; then
+        printf -- '--no-sandbox'
+        return 0
+    fi
+    v=$(cat "$k/unprivileged_userns_clone" 2>/dev/null) || v=""
+    [[ "$v" != 0 ]] || printf -- '--no-sandbox'
+}
+
+# A .desktop Exec= argument: bare when it holds only safe characters, else
+# double-quoted with the spec's escapes (\ " ` $ need a backslash, which the
+# string-value rule then doubles; % is %%).
+_desktop_exec_arg() {
+    # shellcheck disable=SC1003  # a lone backslash, not an escaped quote
+    local s="$1" bs='\'
+    if [[ "$s" =~ ^[A-Za-z0-9_./+-]+$ ]]; then
+        printf '%s' "$s"
+        return 0
+    fi
+    s=${s//"$bs"/"$bs$bs$bs$bs"}
+    s=${s//\"/"$bs$bs"\"}
+    s=${s//\`/"$bs$bs"\`}
+    s=${s//\$/"$bs$bs"\$}
+    s=${s//%/%%}
+    printf '"%s"' "$s"
+}
+
+# Put the fully copied $1 in place of $2, keeping the old one ($3) until then.
+_desktop_swap() {
+    local new="$1" dest="$2" old="$3"
+    if [[ -e "$dest" ]] && ! mv "$dest" "$old"; then
+        err "desktop: could not move the old app aside ($dest)"
+        rm -rf "$new"
+        return 1
+    fi
+    if ! mv "$new" "$dest"; then
+        err "desktop: could not move the new app into place ($dest)"
+        if [[ -e "$old" ]]; then mv "$old" "$dest" || true; fi
+        return 1
+    fi
+    rm -rf "$old"
+}
+
+_desktop_install_windows() {
+    local src="$1" arch="$2" app="$3" inst="" f
+    for f in "$src"/dist/Harness-*-win-"$arch".exe; do
+        [[ -f "$f" ]] || continue
+        if [[ -z "$inst" || "$f" -nt "$inst" ]]; then inst="$f"; fi
+    done
+    if [[ -z "$inst" ]]; then
+        err "desktop: electron-builder did not produce $src/dist/Harness-*-win-$arch.exe"
+        return 1
+    fi
+    echo "harness desktop: running the installer silently ($(basename "$inst"))"
+    # /S must reach NSIS as is: no MSYS path conversion (it would become S:/).
+    if ! MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$inst" /S; then
+        err "desktop: the installer failed ($inst)"
+        return 1
+    fi
+    if [[ ! -f "$app" ]]; then
+        err "desktop: the installer finished but $app is missing (installed in another folder before? uninstall Harness in Settings > Apps, then rerun 'harness desktop install')"
+        return 1
+    fi
+}
+
+_desktop_install_macos() {
+    local src="$1" arch="$2" out apps dest new old
+    out="$src/dist/mac/Harness.app"
+    [[ "$arch" == x64 ]] || out="$src/dist/mac-$arch/Harness.app"
+    if [[ ! -d "$out" ]]; then
+        err "desktop: electron-builder did not produce $out"
+        return 1
+    fi
+    apps="$HOME/Applications"; dest="$apps/Harness.app"
+    new="$apps/.Harness.app.new"; old="$apps/.Harness.app.old"
+    rm -rf "$new" "$old"
+    if ! { mkdir -p "$apps" && ditto "$out" "$new"; }; then
+        err "desktop: could not copy the app to $new"
+        rm -rf "$new"
+        return 1
+    fi
+    # electron-builder edited the unsigned bundle; Apple Silicon refuses to run
+    # it until it is signed again (ad hoc is enough for a local build).
+    if ! codesign --force --deep -s - "$new"; then
+        err "desktop: ad-hoc signing (codesign) failed; the installed app was left as it was"
+        rm -rf "$new"
+        return 1
+    fi
+    xattr -dr com.apple.quarantine "$new" 2>/dev/null || true
+    _desktop_swap "$new" "$dest" "$old"
+}
+
+_desktop_install_linux() {
+    local src="$1" arch="$2" out data base dest new old flag icondir appsdir entry
+    out="$src/dist/linux-unpacked"
+    [[ "$arch" == x64 ]] || out="$src/dist/linux-$arch-unpacked"
+    if [[ ! -x "$out/harness-desktop" ]]; then
+        err "desktop: electron-builder did not produce $out/harness-desktop"
+        return 1
+    fi
+    data="${XDG_DATA_HOME:-$HOME/.local/share}"
+    base="$data/harness-desktop"; dest="$base/app"
+    new="$base/app.new"; old="$base/app.old"
+    rm -rf "$new" "$old"
+    if ! { mkdir -p "$base" && cp -a "$out" "$new"; }; then
+        err "desktop: could not copy the app to $new"
+        rm -rf "$new"
+        return 1
+    fi
+    _desktop_swap "$new" "$dest" "$old" || return 1
+
+    icondir="$data/icons/hicolor/512x512/apps"; appsdir="$data/applications"
+    entry="$appsdir/harness-desktop.desktop"
+    flag=$(_desktop_linux_sandbox_flag "$dest")
+    # StartupWMClass: Electron sets the window class to app.name, which is
+    # package.json's productName ("Harness").
+    if ! { mkdir -p "$icondir" "$appsdir" \
+            && cp "$src/build/icon.png" "$icondir/harness-desktop.png" \
+            && printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Harness' \
+                   'Comment=harness desktop: agent sessions, the ticket queue, settings and keys' \
+                   "Exec=$(_desktop_exec_arg "$dest/harness-desktop")${flag:+ $flag} %U" \
+                   'Icon=harness-desktop' 'Terminal=false' 'Categories=Development;' \
+                   'StartupWMClass=Harness' >"$entry.tmp" \
+            && mv "$entry.tmp" "$entry"; }; then
+        err "desktop: could not write the menu entry $entry"
+        rm -f "$entry.tmp"
+        return 1
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q "$appsdir" >/dev/null 2>&1 || true
+    fi
+}
+
+_desktop_install() {
+    local os src sd arch app stamp lock lock_hash suf rc
+    local -a eb
+    os=$(_desktop_os)
+    app=$(_desktop_app_path "$os") || { _desktop_unsupported "$os"; return 1; }
+    src="$clone_dir/desktop"; sd="$state_root/desktop"
+    if [[ ! -f "$src/package.json" || ! -f "$src/package-lock.json" ]]; then
+        err "desktop: no desktop app source at $src (package.json/package-lock.json missing)"
+        return 1
+    fi
+    _desktop_check_node "$os" || return 1
+    arch=$(_desktop_arch "$os") || return 1
+    mkdir -p "$sd" || return 1
+    # Taken before building: a commit landing mid-build then reads as stale.
+    stamp=$(_desktop_source_stamp)
+
+    lock="$src/package-lock.json"
+    lock_hash=$(_desktop_file_hash "$lock" 2>/dev/null) || lock_hash=""
+    if [[ ! -d "$src/node_modules" || -z "$lock_hash" \
+          || "$(cat "$sd/lock-hash" 2>/dev/null || true)" != "$lock_hash" ]]; then
+        echo "harness desktop: installing dependencies (npm ci)"
+        rm -f "$sd/lock-hash"
+        if ! (cd "$src" && npm ci); then
+            err "desktop: npm ci failed (output above); the installed app was left as it was"
+            return 1
+        fi
+        [[ -z "$lock_hash" ]] || printf '%s\n' "$lock_hash" >"$sd/lock-hash"
+    fi
+
+    echo "harness desktop: building (node scripts/build.mjs --prod)"
+    if ! (cd "$src" && node scripts/build.mjs --prod); then
+        err "desktop: the build failed (output above); the installed app was left as it was"
+        return 1
+    fi
+
+    suf=""; [[ "$arch" == x64 ]] || suf="-$arch"
+    # -c.npmRebuild=false on Windows/macOS: node-pty ships N-API prebuilds there (npm ci skips compiling), and
+    # electron-builder's rebuild would compile it anyway, needing VS Build Tools / Xcode. Linux compiled it at npm ci.
+    case "$os" in
+        windows) eb=(--win nsis "--$arch" -c.npmRebuild=false); rm -f "$src"/dist/Harness-*-win-"$arch".exe ;;
+        macos)   eb=(--mac dir "--$arch" -c.npmRebuild=false);  rm -rf "$src/dist/mac$suf" ;;
+        linux)   eb=(--linux dir "--$arch"); rm -rf "$src/dist/linux$suf-unpacked" ;;
+    esac
+    echo "harness desktop: packaging for $os $arch (electron-builder)"
+    rc=0
+    # No signing identity on macOS: the bundle is ad-hoc signed after the copy.
+    (cd "$src" && { [[ "$os" != macos ]] || export CSC_IDENTITY_AUTO_DISCOVERY=false; } \
+        && npx --no-install electron-builder "${eb[@]}" --publish never) || rc=$?
+    if (( rc != 0 )); then
+        err "desktop: electron-builder failed (output above); the installed app was left as it was"
+        return 1
+    fi
+
+    "_desktop_install_$os" "$src" "$arch" "$app" || return 1
+    printf '%s\n' "$stamp" >"$sd/installed"
+    echo "harness desktop: installed $app"
+}
+
+_desktop_launch() {
+    local os="$1" app="$2" flag w r
+    case "$os" in
+        windows)
+            w=$(cygpath -w "$app") || w="$app"
+            r=$(cygpath -w "$clone_dir") || r="$clone_dir"
+            echo "harness desktop: starting $w"
+            # `start ""` detaches it from this terminal; /c must not be path-converted.
+            HARNESS_DESKTOP_ROOT="$r" MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+                cmd.exe /c start "" "$w" || { err "desktop: could not start $w"; return 1; }
+            ;;
+        macos)
+            echo "harness desktop: starting $app"
+            HARNESS_DESKTOP_ROOT="$clone_dir" open -a "$app" || { err "desktop: could not start $app"; return 1; }
+            ;;
+        linux)
+            if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+                err "desktop: no graphical session here (DISPLAY and WAYLAND_DISPLAY are unset); start it from the application menu, or run this in a desktop terminal"
+                return 1
+            fi
+            flag=$(_desktop_linux_sandbox_flag "$(dirname "$app")")
+            echo "harness desktop: starting $app${flag:+ $flag}"
+            if command -v setsid >/dev/null 2>&1 \
+                && HARNESS_DESKTOP_ROOT="$clone_dir" setsid -f "$app" ${flag:+"$flag"} >/dev/null 2>&1 </dev/null; then
+                return 0
+            fi
+            HARNESS_DESKTOP_ROOT="$clone_dir" nohup "$app" ${flag:+"$flag"} >/dev/null 2>&1 </dev/null &
+            disown 2>/dev/null || true
+            ;;
+    esac
+}
+
+_desktop_start() {
+    local os app st=0
+    os=$(_desktop_os)
+    app=$(_desktop_app_path "$os") || { _desktop_unsupported "$os"; return 1; }
+    _desktop_status "$os" || st=$?
+    case "$st" in
+        0) ;;
+        1) echo "harness desktop: the desktop app is not installed yet; building and installing it first (a few minutes)"
+           _desktop_install || return 1 ;;
+        *) echo "harness desktop: desktop/ changed since the installed app was built (an upgrade?); rebuilding it first"
+           _desktop_install || return 1 ;;
+    esac
+    _desktop_launch "$os" "$app"
+}
+
+_desktop_where() {
+    local os app st=0
+    os=$(_desktop_os)
+    app=$(_desktop_app_path "$os") || { _desktop_unsupported "$os"; return 1; }
+    _desktop_status "$os" || st=$?
+    case "$st" in
+        0) echo "$app"; echo "current: built from this desktop/ ($(_desktop_source_stamp))" ;;
+        1) echo "not installed (it would be $app; 'harness desktop install' builds it)"; return 1 ;;
+        *) echo "$app"; echo "stale: desktop/ changed since it was built ('harness desktop' rebuilds it)" ;;
+    esac
+}
+
+cmd_desktop() {
+    local sub="${1:-start}"
+    (( $# )) && shift
+    case "$sub" in
+        -h|--help|help) _desktop_help ;;
+        start)          _desktop_start ;;
+        install)        _desktop_install ;;
+        where)          _desktop_where ;;
+        *)
+            err "desktop: unknown subcommand '$sub'"
+            _desktop_help >&2
+            return 1
+            ;;
+    esac
+}
+
 # --- dispatch ---------------------------------------------------------------
 
 main() {
@@ -13708,6 +14129,7 @@ main() {
         ticket)                     cmd_ticket "$@" ;;
         context)                    cmd_context "$@" ;;
         serve)                      cmd_serve "$@" ;;
+        desktop)                    cmd_desktop "$@" ;;
         unlock)                     cmd_unlock "$@" ;;
         probe)                      cmd_probe "$@" ;;
         config)                     cmd_config "$@" ;;

@@ -6,6 +6,7 @@ import type { PtyInfo } from '../../shared/ipc';
 import { buildArgv, cleanSpec } from './spec';
 import { log } from '../log';
 import type { handle as Handle, listen as Listen, v as V } from '../ipc';
+import { bashPath } from '../bash';
 
 const REPLAY = 256 * 1024;
 export const EXIT_KEEP_MS = 60000;            // an exited terminal stays attachable this long (renderer reload)
@@ -99,7 +100,7 @@ export class PtyClient {
   async spawn(rawSpec: unknown, cols: number, rows: number) {
     const spec = cleanSpec(rawSpec);
     if (!spec) return { ok: false as const, error: { code: 'bad-spec', message: 'invalid terminal spec' } };
-    const r = buildArgv(spec, { root: this.d.root(), shell: process.env.SHELL, hostConsent: this.d.hostConsent() });
+    const r = buildArgv(spec, { root: this.d.root(), shell: process.env.SHELL, bash: bashPath(), hostConsent: this.d.hostConsent() });
     if (!r.ok) return r;
     const id = `t${Date.now().toString(36)}${(++this.seq).toString(36)}`;
     const res = await new Promise<{ ok: true; pid: number } | { ok: false; message: string }>((resolve) => {

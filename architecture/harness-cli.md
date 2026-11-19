@@ -162,6 +162,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help`, `debug` (an agent on harness itself; see "`debug`" below) |
 | Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove`, `ticket`, `context`, `queue`, `findings` — see "Vaults", "Tickets and context", "Ticket queue" and "Findings agent" below. |
 | Pub page | `serve` — the vault's pub pages plus opencode web, loopback only. See "`serve`" below. |
+| Desktop app | `desktop` (= `desktop start`), `desktop install`, `desktop where` — build `desktop/` into an installed app for this OS and launch it detached. See "`desktop`" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
@@ -3210,6 +3211,71 @@ Session times are epoch ms; ticket times pass through as stored.
 action against a live pub server over test_runs' fixture DB; `python3
 serve/test_api.py --dump DIR` writes each read's answer on that fixture as
 `DIR/<name>.json` for the app's mock serve.
+
+## `desktop`
+
+`cmd_desktop` turns `desktop/` (the Electron app, [`desktop.md`](desktop.md))
+into a normal installed app and starts it. Subcommands: `start` (the default),
+`install`, `where`. OS from `harness_detect_os` (`HARNESS_DESKTOP_OS` forces
+it in tests); anything but windows/macos/linux is refused.
+
+- **Build stamp.** `state/desktop/installed` holds `tree:<git rev-parse
+  HEAD:./desktop>` (the committed tree of `desktop/`), or `version:<package.json
+  version>` when git or the clone's `.git` is missing. `start` launches when
+  the installed app exists and the stamp matches; otherwise it prints one line
+  (not installed / `desktop/` changed, e.g. after `harness upgrade`), runs
+  `install`, then launches. The stamp is computed the same way at install and
+  launch, and taken before the build, so a missing git never loops and a
+  commit landing mid-build reads as stale. Uncommitted edits to `desktop/` do
+  not count — use `harness desktop install` (or `npm run dev`) for those.
+- **Install** (`_desktop_install`): needs `node` >= 22 plus `npm`/`npx` (else a
+  per-OS hint: `winget install OpenJS.NodeJS.LTS`, `brew install node`, …;
+  host mode's vendored Node 20 is not used). `npm ci` only when `node_modules`
+  is missing or the sha256 of `package-lock.json` differs from
+  `state/desktop/lock-hash`; then `node scripts/build.mjs --prod`; then
+  `npx --no-install electron-builder <os target> --<arch> --publish never`
+  (arch x64/arm64 from `uname -m`, or `PROCESSOR_ARCHITEW6432` /
+  `PROCESSOR_ARCHITECTURE` on Windows). The old output for that OS/arch is
+  removed first so a stale artifact is never installed. Per OS:
+  - *windows*: `--win nsis`; the newest `dist/Harness-*-win-<arch>.exe` runs
+    with `/S` (with `MSYS_NO_PATHCONV=1`/`MSYS2_ARG_CONV_EXCL=*`, or MSYS turns
+    `/S` into a path) and is waited for. electron-builder's per-user NSIS
+    (`perMachine: false`, productName `Harness`) installs to
+    `%LOCALAPPDATA%\Programs\Harness\Harness.exe` and creates "Harness"
+    Start-menu and Desktop shortcuts (pinnable to the taskbar). A previous
+    install in another folder (its registry `InstallLocation` wins) is
+    reported, not guessed at.
+  - *macos*: `--mac dir` (`CSC_IDENTITY_AUTO_DISCOVERY=false`), `ditto` of
+    `dist/mac[-arm64]/Harness.app` to `~/Applications/.Harness.app.new`,
+    `codesign --force --deep -s -` (Apple Silicon will not run the bundle
+    electron-builder edited until it is re-signed), quarantine xattr dropped,
+    then swapped in.
+  - *linux*: `--linux dir`, `dist/linux[-arm64]-unpacked` copied to
+    `$XDG_DATA_HOME` (default `~/.local/share`)`/harness-desktop/app` via
+    `app.new` + swap, `build/icon.png` to
+    `icons/hicolor/512x512/apps/harness-desktop.png`, and
+    `applications/harness-desktop.desktop` (`Exec=<app>/harness-desktop %U`,
+    `Icon=harness-desktop`, `StartupWMClass=Harness`: Electron's window class
+    is `app.name`, i.e. productName).
+  The stamp is written only after all of that succeeds; any failure exits
+  non-zero and leaves the previous install and stamp alone.
+- **Linux sandbox rule** (`_desktop_linux_sandbox_flag`): `--no-sandbox` is
+  added (to `Exec=` and the launch) only when `chrome-sandbox` is not setuid
+  root and unprivileged user namespaces are blocked —
+  `/proc/sys/kernel/apparmor_restrict_unprivileged_userns` is 1 or
+  `unprivileged_userns_clone` is 0 (`HARNESS_DESKTOP_PROC_SYS` overrides the
+  directory in tests). Otherwise Electron's userns sandbox works.
+- **Launch** (`_desktop_launch`), detached so closing the terminal does not
+  close the app, with `HARNESS_DESKTOP_ROOT` set to the clone for that launch
+  only: windows `cmd.exe /c start "" "<cygpath -w exe>"`; macos `open -a`;
+  linux `setsid -f` (fallback `nohup … &`), refused without `DISPLAY` /
+  `WAYLAND_DISPLAY`.
+- **`where`** prints the app path and `current: …` / `stale: …` (exit 0), or
+  `not installed …` (exit 1).
+
+Covered by `tests/unit_desktop_cmd_test.sh` (docker-free: a throwaway git
+clone of `harness` with a stub `desktop/`, and stubs on PATH for node, npm,
+npx, cygpath, cmd.exe, open, ditto, codesign, xattr, setsid and `uname -m`).
 
 ## ChatGPT backend (`harness chatgpt`)
 

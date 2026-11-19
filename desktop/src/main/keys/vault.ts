@@ -12,6 +12,7 @@ import { locksAt } from './lifecycle';
 import { classifyUnlock, probeDirect } from './probe';
 import { log } from '../log';
 import type { handle as Handle, v as V } from '../ipc';
+import { bashPath } from '../bash';
 
 export const KINDS: KeyKind[] = ['PROXY_API_KEY', 'OAI_API_KEY', 'TRACKER_TOKEN', 'CHATGPT_COOKIE_STRING', 'ACCESS_CODE'];
 interface Entry extends Omit<KeyMeta, 'locksAt'> { enc: string | null }
@@ -45,7 +46,7 @@ export function runHarnessStdin(root: string, args: string[], input: string, o: 
     let child: ReturnType<typeof spawn>;
     try {
       // K7: own process group, so a timeout also ends what the CLI forked (and the pipes they hold)
-      child = spawn('bash', [`${root}/harness`, ...args], { cwd: root, env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      child = spawn(bashPath(), [`${root}/harness`, ...args], { cwd: root, env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], detached: true, windowsHide: true });
     } catch (e) { resolve({ code: 127, stdout: '', stderr: String(e), timedOut: false }); return; }
     child.stdout!.on('data', (c: Buffer) => { if (out.length < 200_000) out += c.toString('utf8'); });
     child.stderr!.on('data', (c: Buffer) => { if (err.length < 200_000) err += c.toString('utf8'); });

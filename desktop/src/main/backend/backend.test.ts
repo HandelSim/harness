@@ -36,6 +36,12 @@ test('stateId matches pub.py state_id (sha256 of the realpath, 16 hex)', () => {
   assert.equal(stateId('/link', fs), createHash('sha256').update('/real/state').digest('hex').slice(0, 16));
 });
 
+test('stateId on Windows applies ntpath.normcase (lowercase, backslashes) like pub.py', () => {
+  const fs: Fs = { isExec: () => true, exists: () => true, realpath: (p) => p };
+  assert.equal(stateId('C:\\Users\\Me\\harness', fs, 'win32'),
+    createHash('sha256').update('c:\\users\\me\\harness\\state').digest('hex').slice(0, 16));
+});
+
 function server(handler: http.RequestListener): Promise<{ url: string; close(): void }> {
   return new Promise((res) => {
     const s = http.createServer(handler);

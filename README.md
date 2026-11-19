@@ -109,6 +109,9 @@ harness update                fast-forward git pull, code only
 harness upgrade               git pull + migrate config + restart
 harness mcp ...               manage MCP servers (see MCPs)
 harness net ...               manage the egress allowlist (see Firewall)
+harness desktop               run the desktop app; builds and installs it on first
+                              use and after an upgrade changes desktop/ (Start menu +
+                              Desktop shortcut on Windows). Needs Node.js 22+
 harness doctor                environment + network diagnostics
 harness preflight             validate .env and allowlist
 harness test [section]        run the test suite

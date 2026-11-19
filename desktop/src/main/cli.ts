@@ -2,6 +2,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { ConfigRow } from '../shared/api';
 import type { HarnessUpdateState, JobInfo } from '../shared/ipc';
+import { bashPath, killTree } from './bash';
 
 export interface RunResult { code: number; stdout: string; stderr: string; timedOut: boolean }
 
@@ -11,6 +12,7 @@ export function cliEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
 
 /** Signal a detached child's whole process group (falls back to the child alone). */
 export function killGroup(child: ChildProcess, sig: NodeJS.Signals): void {
+  if (child.pid && killTree(child.pid)) return;
   try { if (child.pid) { process.kill(-child.pid, sig); return; } } catch { /* not a group leader / gone */ }
   try { child.kill(sig); } catch { /* gone */ }
 }
@@ -22,7 +24,7 @@ export function runHarness(root: string, args: string[], o: { timeoutMs?: number
     let out = ''; let err = ''; let timedOut = false; let done = false;
     let child: ChildProcess;
     try {
-      child = spawn('bash', [`${root}/harness`, ...args], { cwd: o.cwd || root, env: cliEnv(o.env), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+      child = spawn(bashPath(), [`${root}/harness`, ...args], { cwd: o.cwd || root, env: cliEnv(o.env), stdio: ['ignore', 'pipe', 'pipe'], detached: true, windowsHide: true });
     } catch (e) { resolve({ code: 127, stdout: '', stderr: String(e), timedOut: false }); return; }
     const finish = (code: number) => { if (done) return; done = true; clearTimeout(t); resolve({ code, stdout: out, stderr: err, timedOut }); };
     const cap = (s: string, c: Buffer) => (s.length > 2_000_000 ? s : s + c.toString('utf8'));
@@ -127,7 +129,7 @@ export class Jobs {
 export function startJob(root: string, args: string[], onChunk: (s: string) => void, onExit: (code: number) => void,
   env: Record<string, string> = {}): JobHandle | null {
   try {
-    const child = spawn('bash', [`${root}/harness`, ...args], { cwd: root, env: cliEnv(env), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const child = spawn(bashPath(), [`${root}/harness`, ...args], { cwd: root, env: cliEnv(env), stdio: ['ignore', 'pipe', 'pipe'], detached: true, windowsHide: true });
     const f = framer(onChunk);
     child.stdout!.on('data', f); child.stderr!.on('data', f);
     child.on('error', (e) => onChunk(`${e}\n`));

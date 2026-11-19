@@ -16,6 +16,7 @@ import { classify } from './classify';
 import { ServeClient } from './http';
 import { locateRoot, stateId, validRoot } from './locate';
 import { Poller, pollPath, type PollAnswer } from './poller';
+import { bashPath, killTree } from '../bash';
 
 export interface ManagerDeps {
   env: Env; appPath: string; packaged: boolean; home: string; logDir: string;
@@ -308,8 +309,8 @@ export class BackendManager {
       fd = openSync(this.logFile, 'a', 0o600);
       this.logOff = fstatSync(fd).size;
       this.logAll = ''; this.logPartial = ''; this.logDec = new StringDecoder('utf8');
-      child = spawn('bash', [join(root, 'harness'), 'serve', '--port', String(port)], {
-        cwd: existsSync(cwd) ? cwd : this.d.home, env: cliEnv(extra), stdio: ['ignore', fd, fd], detached: true });
+      child = spawn(bashPath(), [join(root, 'harness'), 'serve', '--port', String(port)], {
+        cwd: existsSync(cwd) ? cwd : this.d.home, env: cliEnv(extra), stdio: ['ignore', fd, fd], detached: true, windowsHide: true });
     } catch (e) {
       this.set({ phase: 'down', owned: false, problem: { code: 'spawn', message: String(e) } });
       return null;
@@ -464,7 +465,7 @@ export class BackendManager {
     if (this.reprobeTimer) { clearTimeout(this.reprobeTimer); this.reprobeTimer = null; }
     const kids = [...this.children];
     if (!this.st.owned && !kids.length) return false;
-    for (const c of kids) if (c.pid) { try { process.kill(-c.pid, 'SIGTERM'); } catch { /* gone */ } }
+    for (const c of kids) if (c.pid && !killTree(c.pid)) { try { process.kill(-c.pid, 'SIGTERM'); } catch { /* gone */ } }
     this.child = null;
     if (this.st.root) await runHarness(this.st.root, ['serve', 'stop'], { timeoutMs: STOP_CLI_MS }).catch(() => null);
     this.set({ owned: false, pid: null });

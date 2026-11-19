@@ -131,6 +131,12 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 - `tests/unit_win_location_test.sh` (no docker, no network) — Windows install
   location: the installer's out-of-profile warning/offer (block eval'd with stubs,
   pty via `script` for the prompt) and `host_win_location_hint`. Covers I052, Ho023.
+- `tests/unit_desktop_cmd_test.sh` (no docker, no network, no real build) — `harness desktop`:
+  install-then-launch when missing, launch only when the stamp is current, rebuild when
+  `desktop/` changed, `npm ci` only on a new lock hash, node missing/too old, a failed build
+  keeping the old install and stamp, the Windows (NSIS `/S`, `cmd.exe /c start`), macOS
+  (ditto, ad-hoc codesign, `open -a`) and Linux (.desktop Exec/Icon, `--no-sandbox` rule,
+  `setsid -f`) branches, `where`, and the no-git version stamp. Stubs on PATH, throwaway clone.
 - `tests/unit_mock_upstream_test.sh` (no docker) — test infrastructure, not a product
   behavior: drives the proxy's real require-tool correction loop in-process against the
   mock's fixture dispatch and asserts it terminates fail-open (after "say hello" and after

@@ -34,6 +34,14 @@ test('framer never splits a UTF-8 character', async () => {
   assert.equal(got.join(''), 'a€b');
   assert.ok(!got.join('').includes('�'));
 });
+test('pty argv on Windows: Git Bash runs harness and the plain terminal', () => {
+  const o = { root: 'C:/Users/me/harness', shell: undefined, hostConsent: false, isDir: () => true, platform: 'win32' as const,
+    bash: 'C:\\Program Files\\Git\\bin\\bash.exe' };
+  const p = buildArgv(cleanSpec({ kind: 'plain', cwd: 'C:\\Users\\me' })!, o);
+  assert.ok(p.ok && p.argv.file === o.bash && p.argv.args.join(' ') === '--login -i');
+  const a = buildArgv(cleanSpec({ kind: 'agent', cwd: 'C:\\Users\\me' })!, o);
+  assert.ok(a.ok && a.argv.file === o.bash && a.argv.args[0] === 'C:/Users/me/harness/harness');
+});
 test('pty argv: kinds, flags, resume, refusals', () => {
   const o = { root: '/r', shell: '/bin/zsh', hostConsent: true, isDir: () => true };
   const spec = (x: object) => cleanSpec({ kind: 'agent', cwd: '/p', ...x })!;
