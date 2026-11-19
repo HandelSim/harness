@@ -12,6 +12,7 @@
 #   - serve/test_findings.py   the queue page's findings board
 #   - serve/test_page_memory.py what is typed survives leaving the page
 #   - serve/test_diff_view.py   the Changes page's Show more lines
+#   - serve/test_api.py   the desktop app's JSON API (/api/v1)
 #   - agents/live-run.sh  headless runs that take messages (stub opencode)
 #   - harness_view        the run viewer a headless launch brings up
 #   - harness_view_refresh harness upgrade restarts it on the new code
@@ -46,6 +47,8 @@ ok "S1: the queue page's findings board"
 ok "S1: page memory"
 ( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_diff_view ) || fail "S1: serve/test_diff_view.py failed"
 ok "S1: the Changes page's Show more lines"
+( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_api ) || fail "S1: serve/test_api.py failed"
+ok "S1: the desktop app's JSON API (/api/v1)"
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT

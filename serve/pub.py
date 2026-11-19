@@ -57,6 +57,7 @@ import findings_view  # noqa: E402
 import findings_agent_view  # noqa: E402
 import page_memory  # noqa: E402
 import jira_view  # noqa: E402  (U3: takes TRACKER_TOKEN out of the environment at import)
+import api  # noqa: E402  the desktop app's JSON API (/api/v1); it never imports pub
 
 PUB_CSP = "sandbox allow-scripts allow-popups"
 INDEX_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
@@ -1531,6 +1532,8 @@ def make_handler(cfg):
                     self.send_page(200, render_login(cfg), head=head)
                 return
             if cfg.codes and not user:
+                if path.startswith("/api/"):
+                    return api.deny(self, head)
                 if self.headers.get("X-Harness-Live"):
                     # the live scripts' polls: say so, rather than redirect to a page they cannot show
                     self.send(401, b'{"auth": false}', "application/json; charset=utf-8",
@@ -1540,6 +1543,8 @@ def make_handler(cfg):
                 else:
                     self.redirect("/login", head=head)
                 return
+            if path.startswith("/api/"):
+                return api.handle(self, cfg, API_HELPERS, "HEAD" if head else "GET", path, url.query, user, head)
             if path in ("/", "/live"):
                 query = (parse_qs(url.query).get("q") or [""])[0].strip()[:200]
                 host = self.headers.get("Host", "").lower()
@@ -1593,16 +1598,22 @@ def make_handler(cfg):
         def do_POST(self):
             if not self.host_ok(False):
                 return
+            path = urlsplit(self.path).path
             if not origin_ok(self.headers, cfg.allowed):
+                if path.startswith("/api/"):
+                    return api.deny_origin(self)
                 self.send(403, b"cross-origin request refused\n")
                 return
-            path = urlsplit(self.path).path
-            if path.startswith(("/runs/", "/vault/", "/settings/")):
+            if path.startswith(("/runs/", "/vault/", "/settings/", "/api/")):
                 _, user = self.session()
                 if cfg.codes and not user:
+                    if path.startswith("/api/"):
+                        return api.deny(self)
                     self.send(401, b"not signed in\n")
                     return
-                if path.startswith("/vault/"):
+                if path.startswith("/api/"):
+                    api.handle(self, cfg, API_HELPERS, "POST", path, urlsplit(self.path).query, user)
+                elif path.startswith("/vault/"):
                     self.vault_post(path, user)
                 elif path.startswith("/settings/"):
                     self.settings_post(path, user)
@@ -1704,6 +1715,11 @@ def state_id(state_dir):
     if not state_dir:
         return ""
     return hashlib.sha256(os.path.normcase(os.path.realpath(state_dir)).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+API_HELPERS = api.Helpers(proxy_status=proxy_status, read_ledger=read_ledger, vault_log=vault_log, state_id=state_id,
+                          list_pages=list_pages, add_code=add_code, remove_code=remove_code, page_cap=PAGE_CAP,
+                          max_form=MAX_FORM, max_send=MAX_SEND_FORM, max_ticket=MAX_TICKET_FORM)
 
 
 def pub_health(port):

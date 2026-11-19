@@ -3042,6 +3042,132 @@ never stopped), a serve whose `/proc` tpgid is -1 as on Git Bash (a pty
 that is not its controlling terminal: key, upgrade, restart, key again), and
 the perl check from the foreground and from a background job. S13: the lease exclusion in `host_proxy_refresh`.
 
+### JSON API (`/api/v1`)
+
+`serve/api.py` is the desktop app's interface to a running serve: the same
+data and actions as the web pages, as JSON, on the same port and behind the
+same checks. It never imports pub.py (pub runs as `__main__`); pub hands its
+helpers in as one namespace, `API_HELPERS` (`proxy_status`, `read_ledger`,
+`vault_log`, `state_id`, `list_pages`, `add_code`, `remove_code`, `page_cap`,
+`max_form`, `max_send`, `max_ticket`). api.py imports `runs` and the
+`*_view` modules itself and only calls their functions.
+
+**Hook in pub.py.** `handle_get`, after the Host check: an `/api/` path with
+no session while access codes are on gets `api.deny` (401 JSON) instead of
+the redirect to `/login`; otherwise `api.handle(..., "GET"|"HEAD", ...)`.
+`do_POST`: Host check, then a failed Origin check on `/api/` is
+`api.deny_origin` (403 JSON, code `origin`), then the session (401 JSON),
+then `api.handle(..., "POST", ...)`. Sign-in stays `POST /login` (form), the
+app keeping the cookie. No other route changed.
+
+**Envelope.** Every answer is `application/json; charset=utf-8` with
+`Cache-Control: no-store`, `X-Harness-Api: 1`, `X-Harness-Stale: 1` when
+serve's code changed on disk, and never a CORS header; HEAD is GET without
+the body.
+- Read: `{"ok": true, "sig", "data"}`; `?sig=` equal to the current one
+  answers `{"ok": true, "sig", "same": true}`. `sig` is
+  `sha1(json.dumps(data, sort_keys=True, default=str))` (the web UI's
+  `_sig`), so `data` carries no "now" and no ages: `stop_wait` is dropped
+  from ticket state (`stuck` is sent instead), `age` from an ingest run.
+- Action: `{"ok": true, "msg", "data"?}`; a refusal is 409 `refused` with
+  the handler's own message, a stale answer form (`runs.CHANGED`) 409
+  `changed`.
+- Error: `{"ok": false, "error": {"code", "message"}}`: 400 `bad-request`,
+  401 `auth`, 403 `origin`, 404 `not-found`, 405 `method`, 409
+  `refused`/`changed`, 413 `too-large`, 415 `content-type`, 500 `internal`
+  (exception class and text; the traceback goes to serve's stderr), 501
+  `unavailable` (not built: `/vault/search`, `/vault/commit/<sha>`), 503
+  `unavailable` (no run viewer, no queue, no vault).
+- POST bodies are one JSON object, `Content-Type: application/json` and
+  `Content-Length` required; the size limits are the web forms':
+  `max_send` (messages), `max_ticket` (queue and ticket actions),
+  `findings_view.FORM_MAX`, `findings_agent_view.FORM_MAX`, else
+  `4 * MAX_FORM`.
+
+**Poll.** `GET /api/v1/poll?t=TOPIC~SIG&...` (at most 24; `TOPIC` matches
+`^[a-z-]+(:[A-Za-z0-9._-]+)?$`, else 400) answers
+`{"ok", "now", "stale", "topics": {TOPIC: {sig, data} | {sig, same} |
+{error}}}`. A topic is a function in `api.READS`, the same one its GET
+endpoint calls: `status home queue sessions findings findings-agent vault
+ingest debug ticket:<KEY> session:<sid>`; a removed ticket or session is
+`{"gone": true}`. One failing topic is an `error` entry; the rest answer.
+`/status` caches proxy health 5 s and the git version 60 s.
+
+**Reads (GET).** `/status`, `/opencode` (`{port, url, user, password}`; 404
+without opencode web), `/home`, `/queue`, `/queue/runner-log`,
+`/queue/branches?project=`, `/queue/repos?project=`, `/tickets/<K>`,
+`/tickets/<K>/out/<name>?from=` (256 KiB a call, cut on a UTF-8 boundary,
+`reset` when `from` is past the end), `/tickets/<K>/edit`,
+`/tickets/<K>/diff?repo=&view=`, `/tickets/<K>/lines?...` (diff_view.lines'
+query), `/sessions?q=&limit=&all=1`, `/sessions/<sid>`,
+`/sessions/<sid>/messages?from=&limit=` (a tool part's output or error over
+4000 characters is cut, `truncated: true`), `/sessions/<sid>/parts/<pid>`,
+`/sessions/<sid>/export`, `/follow?since=&queue=1|findings=1`, `/findings`,
+`/findings/agent`, `/findings/notes/<slug>/<name>`, `/vaults`, `/vault`,
+`/vault/ingest`, `/vault/tree?path=`, `/vault/file?path=` (no `..`, no
+`.git`, text up to 1 MiB, an image as its `/vault/file/` URL), `/settings`
+(a secret config value is `(set, N chars)`, never the value),
+`/settings/doctor`, `/update`, `/jira?list=&mine=1`, `/debug`,
+`/debug/<runs|reports>/<name>`. A session row's `web` is the session's
+opencode-web URL with no login in it (the app answers opencode's Basic auth
+itself), host sessions only.
+
+**Actions (POST).** `/sessions/<sid>/send {text}` (`Runs.send`, CRLF to LF),
+`/sessions/<sid>/stop`, `/queue/{add,start,halt,end}`,
+`/tickets/<K>/<action>` for each `runs.TICKET_ACTIONS`,
+`/findings/{archive,restore,move}`,
+`/findings/agent/{start,stop,notes,folders}`,
+`/vault/{use,ingest/start,ingest/stop,ingest/forget}`,
+`/settings/{config,net,mcp,system,access}`. The body becomes the form the
+web handler reads: a string `[s]`, a number `[str(n)]`, `true` `["1"]`,
+`false`/`null` left out, a list one value each; `stages: [..]` is
+`stage_<s>=1`, `repo_modes: {rel: m}` is `repo_mode:<rel>`, `comments: [..]`
+the JSON string `comments`; `settings/config {set: {K: v}, clear: [K]}` is
+`v_<K>`/`clear_<K>`; `settings/access {act: add}` returns `data.code` once.
+`answer`/`approve`: `answers {qid: text}`, `picks {qid: 0-7|"other"}`,
+`criteria {id: {reject?, comment?}}`, `assumptions {id: text}`,
+`feedback`, `go`/`defaults`, `sig`. On a plan with criteria in
+needs-answers or plan-review they are the per-item fields (`qt.<qid>`,
+`q.<qid>`, `ac.<id>=reject`, `acc.<id>`, `as.<id>`, `note`, `defaults=1`);
+otherwise the plain form: the i-th question's `q<i>` (its text) and `a<i>`
+for i < `FORM_QUESTIONS`, the others appended to `note`.
+
+**Gates.** Each ticket carries `actions: {action: {ok, reason}}` from the
+predicates its pages use: `answer` status in `WAITING` and a vault;
+`approve` plan-review; `retry` `RETRYABLE`; `continue` `_continuable` (with
+the queue's `continue_refused` text as the reason); `stop` `STOPPABLE` and
+not stopping; `remove`/`archive` not running; `followup` done, a plan stage,
+a vault and no `followup_refused`; `edit` `_edit_lock` not `none`; `fix`
+`FIXABLE` and `fix_refused == ""`; `move`, `note` always. An archived
+ticket allows only `unarchive`, `remove`, `note`; a missing or unreadable
+`state.json` is status `""` and allows only `remove`. The queue's `start`
+gate is off while a run is going or starting. The queue script still has
+the last word (its refusal is a 409).
+
+**The `unknown` fields of `desktop/src/shared/api.ts`.**
+- `Runner.started`: run.json's string, or null; `since`: epoch seconds this
+  viewer launched the run, while starting, or null; `exited`: null or
+  `[returncode, epoch seconds]`; `on`: `[{ticket, stage, step}]`; `beat`:
+  epoch seconds of the last heartbeat, 0 when none; `watch` false when
+  run.json does not say.
+- `TicketSummary.created`/`updated`: state.json's strings as stored (ISO
+  8601 UTC); `finished`: boolean (the stage's output is kept). Notes' and
+  history's `at`: strings as stored. `questions[].options`: strings.
+- `Diff.notes`: list of strings; `says`: string.
+- `FindingsAgent.folders`, `last_repos`: lists of absolute paths.
+- `Ingest.summary`: `{sources: [{name, path, exists, ok, failed, pages (a
+  count), at}], failed: [{id, page, attempts, at, problems}], nfailed, last,
+  has}`.
+- `VaultOverview.facts`: `{branch, head: [short sha, relative time,
+  subject], remote, ahead, behind, dirty}`; `log` and `Home.activity`:
+  `[{sha, author, when (relative), subject}]`.
+
+Session times are epoch ms; ticket times pass through as stored.
+`serve/test_api.py` (in `tests/unit_serve_test.sh`) runs every read and
+action against a live pub server over test_runs' fixture DB; `python3
+serve/test_api.py --dump DIR` writes each read's answer on that fixture as
+`DIR/<name>.json` for the app's mock serve.
+
 ## ChatGPT backend (`harness chatgpt`)
 
 `cmd_chatgpt` is a **front door, not a parallel launch path**. It sets the
