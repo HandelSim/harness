@@ -3,6 +3,10 @@
   --title-h: 38px; --rail-w: 44px; --sidebar-w: 260px; --status-h: 24px; --tab-h: 36px;
   --row-h: var(--h-row); --dock-gap: 6px;
   --surface-panel: var(--surface-0);
+  /* Surface opacity (W2-G). core/background.ts sets the -auto values from appearance.seeThrough, floored so text-2/3
+     keep >= 4.5:1 over the brightest pixel the background can draw; these fallbacks apply before it runs. */
+  --chrome-alpha: var(--chrome-alpha-auto, 0.7);
+  --panel-alpha: var(--panel-alpha-auto, 0.84);
   font-family: var(--font-ui);
   font-feature-settings: var(--font-features-ui);
   font-size: var(--text-13); line-height: var(--lh-13);
@@ -12,11 +16,16 @@
   text-rendering: optimizeLegibility;
 }
 [data-density="comfortable"] { --row-h: var(--h-row-comfy); --h-control: 32px; }
-[data-see-through="1"] { --surface-panel: var(--glass-content); }
+[data-glass="on"][data-see-through="1"] { --surface-panel: var(--glass-content); }
+[data-glass="off"] { --chrome-alpha: 1; --panel-alpha: 1; }
 [data-reduce-motion="1"] { --dur-fast: 0ms; --dur-base: 0ms; --dur-panel: 0ms; --dur-slow: 0ms; }
 
 *, *::before, *::after { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg-window); }
+html, body { margin: 0; height: 100%; overflow: hidden; }
+/* Only <html> paints the window colour: an opaque <body> would paint over #bg-root (z-index -1 sits below in-flow
+   block backgrounds in the root stacking context), hiding the background entirely. */
+html { background: var(--bg-window); }
+body { background: transparent; }
 body { user-select: none; cursor: default; }
 #bg-root { position: fixed; inset: 0; z-index: var(--z-bg); pointer-events: none; overflow: hidden; }
 #app { position: fixed; inset: 0; z-index: var(--z-base); }

@@ -164,6 +164,29 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   events of one kind in one poll collapse into one. A click routes to the
   ticket panel or the view (`notify:click`).
 
+## Background and glass (`src/background/`, `src/renderer/core/background.ts`)
+
+- The background engine draws into `#bg-root` (`z-index:-1`) behind the
+  whole UI. Only `<html>` paints `--bg-window`; `body` must stay transparent
+  or it covers the canvas.
+- Chrome (title bar, rail, sidebar, status bar) and each dock group paint ONE
+  translucent layer of `--surface-0`. Tab strips and `.view` are transparent;
+  cards, inputs, menus and terminals stay opaque.
+- The alphas are computed (`views/background/surface.ts`): the lowest alpha
+  at which text-1/2/3 keep 4.5:1 over every palette ramp stop the engine can
+  draw, scaled by `appearance.seeThrough` (0 = opaque). Written to `<html>`
+  as `--panel-alpha-auto` / `--chrome-alpha-auto` on every appearance change.
+  Glass off, `prefers-contrast: more` and `prefers-reduced-transparency`
+  force alpha 1.
+- Low power (`src/background/gpu.ts`): `auto` turns on when the WebGL
+  renderer is software (SwiftShader, llvmpipe, ...). Animated backgrounds run
+  at 20 fps and half scale; tracers and grayscott draw their CSS variant. The
+  per-device override (`auto` / `on` / `off`) is in localStorage
+  `harness.bg.lowPower` and in the background picker.
+- The governor steps down one rung (never up) on sustained worker frame cost
+  or on main-thread jank: rAF-interval p95 > 34 ms or long tasks > 25 % of a
+  2 s window, reported by the renderer about once a second.
+
 ## Where state lives
 
 - `userData/settings.json` and `userData/state.json`: written atomically,
@@ -192,6 +215,9 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   - Flags: `--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --no-sandbox`.
   - Runs against `e2e/mock-serve` and `e2e/fake-harness`. It never runs a
     real serve and never runs docker.
+  - The mock serves topics per scenario plus canned GET routes
+    (`data/w2f-views.mjs`, keyed by path and sorted query); a spec overrides
+    one with `setRoute(key, data, status)`.
 - `--smoke-test` is the packaged smoke. It loads the window, checks the
   bridge, echoes through a PTY and exits 0 or 1, and never starts a backend.
 - CI workflows ship as `desktop/ci/*.yml`, for the owner to move into

@@ -15,7 +15,7 @@ export async function renderThumb(config: BgConfig, theme: BgTheme, w: number, h
   const octx = out.getContext('2d', { alpha: false });
   if (!octx) throw new Error('no 2d context');
   if (d?.dynamic && def) {
-    const cw = w * 3, ch = h * 3;                  // render as if the viewport were 3x the thumb, then downscale
+    const cw = w * 2, ch = h * 2;                  // render as if the viewport were 2x the thumb, then downscale (3x cost 2.25x the pixels for no visible gain at thumb size)
     let src: OffscreenCanvas;
     let eff;
     if (def.make2d) {

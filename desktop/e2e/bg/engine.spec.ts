@@ -16,7 +16,9 @@ const engine = (win: Page, fn: string, arg: unknown) => win.evaluate(([f, a]) =>
   return void e[f as string](a);
 }, [fn, arg] as const);
 
-async function openDemo(win: Page, q = 'thumbs=0'): Promise<string[]> {
+// lowpower=off: e2e runs on SwiftShader, where the no-GPU policy (auto) would otherwise swap heavy ids for CSS and cap
+// fps; the engine specs below test the full pipeline. The low-power spec opens without the param (engine default auto).
+async function openDemo(win: Page, q = 'thumbs=0&lowpower=off'): Promise<string[]> {
   const pageErrors: string[] = [];
   win.on('pageerror', (e) => pageErrors.push(e.message));
   win.on('console', (m) => { if (m.type() === 'error') pageErrors.push(m.text()); });
@@ -109,7 +111,7 @@ test.describe('background engine', () => {
 
   test('thumbnails: one decodable image per catalog id, cached on the second call', async ({ win }) => {
     test.setTimeout(90000);
-    await openDemo(win, 'id=solid');
+    await openDemo(win, 'id=solid&lowpower=off');
     await expect.poll(() => win.evaluate(() => [...document.querySelectorAll('#thumbs img')].filter((i) => (i as HTMLImageElement).naturalWidth > 0).length),
       { timeout: 60000 }).toBe(CATALOG.length);
     const r = await win.evaluate(async () => {
@@ -123,22 +125,57 @@ test.describe('background engine', () => {
     expect(r.errors).toEqual([]);
   });
 
+  test('low power: auto activates on SwiftShader; heavy ids go CSS, light ids are fps-capped; off restores', async ({ win }) => {
+    test.setTimeout(90000);
+    const pageErrors = await openDemo(win, 'thumbs=0');
+    const lp = await win.evaluate(() => (window as unknown as { __bg: { engine: { lowPower(): unknown } } }).__bg.engine.lowPower()) as
+      { mode: string; active: boolean; gpu: { renderer: string; software: boolean } };
+    console.log('lowPower()', JSON.stringify(lp));
+    expect(lp.mode).toBe('auto');
+    expect(lp.gpu.software).toBe(true);
+    expect(lp.active).toBe(true);
+    await set(win, { id: 'grayscott' });
+    await expect.poll(async () => (await probe(win)).stats?.renderer, { timeout: 10000 }).toBe('css');
+    expect((await probe(win)).stats?.reason).toMatch(/low power \(software GL\)/);
+    await set(win, { id: 'life', fpsCap: 60 });
+    await expect.poll(async () => (await probe(win)).frames, { timeout: 10000 }).toBeGreaterThan(5);
+    // data-bg-frames moves only with a stats message (every 500 ms): sample on a change at both ends.
+    const onTick = async () => { const f = (await probe(win)).frames; await expect.poll(async () => (await probe(win)).frames, { timeout: 5000, intervals: [25] }).not.toBe(f); return { f: (await probe(win)).frames, t: Date.now() }; };
+    const a = await onTick();
+    await win.waitForTimeout(3000);
+    const b = await onTick();
+    const p = await probe(win), fps = (b.f - a.f) / ((b.t - a.t) / 1000);
+    console.log('life under low power', fps.toFixed(1), 'fps', JSON.stringify(p.stats));
+    expect(p.stats?.renderer).not.toBe('css');
+    expect(fps).toBeLessThanOrEqual(22);
+    expect(p.stats?.downgraded).toBe(true);
+    await engine(win, 'setLowPower', 'off');
+    await set(win, { id: 'grayscott' });
+    await expect.poll(async () => (await probe(win)).stats?.renderer, { timeout: 10000 }).not.toBe('css');
+    expect((await probe(win)).errors).toEqual([]);
+    expect(pageErrors).toEqual([]);
+  });
+
   test('perf: page rAF p95 per id (asserted < 25 ms with HARNESS_DESKTOP_E2E_PERF=1); page heap grows < 10 MB over 20 s', async ({ win }) => {
-    test.setTimeout(120000);
+    test.setTimeout(200000);
     await openDemo(win);
     const p95 = (ms: number) => win.evaluate((dur) => new Promise<number>((res) => {
       const iv: number[] = []; let last = -1; const end = performance.now() + dur;
       const f = (t: number) => { if (last >= 0) iv.push(t - last); last = t; if (t < end) requestAnimationFrame(f); else { iv.sort((a, b) => a - b); res(iv[Math.floor(iv.length * 0.95)] ?? 0); } };
       requestAnimationFrame(f);
     }), ms);
-    const results: Record<string, number> = {};
-    for (const d of [...CATALOG.filter((x) => !x.dynamic).slice(0, 1), ...CATALOG.filter((x) => x.dynamic)]) {
-      await set(win, { id: d.id });
-      await win.waitForTimeout(1500);
-      results[d.id] = await p95(2500);
-    }
-    console.log('rAF p95 ms', JSON.stringify(results));
-    test.info().annotations.push({ type: 'rAF p95 ms', description: JSON.stringify(results) });
+    const pass = async (label: string) => {
+      const results: Record<string, number> = {};
+      for (const d of [...CATALOG.filter((x) => !x.dynamic).slice(0, 1), ...CATALOG.filter((x) => x.dynamic)]) {
+        await set(win, { id: d.id });
+        await win.waitForTimeout(1500);
+        results[d.id] = Math.round(await p95(2500) * 10) / 10;
+      }
+      console.log(`rAF p95 ms (lowpower=${label})`, JSON.stringify(results));
+      test.info().annotations.push({ type: `rAF p95 ms (lowpower=${label})`, description: JSON.stringify(results) });
+      return results;
+    };
+    const results = await pass('off');
     // The 25 ms target is not met on software GL (SwiftShader starves the compositor; see docs/progress/L4.md),
     // so it is asserted only when HARNESS_DESKTOP_E2E_PERF=1 (a host with a real GPU). The heap check always runs.
     if (process.env.HARNESS_DESKTOP_E2E_PERF === '1') {
@@ -153,5 +190,8 @@ test.describe('background engine', () => {
     console.log('page heap MB', (h0 / 1e6).toFixed(1), '->', (h1 / 1e6).toFixed(1));
     expect(h0, 'performance.memory is available').toBeGreaterThan(0);
     expect(h1 - h0).toBeLessThan(10 * 1024 * 1024);
+    // Same pass with the no-GPU policy on auto (active here: SwiftShader). Reported, not asserted.
+    await engine(win, 'setLowPower', 'auto');
+    await pass('auto');
   });
 });

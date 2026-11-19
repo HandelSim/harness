@@ -9,6 +9,8 @@ import { parseFromWorker, type ToWorker } from './protocol';
 import { MainRunner } from './mainrunner';
 import { EFFECTS } from './effects/registry';
 import { renderThumb } from './thumb';
+import { probeGpu, lowPowerActive, lowPowerPlan, isLowPowerMode, LOW_POWER_REASON, type GpuInfo, type LowPowerMode } from './gpu';
+import { JankMeter, type JankSummary } from './jank';
 
 type Rung = 'worker' | 'main2d' | 'css';
 interface Layer { id: number; el: HTMLElement; cfg: BgConfig; kind: 'css' | 'worker' | 'main2d'; main?: MainRunner; canvas?: HTMLCanvasElement }
@@ -45,6 +47,9 @@ class Engine implements BgEngine {
   private onVis = () => { this.hidden = document.hidden; this.pushState(); };
   private disposed = false;
   private size = { w: 1, h: 1 };
+  private lowMode: LowPowerMode = 'auto';
+  private jankMeter: JankMeter | null = null;
+  private lastReason = '';
 
   constructor(root: HTMLElement, opts: BgCreateOpts) {
     this.root = root; this.opts = opts;
@@ -88,6 +93,28 @@ class Engine implements BgEngine {
     this.statsCbs.add(cb); cb(this.lastStats);
     return () => { this.statsCbs.delete(cb); };
   }
+  /** No-GPU policy (not part of BgEngine): 'auto' = on when probeGpu() reports a software rasteriser.
+   *  Changing it rebuilds the live layer. */
+  setLowPower(mode: LowPowerMode): void {
+    const m = isLowPowerMode(mode) ? mode : 'auto';
+    if (m === this.lowMode) return;
+    const was = this.lowActive();
+    this.lowMode = m;
+    if (was !== this.lowActive() && this.layer) void this.apply(this.layer.cfg, 0, true);
+  }
+  lowPower(): { mode: LowPowerMode; active: boolean; gpu: GpuInfo } {
+    return { mode: this.lowMode, active: this.lowActive(), gpu: probeGpu() };
+  }
+  private lowActive(): boolean { return this.lowMode === 'on' || (this.lowMode === 'auto' && lowPowerActive('auto', probeGpu())); }
+  /** Stats of a canvas layer running under the low-power limits say so (unless something more specific applies). */
+  private lowStats(s: BgStats): BgStats {
+    if (s.downgraded || s.reason || !this.layer || this.layer.kind === 'css' || this.limits(this.layer.cfg).maxFps === undefined) return s;
+    return { ...s, downgraded: true, reason: LOW_POWER_REASON };
+  }
+  private lowStatic(cfg: BgConfig): boolean {
+    const d = descriptor(cfg.id);
+    return !!d && this.lowActive() && lowPowerPlan(d).mode === 'static';
+  }
   /** Debug hook (demo / e2e): make each worker frame burn this many ms. Not part of BgEngine. */
   debugBurn(ms: number): void { this.post({ t: 'debug', burnMs: ms }); this.layer?.main?.burn(ms); }
 
@@ -104,6 +131,7 @@ class Engine implements BgEngine {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.jankMeter?.stop(); this.jankMeter = null;
     document.removeEventListener('visibilitychange', this.onVis);
     this.ro?.disconnect();
     this.layer?.main?.dispose();
@@ -124,6 +152,25 @@ class Engine implements BgEngine {
     this.layer?.main?.setState(s.state, s.reduced);
     const l = this.layer;
     if (l?.kind === 'css') this.cssMotion(l.el, l.cfg);
+    this.syncJank();
+  }
+  /** Measure main-thread jank only while a canvas layer animates (not paused, hidden, reduced or CSS). */
+  private syncJank(): void {
+    const l = this.layer, s = this.effState();
+    const want = !this.disposed && !!l && l.kind !== 'css' && s.state !== 'pause' && !s.reduced && typeof requestAnimationFrame === 'function';
+    if (!want) { this.jankMeter?.stop(); return; }
+    this.jankMeter ??= new JankMeter({
+      raf: (cb) => requestAnimationFrame(cb), caf: (h) => cancelAnimationFrame(h), now: () => performance.now(),
+      onReport: (r) => this.onJank(r),
+    });
+    this.jankMeter.start();
+  }
+  private onJank(r: JankSummary): void {
+    const l = this.layer;
+    if (!l) return;
+    this.root.dataset.bgJank = `${r.p95}/${r.longMs}`;
+    if (l.kind === 'worker') this.post({ t: 'jank', id: l.id, ...r });
+    else l.main?.jank(r);
   }
   private measure(): void {
     const r = this.root.getBoundingClientRect();
@@ -179,7 +226,8 @@ class Engine implements BgEngine {
     if (!l || l.id !== m.id) return;
     if (m.t === 'stats') {
       this.root.dataset.bgFrames = String(m.frames);
-      this.emit({ fps: m.fps, frameMs: m.frameMs, renderer: m.renderer, tier: m.tier, downgraded: m.downgraded || !!this.gpuBroken, reason: m.reason || this.gpuBroken });
+      if (m.reason !== this.lastReason) { this.lastReason = m.reason; if (m.downgraded) this.jankMeter?.reset(); }   // new rung: fresh jank window
+      this.emit(this.lowStats({ fps: m.fps, frameMs: m.frameMs, renderer: m.renderer, tier: m.tier, downgraded: m.downgraded || !!this.gpuBroken, reason: m.reason || this.gpuBroken }));
       if (m.tier === 3) void this.apply(l.cfg, 400, true, true, m.reason);       // governor reached static
     } else if (m.t === 'ready') {
       this.root.dataset.bgRenderer = m.renderer;
@@ -199,7 +247,7 @@ class Engine implements BgEngine {
   /** Pick the rung for a config: worker (GL or 2D inside), main-thread 2D, or CSS static. */
   private pickRung(cfg: BgConfig, forceCss: boolean): Rung {
     const d = descriptor(cfg.id), def = EFFECTS[cfg.id];
-    if (forceCss || !d || !d.dynamic || !def) return 'css';
+    if (forceCss || !d || !d.dynamic || !def || this.lowStatic(cfg)) return 'css';
     if (this.ensureWorker() && (def.make2d || (def.makeGL && this.glAllowed(cfg.id)))) return 'worker';
     return def.make2d ? 'main2d' : 'css';
   }
@@ -226,7 +274,7 @@ class Engine implements BgEngine {
       const el = document.createElement('div');
       layer = { id, el, cfg, kind: 'css' };
       this.paintCss(el, cfg);
-      const why = descriptor(cfg.id)?.dynamic ? (reason || this.gpuBroken || this.workerBroken || 'static fallback') : '';
+      const why = descriptor(cfg.id)?.dynamic ? (reason || this.gpuBroken || (this.lowStatic(cfg) ? LOW_POWER_REASON : '') || this.workerBroken || 'static fallback') : '';
       this.emit({ fps: 0, frameMs: 0, renderer: 'css', tier: descriptor(cfg.id)?.dynamic ? 3 : 0, downgraded: !!why, reason: why });
       this.root.dataset.bgRenderer = 'css';
     } else {
@@ -241,9 +289,9 @@ class Engine implements BgEngine {
         const off = canvas.transferControlToOffscreen();
         const allowGL = this.glAllowed(cfg.id);
         this.lastInitGL.set(id, allowGL);
-        this.post({ t: 'init', id, canvas: off, w: this.size.w, h: this.size.h, config: cfg, allowGL }, [off]);
+        this.post({ t: 'init', id, canvas: off, w: this.size.w, h: this.size.h, config: cfg, allowGL, ...this.limits(cfg) }, [off]);
       } else {
-        try { layer.main = new MainRunner(canvas, cfg, this.theme, (s) => { this.root.dataset.bgFrames = String(s.frames); this.emit(s.stats); });
+        try { layer.main = new MainRunner(canvas, cfg, this.theme, (s) => { this.root.dataset.bgFrames = String(s.frames); this.emit(this.lowStats(s.stats)); }, this.limits(cfg));
         } catch (e) { return this.apply(cfg, 0, true, true, (e as Error).message); }
         layer.main.resize(this.size.w, this.size.h);
         const s = this.effState(); layer.main.setState(s.state, s.reduced);
@@ -254,6 +302,9 @@ class Engine implements BgEngine {
     this.root.appendChild(layer.el);
     this.layer = layer;
     this.root.dataset.bgId = cfg.id;
+    this.lastReason = '';
+    this.jankMeter?.reset();                                   // new layer: fresh jank window
+    this.syncJank();
 
     const ms = this.reduced || !cur ? 0 : Math.max(0, fadeMs);
     await new Promise<void>((resolve) => {
@@ -267,6 +318,14 @@ class Engine implements BgEngine {
     if (cur) this.retire(cur);
     // a later apply may have replaced this layer during the fade; retire any stragglers
     for (const child of Array.from(this.root.children)) if (child !== this.layer?.el && child !== layer.el) child.remove();
+  }
+
+  /** Low power: frame-rate cap and render-scale multiplier sent with the layer's init. */
+  private limits(cfg: BgConfig): { maxFps?: number; scaleMul?: number } {
+    const d = descriptor(cfg.id);
+    if (!d || !this.lowActive()) return {};
+    const p = lowPowerPlan(d);
+    return p.mode === 'reduced' ? { maxFps: Math.min(cfg.fpsCap, p.fpsCap), scaleMul: p.scaleMul } : {};
   }
 
   private retire(l: Layer): void {

@@ -21,6 +21,7 @@ export class Governor {
   reason = '';
   private buf: Float64Array; private n = 0; private i = 0; private sum = 0;
   private overSince: number | null = null;
+  private jankSince: number | null = null;
 
   constructor(o: GovernorOpts) {
     this.budgetMs = o.budgetMs; this.window = o.window ?? 60; this.overFactor = o.overFactor ?? 1.5; this.holdMs = o.holdMs ?? 2000;
@@ -32,8 +33,8 @@ export class Governor {
 
   reset(): void { this.level = 0; this.reason = ''; this.clearWindow(); }
   /** Call when the loop pauses: time spent paused must not count as "over budget". */
-  pause(): void { this.overSince = null; }
-  private clearWindow(): void { this.buf.fill(0); this.n = 0; this.i = 0; this.sum = 0; this.overSince = null; }
+  pause(): void { this.overSince = null; this.jankSince = null; }
+  private clearWindow(): void { this.buf.fill(0); this.n = 0; this.i = 0; this.sum = 0; this.overSince = null; this.jankSince = null; }
 
   /** Record one frame's work time. Returns true when it stepped down a rung on this call. */
   sample(frameMs: number, now: number): boolean {
@@ -45,6 +46,15 @@ export class Governor {
     if (this.overSince === null) { this.overSince = now; return false; }
     if (now - this.overSince < this.holdMs) return false;
     return this.downgrade(`frame ${this.mean.toFixed(1)} ms over ${(this.budgetMs * this.overFactor).toFixed(1)} ms budget`);
+  }
+  /** Main-thread jank report (jank.ts isJanky, about once a second). Jank sustained for the hold steps one rung
+   *  down, like an over-budget worker frame time; a clean report clears it. Returns true when it stepped. */
+  jank(janky: boolean, now: number, detail = ''): boolean {
+    if (!janky || !Number.isFinite(now)) { this.jankSince = null; return false; }
+    if (this.level >= LADDER.length - 1) return false;
+    if (this.jankSince === null) { this.jankSince = now; return false; }
+    if (now - this.jankSince < this.holdMs) return false;
+    return this.downgrade(detail ? `jank: ${detail}` : 'main thread jank');
   }
   /** Step down one rung now (also used on repeated context loss). */
   downgrade(reason: string): boolean {

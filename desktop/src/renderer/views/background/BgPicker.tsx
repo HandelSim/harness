@@ -2,7 +2,7 @@
 // intensity / speed / fps / seed and the per-background params.
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { BgConfig, BgDescriptor } from '../../../shared/bg';
-import { bgCatalog, bgEngine, bgStats, bgError, currentBgTheme, previewBg } from '../../core/background';
+import { bgCatalog, bgEngine, bgStats, bgError, currentBgTheme, previewBg, bgLowPower, setLowPower, lowPowerPlan, applySurfaceAlphas, type LowPowerMode } from '../../core/background';
 import { settings, patchSettings } from '../../core/app';
 import { popover } from '../../shell/ui';
 import { Button, Seg } from '../../ui/kit';
@@ -43,6 +43,8 @@ export function BgPicker() {
     commit({ id: d.id, params });
   };
   const desc = cat.find((d) => d.id === cfg?.id);
+  const lp = bgLowPower.value;
+  const see = settings.value?.appearance?.seeThrough ?? 0.5;
   const groups = [...new Set(cat.map((d) => d.group))];
   return (
     <div ref={el} class="popover glass glass--overlay bg-picker" data-testid="bg-picker" role="dialog" aria-label="Background"
@@ -50,6 +52,12 @@ export function BgPicker() {
       <div class="row"><strong>Background</strong><span class="spacer" />
         {bgStats.value ? <span class="meta tnum">{bgStats.value.renderer} · {Math.round(bgStats.value.fps)} fps{bgStats.value.downgraded ? ` · ${bgStats.value.reason}` : ''}</span> : null}</div>
       {bgError.value ? <div class="notice notice--warn small">Background engine unavailable: {bgError.value}</div> : null}
+      {lp.active ? (
+        <div class="notice small" data-testid="bg-lowpower" style={{ margin: 'var(--sp-2) 0' }}>
+          Low-power mode{lp.gpu?.software ? ` (no GPU: ${lp.gpu.renderer || 'software rendering'})` : ''}: heavy backgrounds draw a still
+          frame, the rest run at lower resolution and frame rate.
+        </div>
+      ) : null}
       {groups.map((g) => (
         <section key={g}>
           <div class="section-title">{GROUPS[g] ?? g}</div>
@@ -61,7 +69,9 @@ export function BgPicker() {
                 onBlur={() => previewBg(null)} onClick={() => pick(d)}>
                 <Thumb d={d} />
                 <span class="ellipsis">{d.name}</span>
-                {d.cost >= 3 ? <span class="meta" title="GPU heavy">●●●</span> : null}
+                {lp.active && lowPowerPlan(d)?.mode === 'static'
+                  ? <span class="meta" data-testid={`bg-still-${d.id}`} title="Low-power mode draws a still frame of this one">still</span>
+                  : d.cost >= 3 ? <span class="meta" title="GPU heavy">●●●</span> : null}
               </button>
             ))}
           </div>
@@ -84,6 +94,15 @@ export function BgPicker() {
           <div class="row">{desc?.dynamic ? <Button size="sm" icon="refresh" onClick={() => commit({ seed: Math.floor(Math.random() * 2 ** 31) })}>New seed</Button> : null}</div>
         </div>
       ) : null}
+      <div class="col" style={{ gap: 'var(--sp-2)', marginTop: 'var(--sp-3)' }}>
+        <label class="row small" title="How much of the background shows through the window surfaces. Text contrast stays at least 4.5:1.">
+          See-through<input type="range" class="grow" data-testid="bg-see-through" min={0} max={1} step={0.05} value={see}
+            onInput={(e) => applySurfaceAlphas(+(e.target as HTMLInputElement).value)}
+            onChange={(e) => void patchSettings({ appearance: { seeThrough: +(e.target as HTMLInputElement).value } } as never)} /></label>
+        <div class="row small" title="Auto turns low power on when the GPU is software-only">Low power
+          <Seg options={[{ value: 'auto', label: 'Auto' }, { value: 'on', label: 'On' }, { value: 'off', label: 'Off' }]} value={lp.mode}
+            onChange={(v) => setLowPower(v as LowPowerMode)} /></div>
+      </div>
     </div>
   );
 }

@@ -2,8 +2,8 @@
 import type { OutChunk, Ticket, TicketAction, TicketState, TicketStatus } from '../../../shared/api';
 
 export type Tone = 'ok' | 'warn' | 'err' | 'info' | 'accent' | 'default';
-export type TicketTab = 'overview' | 'live' | 'plan' | 'notes' | 'sessions';
-export const TICKET_TABS: TicketTab[] = ['overview', 'live', 'plan', 'notes', 'sessions'];
+export type TicketTab = 'overview' | 'live' | 'plan' | 'notes' | 'sessions' | 'changes';
+export const TICKET_TABS: TicketTab[] = ['overview', 'live', 'plan', 'notes', 'sessions', 'changes'];
 
 export const STATUS_LABEL: Record<TicketStatus, string> = {
   queued: 'Queued', running: 'Running', interrupted: 'Interrupted', 'needs-answers': 'Needs answers',

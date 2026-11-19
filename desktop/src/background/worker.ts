@@ -28,6 +28,7 @@ function onMessage(m: ToWorker): void {
         raf, caf, now: () => performance.now(),
         onStats: (s, frames) => post({ t: 'stats', id: m.id, fps: s.fps, frameMs: s.frameMs, renderer: scene.renderer, tier: s.tier, downgraded: s.downgraded, reason: s.reason, frames }),
         onFail: (reason, contextLost) => post({ t: 'fail', id: m.id, reason, contextLost }),
+        maxFps: m.maxFps, scaleMul: m.scaleMul,
       });
       try {
         scene.setState(runState.state, runState.reduced);
@@ -46,6 +47,7 @@ function onMessage(m: ToWorker): void {
     case 'drop': scenes.get(m.id)?.dispose(); scenes.delete(m.id); return;
     case 'theme': theme = m.theme; for (const s of scenes.values()) s.setTheme(theme); return;
     case 'state': runState = { state: m.state, reduced: m.reduced }; for (const s of scenes.values()) s.setState(m.state, m.reduced); return;
+    case 'jank': scenes.get(m.id)?.jank(m); return;
     case 'debug': burnMs = m.burnMs; for (const s of scenes.values()) s.burn(burnMs); return;
     case 'thumb': void thumb(m.req, m.config, m.w, m.h, m.theme); return;
   }

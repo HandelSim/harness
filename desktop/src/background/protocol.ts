@@ -4,14 +4,15 @@ import type { BgConfig, BgRunState, BgTheme } from '../shared/bg';
 export type RendererKind = 'webgl2' | 'worker2d';
 
 export type ToWorker =
-  | { t: 'init'; id: number; canvas: OffscreenCanvas; w: number; h: number; config: BgConfig; allowGL: boolean }
+  | { t: 'init'; id: number; canvas: OffscreenCanvas; w: number; h: number; config: BgConfig; allowGL: boolean; maxFps?: number; scaleMul?: number }
   | { t: 'config'; id: number; config: BgConfig }
   | { t: 'resize'; id: number; w: number; h: number }
   | { t: 'drop'; id: number }
   | { t: 'theme'; theme: BgTheme }
   | { t: 'state'; state: BgRunState; reduced: boolean }
   | { t: 'thumb'; req: number; config: BgConfig; w: number; h: number; theme: BgTheme }
-  | { t: 'debug'; burnMs: number };
+  | { t: 'debug'; burnMs: number }
+  | { t: 'jank'; id: number; p95: number; longMs: number; windowMs: number; n: number };
 
 export type FromWorker =
   | { t: 'ready'; id: number; renderer: RendererKind }
@@ -41,7 +42,9 @@ export function parseToWorker(v: unknown): ToWorker | null {
   switch (v.t) {
     case 'init':
       return isInt(v.id) && typeof OffscreenCanvas !== 'undefined' && v.canvas instanceof OffscreenCanvas
-        && isDim(v.w) && isDim(v.h) && isConfig(v.config) && typeof v.allowGL === 'boolean' ? (v as ToWorker) : null;
+        && isDim(v.w) && isDim(v.h) && isConfig(v.config) && typeof v.allowGL === 'boolean'
+        && (v.maxFps === undefined || (isNum(v.maxFps) && (v.maxFps as number) >= 1 && (v.maxFps as number) <= 60))
+        && (v.scaleMul === undefined || (isNum(v.scaleMul) && (v.scaleMul as number) > 0 && (v.scaleMul as number) <= 1)) ? (v as ToWorker) : null;
     case 'config': return isInt(v.id) && isConfig(v.config) ? (v as ToWorker) : null;
     case 'resize': return isInt(v.id) && isDim(v.w) && isDim(v.h) ? (v as ToWorker) : null;
     case 'drop': return isInt(v.id) ? (v as ToWorker) : null;
@@ -49,9 +52,13 @@ export function parseToWorker(v: unknown): ToWorker | null {
     case 'state': return RUN.includes(v.state as BgRunState) && typeof v.reduced === 'boolean' ? (v as ToWorker) : null;
     case 'thumb': return isInt(v.req) && isConfig(v.config) && isInt(v.w, 1, 1024) && isInt(v.h, 1, 1024) && isTheme(v.theme) ? (v as ToWorker) : null;
     case 'debug': return isNum(v.burnMs) && (v.burnMs as number) >= 0 && (v.burnMs as number) <= 100 ? (v as ToWorker) : null;
+    case 'jank':
+      return isInt(v.id) && inRange(v.p95, 0, 60_000) && inRange(v.longMs, 0, 600_000) && inRange(v.windowMs, 1, 600_000)
+        && isInt(v.n, 0, 100_000) ? (v as ToWorker) : null;
     default: return null;
   }
 }
+const inRange = (v: unknown, lo: number, hi: number) => isNum(v) && (v as number) >= lo && (v as number) <= hi;
 
 /** Validate a message arriving on the main thread. */
 export function parseFromWorker(v: unknown): FromWorker | null {

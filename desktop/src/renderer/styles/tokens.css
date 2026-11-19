@@ -65,7 +65,7 @@
   --border-solid:  #363a3f; /* slate-6 when alpha would double up */
   --text-1: #edeef0;  /* slate-12  16.3:1 on surface-0 */
   --text-2: #b0b4ba;  /* slate-11   9.1:1 */
-  --text-3: #8b8f98;  /* custom     5.8:1 on surface-0, 5.4:1 on surface-1 — tertiary/meta (AA) */
+  --text-3: #9297a0;  /* custom     6.4:1 on surface-0 — tertiary/meta; lighter than 5.8:1 so it stays AA on glass */
   --text-disabled: #5a6169; /* slate-8, decorative/disabled only */
   --icon: #9a9ea6;    /* 7.0:1 */
 
@@ -76,9 +76,10 @@
   --info-solid: #0090ff; --info-text: #70b8ff; --info-bg: #0d2847;
 
   /* glass */
-  --glass-bg:        rgba(17,17,19,0.62);   /* chrome: titlebar, sidebar, tab strip */
+  /* --chrome-alpha / --panel-alpha come from base.css (set at runtime from appearance.seeThrough with an AA floor) */
+  --glass-bg:        color-mix(in srgb, var(--surface-0) calc(var(--chrome-alpha) * 100%), transparent); /* chrome strips */
   --glass-bg-strong: rgba(24,25,27,0.78);   /* overlays: palette, menus, toasts */
-  --glass-content:   rgba(17,17,19,0.90);   /* dock panel bodies when "see-through" is on; else --surface-0 */
+  --glass-content:   color-mix(in srgb, var(--surface-0) calc(var(--panel-alpha) * 100%), transparent); /* dock groups */
   --glass-border:    rgba(255,255,255,0.08);
   --glass-highlight: rgba(255,255,255,0.06);/* 1px inner top edge */
   --glass-blur: 20px; --glass-saturate: 140%;
@@ -106,8 +107,8 @@
   --border-strong: rgba(0,6,46,0.18);
   --border-solid:  #d9d9e0; /* slate-6 */
   --text-1: #1c2024;  /* slate-12 16.0:1 */
-  --text-2: #60646c;  /* slate-11  5.8:1 on surface-0, 5.2:1 on surface-2 */
-  --text-3: #6f727b;  /* custom    4.7:1 (slate-10 #80838d is only 3.7:1 — don't use for text) */
+  --text-2: #5a5e66;  /* slate-11 darkened  6.4:1 on surface-0 */
+  --text-3: #5f626b;  /* custom    6.0:1 (slate-10 #80838d is only 3.7:1); dark enough that glass panels need alpha ~0.74, not 0.88 */
   --text-disabled: #b9bbc6;
   --icon: #60646c;
 
@@ -116,9 +117,9 @@
   --err-solid: #e5484d;  --err-text: #ce2c31;  --err-bg: #feebec;
   --info-solid: #0d74ce; --info-text: #0d74ce; --info-bg: #e6f4fe;
 
-  --glass-bg:        rgba(252,252,253,0.66);
+  --glass-bg:        color-mix(in srgb, var(--surface-0) calc(var(--chrome-alpha) * 100%), transparent);
   --glass-bg-strong: rgba(252,252,253,0.82);
-  --glass-content:   rgba(252,252,253,0.92);
+  --glass-content:   color-mix(in srgb, var(--surface-0) calc(var(--panel-alpha) * 100%), transparent);
   --glass-border:    rgba(0,0,45,0.08);
   --glass-highlight: rgba(255,255,255,0.70);
   --glass-blur: 20px; --glass-saturate: 160%;
@@ -161,5 +162,5 @@
   :root { --dur-fast: 0ms; --dur-base: 0ms; --dur-panel: 0ms; --dur-slow: 0ms; }
 }
 @media (prefers-contrast: more) {
-  :root { --border-subtle: rgba(255,255,255,0.16); --border: rgba(255,255,255,0.24); --glass-bg: var(--surface-0); --text-3: var(--text-2); }
+  :root { --border-subtle: rgba(255,255,255,0.16); --border: rgba(255,255,255,0.24); --chrome-alpha: 1; --panel-alpha: 1; --text-3: var(--text-2); }
 }

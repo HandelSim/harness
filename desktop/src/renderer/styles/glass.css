@@ -30,3 +30,18 @@
   .glass, .glass--flat { background: var(--surface-1); }
   .glass--overlay { -webkit-backdrop-filter: none; backdrop-filter: none; background: var(--surface-1); }
 }
+
+/* Surfaces over the background (W2-G). Chrome strips (title bar, rail, sidebar, status bar) paint --glass-bg
+   (alpha --chrome-alpha). Each dock group paints ONE translucent layer (--surface-panel, alpha --panel-alpha); its tab
+   strip and the panel body inside it are transparent so alphas never stack. Cards, inputs and terminals stay opaque.
+   The specificity (html[...] .x) beats dockview.css without editing it. */
+html[data-glass="on"][data-see-through="1"] .dockview-theme-harness {
+  --dv-tabs-and-actions-container-background-color: transparent;
+  --dv-activegroup-visiblepanel-tab-background-color: var(--tab-active-bg);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--tab-active-bg);
+}
+html[data-glass="on"][data-see-through="1"] .dv-groupview .view { background: transparent; }
+:root { --tab-active-bg: rgba(255,255,255,0.06); }
+[data-theme="light"] { --tab-active-bg: rgba(0,0,40,0.05); }
+@media (prefers-reduced-transparency: reduce) { :root { --chrome-alpha: 1; --panel-alpha: 1; } }
+html[data-glass="on"] .dockview-theme-harness .dv-tabs-overflow-container { background-color: var(--surface-1); }

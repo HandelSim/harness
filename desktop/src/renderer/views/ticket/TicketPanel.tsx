@@ -15,6 +15,7 @@ import {
 } from './model';
 import { AnchoredMenu, confirmDialog, promptDialog } from './parts';
 import { CHANGED_MSG, Criteria, LiveTab, NotesTab, PlanTab, type ComposeMode, type Run } from './tabs';
+import { ChangesTab } from './DiffView';
 
 const TAB_STATE: Record<string, TabState> = {
   running: 'working', 'needs-answers': 'attention', 'plan-review': 'attention', interrupted: 'attention',
@@ -90,6 +91,7 @@ export default function TicketPanel({ ctx }: { ctx: PanelCtx }) {
     { id: 'plan' as const, label: status === 'needs-answers' ? 'Answers' : 'Plan', badge: s.questions?.length && (status === 'needs-answers' || status === 'plan-review') ? String(s.questions.length) : undefined },
     { id: 'notes' as const, label: 'Notes', badge: s.notes?.length ? String(s.notes.length) : undefined },
     { id: 'sessions' as const, label: 'Sessions', badge: t.sessions.length ? String(t.sessions.length) : undefined },
+    { id: 'changes' as const, label: 'Changes' },
   ];
 
   return (
@@ -122,6 +124,7 @@ export default function TicketPanel({ ctx }: { ctx: PanelCtx }) {
         {cur === 'plan' ? <PlanTab t={t} run={run} approve={approve} notice={planNotice} setNotice={setPlanNotice} /> : null}
         {cur === 'notes' ? <NotesTab t={t} run={run} mode={mode} setMode={setMode} focusTick={focusTick} /> : null}
         {cur === 'sessions' ? <Sessions t={t} /> : null}
+        {cur === 'changes' ? <ChangesTab ticketKey={t.key} t={t} /> : null}
       </div>
     </div>
   );

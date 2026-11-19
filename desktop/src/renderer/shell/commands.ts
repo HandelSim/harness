@@ -68,6 +68,8 @@ export function registerDefaultCommands(): void {
       run: () => { void patchSettings({ appearance: { theme: document.documentElement.dataset.theme === 'light' ? 'dark' : 'light' } }); } },
     { id: 'web.open', title: 'Open web version of this page', group: 'Actions', keywords: ['serve', 'browser'], run: () => { openWeb('/'); } },
     { id: 'queue.add', title: 'Add tickets…', group: 'Tickets', run: () => hooks.addTickets() },
+    { id: 'chat.open', title: 'Open chat', group: 'Sessions', keywords: ['message', 'conversation', 'talk', 'opencode'],
+      run: () => { void import('./dock').then((m) => m.openPanel('chat', 'main', { title: 'Chat' })); } },
   ];
   commands.register(c);
 }

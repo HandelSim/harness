@@ -13,6 +13,7 @@ test('protocol: valid control messages pass', () => {
   assert.ok(parseToWorker({ t: 'state', state: 'dim', reduced: false }));
   assert.ok(parseToWorker({ t: 'thumb', req: 1, config: DEFAULT_BG, w: 96, h: 60, theme }));
   assert.ok(parseToWorker({ t: 'debug', burnMs: 10 }));
+  assert.ok(parseToWorker({ t: 'jank', id: 2, p95: 33.4, longMs: 0, windowMs: 2000, n: 120 }));
 });
 test('protocol: malformed messages are rejected', () => {
   const bad: unknown[] = [
@@ -24,6 +25,10 @@ test('protocol: malformed messages are rejected', () => {
     { t: 'state', state: 'stop', reduced: false }, { t: 'state', state: 'run' },
     { t: 'thumb', req: 1, config: DEFAULT_BG, w: 5000, h: 60, theme },
     { t: 'debug', burnMs: 1000 }, { t: 'debug', burnMs: -1 },
+    { t: 'jank', id: 1, p95: NaN, longMs: 0, windowMs: 2000, n: 1 }, { t: 'jank', id: 1, p95: 20, longMs: -1, windowMs: 2000, n: 1 },
+    { t: 'jank', id: 1, p95: 20, longMs: 0, windowMs: 0, n: 1 }, { t: 'jank', id: 1, p95: 20, longMs: 0, windowMs: 2000, n: 1.5 },
+    { t: 'jank', id: -1, p95: 20, longMs: 0, windowMs: 2000, n: 1 }, { t: 'jank', id: 1, p95: '20', longMs: 0, windowMs: 2000, n: 1 },
+    { t: 'jank', id: 1, p95: 20, longMs: 0, windowMs: 2000 },
     { t: 'init', id: 1, canvas: {}, w: 10, h: 10, config: DEFAULT_BG, allowGL: true },   // not an OffscreenCanvas
   ];
   for (const m of bad) assert.equal(parseToWorker(m), null, JSON.stringify(m));

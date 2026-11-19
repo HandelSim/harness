@@ -1,0 +1,25 @@
+/* Home view (PLAN 3.3). Loaded as text and injected once by HomeView (lazy chunks' CSS is not loaded by the build). */
+.home-body { display: flex; flex-direction: column; gap: var(--sp-3); }
+.home-health { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--sp-3); }
+.home-tile { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+.home-tile[role="button"] { cursor: pointer; }
+.home-tile[role="button"]:hover { background: var(--surface-hover); }
+.home-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--sp-3); align-items: start; }
+.home-card { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.home-card--wide { grid-column: 1 / -1; }
+.home-card-head { display: flex; align-items: center; gap: var(--sp-2); color: var(--text-3); }
+.home-gap { gap: var(--sp-2); }
+.home-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.home-counts { display: flex; flex-wrap: wrap; gap: var(--sp-4); }
+.home-count { display: flex; flex-direction: column; }
+.home-count b, .home-stat b { font-size: var(--text-16); font-weight: var(--weight-medium); color: var(--text-1); }
+.home-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: var(--sp-2); }
+.home-stat { display: flex; flex-direction: column; padding: var(--sp-2) var(--sp-3); border-radius: var(--r-sm); background: var(--surface-2); }
+.home-models { width: 100%; border-collapse: collapse; font-size: var(--text-12); }
+.home-models th { text-align: right; color: var(--text-3); font-weight: var(--weight-medium); padding: 2px var(--sp-2); }
+.home-models td { text-align: right; padding: 3px var(--sp-2); border-top: 1px solid var(--border-subtle); }
+.home-models th:first-child, .home-models td:first-child { text-align: left; width: 45%; max-width: 0; }
+.home-models td:first-child > .mono { display: block; }
+.home-bar { display: block; height: 3px; margin-top: 2px; border-radius: 2px; background: var(--accent-9); opacity: .7; }
+.home-log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); max-height: 320px; overflow: auto; }
+.home-log li { display: flex; flex-direction: column; min-width: 0; }

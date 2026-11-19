@@ -5,6 +5,7 @@ import { derivePalette, effectiveIntensity, type Palette } from './palette';
 import { Governor } from './governor';
 import type { AnyCanvas, Effect, EffectDef } from './effects/types';
 import type { RendererKind } from './protocol';
+import { isJanky, describeJank, type JankSummary } from './jank';
 
 export interface SceneStats { fps: number; frameMs: number; renderer: RendererKind | 'main2d'; tier: 0 | 1 | 2 | 3; downgraded: boolean; reason: string }
 export interface SceneHooks {
@@ -13,7 +14,8 @@ export interface SceneHooks {
   now: () => number;
   onStats: (s: SceneStats, frames: number) => void;
   onFail: (reason: string, contextLost: boolean) => void;
-  maxFps?: number;            // main-thread fallback: 15
+  maxFps?: number;            // main-thread fallback: 15; low power: 20
+  scaleMul?: number;          // low power: 0.5 on top of the effect's own render scale
   label?: 'main2d';
 }
 
@@ -71,10 +73,15 @@ export class Scene {
       this.eff = this.def.make2d(ctx, init);
       this.renderer = 'worker2d';
     }
-    this.eff.resize(this.w, this.h, this.gov.rung.scale);
+    this.eff.resize(this.w, this.h, this.cap());
     this.eff.setPalette(this.pal, this.intensity());
   }
 
+  /** Render-scale cap for the effect: the governor rung, times the low-power multiplier when set. */
+  private cap(): number {
+    const m = this.hooks.scaleMul ?? 1;
+    return m === 1 ? this.gov.rung.scale : Math.min(this.def.scale, this.gov.rung.scale) * m;
+  }
   private intensity(): number { return effectiveIntensity(this.pal, this.cfg.intensity) * (this.state === 'dim' ? 0.6 : 1); }
 
   setConfig(cfg: BgConfig): void {
@@ -82,7 +89,7 @@ export class Scene {
     this.cfg = cfg;
     this.gov.reset();
     if (rebuild) { try { this.build(); } catch (e) { this.hooks.onFail((e as Error).message, false); return; } }
-    else { this.eff?.resize(this.w, this.h, this.gov.rung.scale); this.eff?.setPalette(this.pal, this.intensity()); }
+    else { this.eff?.resize(this.w, this.h, this.cap()); this.eff?.setPalette(this.pal, this.intensity()); }
     this.once();
   }
   setTheme(theme: BgTheme): void {
@@ -100,10 +107,18 @@ export class Scene {
   }
   resize(w: number, h: number): void {
     this.w = w; this.h = h;
-    this.eff?.resize(w, h, this.gov.rung.scale);
+    this.eff?.resize(w, h, this.cap());
     this.once();
   }
   burn(ms: number): void { this.burnMs = ms; }
+  /** Main-thread jank summary from the engine: sustained jank steps the governor down like a slow frame. */
+  jank(s: JankSummary): void {
+    if (!this.running || !this.eff || this.state === 'pause' || this.reduced) return;
+    if (!this.gov.jank(isJanky(s), this.hooks.now(), describeJank(s))) return;
+    if (this.gov.rung.static) { this.stop(); this.hooks.onStats(this.stats(0, 0), this.frames); return; }
+    this.eff.resize(this.w, this.h, this.cap());
+    this.hooks.onStats(this.stats(0, 0), this.frames);
+  }
   dispose(): void { this.disposed = true; this.stop(); if (this.settleTimer !== null) clearTimeout(this.settleTimer); this.eff?.dispose(); this.eff = null; this.gl?.getExtension('WEBGL_lose_context')?.loseContext(); }
 
   /** Redraw once when not animating (paused / reduced) so config and theme changes show. */
@@ -160,7 +175,7 @@ export class Scene {
     this.frames++; this.statFrames++; this.statWork += work;
     if (this.gov.sample(work, t)) {
       if (this.gov.rung.static) { this.stop(); this.hooks.onStats(this.stats(0, work), this.frames); return; }
-      this.eff.resize(this.w, this.h, this.gov.rung.scale);
+      this.eff.resize(this.w, this.h, this.cap());
       this.hooks.onStats(this.stats(0, work), this.frames);                  // report a downgrade at once
     }
     if (this.statT < 0) this.statT = t;

@@ -14,6 +14,14 @@ export function registerPanels(): void {
   registerPanel('view.sessions', lazy(() => import('../views/sessions/SessionsView')));
   registerPanel('transcript', lazy(() => import('../views/transcript/TranscriptPanel')));
   registerPanel('terminal', lazy(() => import('../views/terminal/TerminalPanel')));
+  registerPanel('view.vault', lazy(() => import('../views/vault/VaultView')));
+  registerPanel('vault-file', lazy(() => import('../views/vault/VaultFilePanel')));
+  registerPanel('view.jira', lazy(() => import('../views/jira/JiraView')));
+  registerPanel('view.debug', lazy(() => import('../views/debug/DebugView')));
+  registerPanel('diff', lazy(() => import('../views/ticket/DiffView')));
+  registerPanel('view.home', lazy(() => import('../views/home/HomeView')));
+  registerPanel('view.findings', lazy(() => import('../views/findings/FindingsView')));
+  registerPanel('chat', lazy(() => import('../views/chat/ChatPanel')));
   hooks.newSession = (again) => { void import('../views/session/NewSessionDialog').then((m) => m.openNewSession(again)); };
   hooks.addTickets = () => { void import('../views/queue/AddTicketsDialog').then((m) => m.openAddTickets()); };
 }

@@ -1,5 +1,5 @@
 // Standalone visual + perf check page for the background engine (dev builds only):
-// out/renderer/bg-demo.html. Query: ?id=<bg id>&theme=light&cycle=<seconds>&reduced=1&state=pause
+// out/renderer/bg-demo.html. Query: ?id=<bg id>&theme=light&cycle=<seconds>&reduced=1&state=pause&lowpower=off|on|auto
 import type { BgConfig, BgStats, BgTheme } from '../shared/bg';
 import { createBackground, DEFAULT_BG } from './index';
 import { defaultParams, descriptor } from './catalog';
@@ -17,6 +17,9 @@ const themes: Record<string, BgTheme> = {
 let themeName = q.get('theme') ?? 'dark';
 engine.setTheme(themes[themeName] ?? themes.dark);
 if (q.get('reduced') === '1') engine.setReducedMotion(true);
+// No-GPU policy: ?lowpower=off|on|auto (default: the engine's own default, auto).
+const lp = q.get('lowpower');
+if (lp === 'off' || lp === 'on' || lp === 'auto') (engine as unknown as { setLowPower(m: string): void }).setLowPower(lp);
 
 const cfgFor = (id: string, over: Partial<BgConfig> = {}): BgConfig =>
   ({ ...DEFAULT_BG, id, params: defaultParams(descriptor(id)!), seed: Number(q.get('seed') ?? 1), ...over });

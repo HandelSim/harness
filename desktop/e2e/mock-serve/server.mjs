@@ -3,6 +3,15 @@
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { scenario as makeScenario, topicPath } from './scenarios.mjs';
+// W2-F: canned GET routes (vault tree/file, jira, debug reports, ticket diff) and session messages.
+import { VIEW_ROUTES, MESSAGES } from './data/w2f-views.mjs';
+// 1x1 PNG served at /vault/file/<rel>.png (the vault image route lives outside /api/v1, like serve's)
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+/** Route key of a GET: path, then ?k=v&... with params sorted and sig dropped (unencoded). */
+const routeKey = (sub, u) => {
+  const q = [...u.searchParams.entries()].filter(([k]) => k !== 'sig').sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return q.length ? `${sub}?${q.map(([k, v]) => `${k}=${v}`).join('&')}` : sub;
+};
 
 const sigOf = (d) => createHash('sha1').update(JSON.stringify(d ?? null)).digest('hex').slice(0, 12);
 const TOPIC_RE = /^[a-z-]+(:[A-Za-z0-9._-]+)?$/;
@@ -16,12 +25,16 @@ export async function startMock(o = {}) {
   let reqLog = [];
   let feed = { version: '0.0.1' };
   let nreq = 0;
+  let routes = {};              // GET route key -> { status, data } (W2-F views)
   const sockets = new Set();
   const hung = new Set();
   const sessions = new Set();  // valid cookies (codes-on)
   const ACCESS = 'mock-code-1234';
 
-  const setScenario = (name) => { const s = makeScenario(name); topics = s.topics; flags = s.flags; posts = new Map(); topics.status.state_id = stateId; };
+  const setScenario = (name) => {
+    const s = makeScenario(name); topics = s.topics; flags = s.flags; posts = new Map(); topics.status.state_id = stateId;
+    routes = Object.fromEntries(Object.entries(VIEW_ROUTES).map(([k, d]) => [k, { status: 200, data: d }]));
+  };
   setScenario(o.scenario || 'healthy');
 
   const send = (res, status, body, headers = {}) => {
@@ -35,6 +48,8 @@ export async function startMock(o = {}) {
   const control = {
     scenario: async (name) => setScenario(name),
     setTopic: async (topic, data) => { topics[topic] = data; },
+    /** W2-F: answer GET <path>[?sorted query] with data (status >= 400: data is the {code,message} error); null removes. */
+    setRoute: async (key, data, status = 200) => { if (data === null) delete routes[key]; else routes[key] = { status, data }; },
     onPost: async (path, reply) => { posts.set(path.startsWith('/api/') ? path : `/api/v1${path.startsWith('/') ? '' : '/'}${path}`, reply || {}); },
     fail: async (mode, count) => { failMode = mode; failLeft = mode === 'none' ? 0 : count ?? Infinity; },
     requests: async (filter) => reqLog.filter((r) => !filter || r.path.includes(filter)),
@@ -81,6 +96,13 @@ export async function startMock(o = {}) {
       sessions.add(c);
       return send(res, 303, '', { Location: '/', 'Set-Cookie': `${c}; HttpOnly; Path=/; SameSite=Strict` });
     }
+    if (path.startsWith('/vault/file/') && req.method === 'GET') {
+      if (!authed(req)) return send(res, 401, 'sign in first');
+      reqLog.push({ method: req.method, path: req.url, headers: { ...req.headers }, body: null });
+      if (!/\.png$/i.test(path)) return send(res, 404, 'not found');
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': PNG.length, 'Cache-Control': 'no-store' });
+      return res.end(PNG);
+    }
     if (!path.startsWith('/api/v1/')) return send(res, 200, `<html><body><h1>mock serve ${path}</h1></body></html>`, { 'Content-Type': 'text/html' });
     if (flags.oldServe) return send(res, 404, 'Not Found');
     if (!authed(req)) return send(res, 401, { ok: false, error: { code: 'auth', message: 'sign in first' } });
@@ -112,6 +134,22 @@ export async function startMock(o = {}) {
           const want = u.searchParams.get('sig');
           return send(res, 200, want && want === s ? { ok: true, sig: s, same: true } : { ok: true, sig: s, data });
         }
+      }
+      const rk = routeKey(sub, u);
+      const hit = routes[rk] ?? routes[sub];
+      if (hit) return hit.status >= 400 ? send(res, hit.status, { ok: false, error: hit.data }) : send(res, 200, { ok: true, sig: sigOf(hit.data), data: hit.data });
+      const lm = /^\/tickets\/[^/]+\/lines$/.exec(sub);
+      if (lm) {
+        const from = Math.max(1, Number(u.searchParams.get('from')) || 1); const to = Math.min(from + 499, Number(u.searchParams.get('to')) || from);
+        const lines = []; for (let n = from; n <= to; n++) lines.push(`line ${n} of ${u.searchParams.get('path')}`);
+        return send(res, 200, { ok: true, sig: sigOf(lines), data: { lines, total: 9999 } });
+      }
+      const mm = /^\/sessions\/([^/]+)\/messages$/.exec(sub);
+      if (mm && (topics.sessions || []).some((r) => r.id === decodeURIComponent(mm[1]))) {
+        const from = Math.max(0, Number(u.searchParams.get('from')) || 0);
+        const messages = MESSAGES.messages.filter((m) => m.index >= from);
+        const data = { ...MESSAGES, from, count: MESSAGES.messages.length, messages };
+        return send(res, 200, { ok: true, sig: sigOf(data), data });
       }
       if (sub.startsWith('/tickets/') || sub.startsWith('/sessions/')) return send(res, 404, { ok: false, error: { code: 'not-found', message: 'no such item' } });
       return send(res, 501, { ok: false, error: { code: 'unavailable', message: `mock has no ${sub}` } });
@@ -152,5 +190,6 @@ export function remoteMock(url) {
     return (await r.json()).value;
   };
   return { url, scenario: (n) => call('scenario', n), setTopic: (t, d) => call('setTopic', t, d), onPost: (p, r) => call('onPost', p, r),
+    setRoute: (k, d, s) => call('setRoute', k, d, s),
     fail: (m, c) => call('fail', m, c), requests: (f) => call('requests', f), setFeed: (f) => call('setFeed', f) };
 }

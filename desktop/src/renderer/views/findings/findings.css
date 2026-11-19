@@ -1,0 +1,37 @@
+/* Findings view. Loaded as text and injected once by FindingsView (lazy chunks' CSS is not loaded by the build). */
+.findings-view { display: flex; flex-direction: column; height: 100%; min-height: 0; container-type: inline-size; }
+.findings-view .view-head { flex-wrap: wrap; }
+.findings-body { display: flex; flex-direction: column; min-height: 0; }
+.fselect { height: 26px; max-width: 160px; }
+.fpad { padding: var(--sp-4); overflow: auto; flex: 1; min-height: 0; }
+.fsplit { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(340px, 1.2fr); flex: 1; min-height: 0; }
+@container (max-width: 720px) { .fsplit { grid-template-columns: 1fr; grid-template-rows: minmax(200px, 1fr) minmax(200px, 1fr); } .fleft { border-right: 0; border-bottom: 1px solid var(--border-subtle); } }
+.fleft { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--border-subtle); }
+.fright { min-width: 0; min-height: 0; overflow: auto; }
+.fbar { padding: var(--sp-2) var(--sp-3); flex: none; }
+.flist { flex: 1; min-height: 0; overflow: auto; padding: 0 var(--sp-2) var(--sp-3); outline: none; }
+.flist:focus-visible { box-shadow: inset 0 0 0 1px var(--accent-8); }
+.frow { display: grid; grid-template-columns: 16px 8px minmax(0, 1fr) minmax(0, 90px) 64px; align-items: center; gap: var(--sp-2); height: 34px;
+  padding: 0 var(--sp-2); border-radius: var(--r-sm); cursor: default; user-select: none; }
+.frow:hover { background: var(--surface-hover); }
+.frow[aria-selected="true"] { background: var(--surface-active); }
+.flist:focus .frow[aria-selected="true"] { box-shadow: inset 2px 0 0 0 var(--accent-9); }
+.frow input { accent-color: var(--accent-9); margin: 0; }
+.frow-title { color: var(--text-1); }
+.frow-src, .frow-ago { text-align: right; }
+.fsev { width: 8px; height: 8px; border-radius: 50%; background: var(--border-strong); }
+.fsev--high { background: var(--err-solid); } .fsev--medium { background: var(--warn-solid); } .fsev--low { background: var(--info-solid); }
+.fhint { padding: var(--sp-2) var(--sp-3); }
+.fgroup { padding: var(--sp-2) var(--sp-2) var(--sp-1); }
+.fdetail, .fnote { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4); user-select: text; }
+.fdetail-title, .fnote h2 { font-size: var(--text-16); line-height: var(--lh-16); margin: 0; }
+.fdetail-pre { background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3); max-height: 320px; overflow: auto; }
+.fdetail-steps, .fitems { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: var(--sp-1); }
+.fitems li .btn { margin-left: var(--sp-2); }
+.fagent { gap: var(--sp-3); max-width: 980px; }
+.ftable { width: 100%; border-collapse: collapse; font-size: var(--text-12); }
+.ftable th { text-align: left; color: var(--text-3); font-weight: var(--weight-medium); padding: 2px var(--sp-2); }
+.ftable td { padding: 3px var(--sp-2); border-top: 1px solid var(--border-subtle); }
+.fpass { height: auto; min-height: var(--row-h); }
+.fpass--static { cursor: default; }
+.fpass--static:hover { background: none; }
