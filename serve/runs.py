@@ -833,7 +833,8 @@ class Runs:
     def _ticket_stamp(self, key):
         """What the queue's checks on a ticket read that a stat shows: its state.json and
         its folder (a plan or stage output written or removed). The refs they read are
-        not stat'ed: the checks are kept for at most a minute."""
+        not stat'ed here: the checks are kept for at most a minute (fix_refused adds the
+        branch's ref files, _branch_refs)."""
         d = os.path.join(self.queue_dir, key)
         return (os.path.join(d, "state.json"), d)
 
@@ -926,6 +927,26 @@ class Runs:
                 p["id"] = r["id"]
                 index[r["message_id"]].append(p)
         return msgs
+
+    def messages_page(self, src, sid, start, limit):
+        """(the session's message count, messages() from start, at most limit): the
+        page alone is read and decoded, so a long session's tail costs its page."""
+        rows = self._query(src, "select count(*) as n from message where session_id = ?", (sid,))
+        count = rows[0]["n"] if rows else 0
+        start = max(0, min(int(start), count))
+        page = ("select id from message where session_id = ? order by time_created, id limit ? offset ?")
+        msgs = [(r["id"], _loads(r["data"]), _ms(r["time_created"]), [])
+                for r in self._query(src, "select id, data, time_created from message where session_id = ? "
+                                          "order by time_created, id limit ? offset ?", (sid, limit, start))]
+        index = {m[0]: m[3] for m in msgs}
+        if index:
+            for r in self._query(src, f"select id, message_id, data from part where session_id = ? "
+                                      f"and message_id in ({page}) order by id", (sid, sid, limit, start)):
+                if r["message_id"] in index:
+                    p = _loads(r["data"])
+                    p["id"] = r["id"]
+                    index[r["message_id"]].append(p)
+        return count, msgs
 
     def part(self, src, sid, pid):
         rows = self._query(src, "select data from part where session_id = ? and id = ?", (sid, pid))
@@ -1239,7 +1260,25 @@ class Runs:
                 return tq.owner_fix_refused(q, st, look=False) if isinstance(st, dict) else None
             except Exception:
                 return None
-        return self.memo("fix_refused", (key, _tq), self._ticket_stamp(key), check, ttl=60)
+        refs = self._branch_refs(key)
+        # its one git call (rev-list base..branch) is answered again only when the branch's ref
+        # files change, not every minute: the queue's poll asks this for every ticket
+        return self.memo("fix_refused", (key, _tq), self._ticket_stamp(key) + refs, check, ttl=0 if refs else 60)
+
+    def _branch_refs(self, key):
+        """The files a commit on the ticket's branch changes, in the git folder its agents
+        commit to (loose ref, packed-refs, reftable list); () when that is not a plain
+        .git folder (a worktree's .git file, no clone yet): then a check is kept a minute."""
+        st = self.ticket_state(key)
+        if not isinstance(st, dict) or not st:
+            return ()
+        wd = st.get("project") if st.get("in_place") else os.path.join(self.queue_dir, key, "repo")
+        gd = os.path.join(wd, ".git") if isinstance(wd, str) and wd else ""
+        if not gd or not os.path.isdir(gd):
+            return ()
+        branch = st.get("branch") or key
+        return (os.path.join(gd, "refs", "heads", *str(branch).split("/")), os.path.join(gd, "packed-refs"),
+                os.path.join(gd, "reftable", "tables.list"))
 
     def vault_of(self, st):
         """The vault the queue ran the ticket with (it may not be the one this

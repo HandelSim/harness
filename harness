@@ -7643,8 +7643,28 @@ HELP
                     return 1
                 fi
             fi
+            # In the background with TERM and HUP passed on, so a signal to
+            # this wrapper alone (serve's or the desktop's stop) still ends the
+            # run and its put-back, not just the wrapper. INT is not passed on:
+            # a Ctrl-C already reaches the run (same process group), and a
+            # second one would cut its put-back short. The subshell undoes the
+            # ignored INT/QUIT bash gives a background job; <&0 keeps stdin.
+            local qpid caught=0 r
             # shellcheck disable=SC2086  # $py can be 'py -3'
-            PYTHONUTF8=1 $py "$script" "${args[@]}" || rc=$?
+            ( trap - INT QUIT; PYTHONUTF8=1 exec $py "$script" "${args[@]}" ) <&0 &
+            qpid=$!
+            trap 'caught=1; kill -TERM "$qpid" 2>/dev/null' TERM
+            trap 'caught=1; kill -HUP "$qpid" 2>/dev/null' HUP
+            trap 'caught=1' INT
+            wait "$qpid" || rc=$?
+            # A trapped signal ends the wait early (128+N): wait again for the
+            # run's own code (127: that code was already collected above).
+            while (( caught )); do
+                caught=0 r=0
+                wait "$qpid" || r=$?
+                (( r == 127 )) || rc=$r
+            done
+            trap - TERM HUP INT
             if (( rc == 75 )); then
                 # harness upgrade changed the runner: it ended between tickets
                 # to go on with the new code (and this script's). Not while the
@@ -7670,8 +7690,11 @@ HELP
         *) err "unknown queue command '$sub' (see: harness queue --help)"; return 1 ;;
     esac
     # UTF-8 for its files and pipes whatever the Windows code page is.
+    # exec: a signal to `harness queue <cmd>` reaches the script itself.
+    # exec bypasses the EXIT trap: reap the jq sidecar before it.
+    _reap_jq_sidecar
     # shellcheck disable=SC2086  # $py can be 'py -3'
-    PYTHONUTF8=1 $py "$script" "${args[@]}"
+    PYTHONUTF8=1 exec $py "$script" "${args[@]}"
 }
 
 # `harness findings`: the findings agent (scripts/findings_agent.py) runs

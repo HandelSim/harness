@@ -7215,12 +7215,12 @@ def end_run(q, a):
     stage (stopped, when the owner had asked that)."""
     r = runner(q)
     end = time.time() + 10
-    while run_going(q) and not trusted(r) and time.time() < end:   # a run that has just taken run.lock
+    while run_going(q) and not trusted(r, q) and time.time() < end:   # a run that has just taken run.lock
         time.sleep(0.5)                                             # names itself within seconds
         r = runner(q)
     pid, agent = r.get("pid"), r.get("agent")
     if run_going(q):
-        if not trusted(r):
+        if not trusted(r, q):
             # Not the run's pid: a run.json with no beat is one a run the machine took down (or
             # a kill) left, and after a restart its pid may be any other process by now.
             print("[queue] a run holds the queue but its run.json has not beaten in 30 s (a run still "
@@ -7234,17 +7234,18 @@ def end_run(q, a):
         # the run first: it would take its agent's end for a failed launch and go on
         # (a parallel run: each slot is a run, then the run that started them; only a slot
         # that beats: a run-I.json a killed run left names a pid that may be someone else's)
-        for s in [*(s for s in slot_runs(q, all_files=True) if trusted(s)), r]:
+        for s in [*(s for s in slot_runs(q, all_files=True) if trusted(s, q)), r]:
             if s is not r and not (isinstance(s.get("pid"), int) and s["pid"] > 0):
                 continue
+            agents = [p for p in [s.get("agent")] + list(s.get("agents") or [])   # a panel's: all of them
+                      if isinstance(p, int) and not isinstance(p, bool) and p > 0 and own_agent(s, p)]
             if os.name == "nt":
                 kill_tree(s["pid"])
             else:
                 with contextlib.suppress(OSError):
                     os.kill(s["pid"], signal.SIGKILL)
-            for pid_ in [s.get("agent")] + list(s.get("agents") or []):   # a panel's: all of them
-                if isinstance(pid_, int) and pid_ > 0:
-                    kill_tree(pid_)   # the agent's session (Windows: its tree: bash, the docker client)
+            for pid_ in agents:
+                kill_tree(pid_)   # the agent's session (Windows: its tree: bash, the docker client)
         end = time.time() + 20
         while run_going(q) and time.time() < end:
             time.sleep(0.2)
@@ -7369,9 +7370,11 @@ def run_file(path):
     return info if isinstance(info, dict) else None
 
 
-def trusted(info):
+def trusted(info, q=None):
     """halt --force may kill the pid run.json (run-I.json) names: it beats, or (a run
-    frozen whole, its beat thread too) /proc says it is a ticket_queue.py process."""
+    frozen whole, its beat thread too) /proc says it runs ticket_queue.py's `run` (a
+    slot's too) on this queue (q's state folder), not just any ticket_queue.py command
+    or an editor open on the file: after a restart a stale pid may be anyone's."""
     if beating(info):
         return True
     pid = info.get("pid")
@@ -7379,8 +7382,46 @@ def trusted(info):
         return False
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return any(arg.endswith(b"ticket_queue.py") for arg in f.read().split(b"\0"))
+            argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0")]
+        cwd = os.readlink(f"/proc/{pid}/cwd")
     except OSError:   # no /proc (macOS, Windows), or gone: the beat alone decides
+        return False
+    return runs_queue(argv, q.root if q is not None else None, cwd)
+
+
+def runs_queue(argv, root, cwd):
+    """argv (a command line) is ticket_queue.py --state <root> run ... (root None: any queue)."""
+    i = next((n for n, a in enumerate(argv) if os.path.basename(a) == "ticket_queue.py"), None)
+    if i is None:
+        return False
+    rest, state, sub, j = argv[i + 1:], None, None, 0
+    while j < len(rest):
+        a = rest[j]
+        if a == "--state" and j + 1 < len(rest):
+            state, j = rest[j + 1], j + 2
+        elif a.startswith("--state="):
+            state, j = a.split("=", 1)[1], j + 1
+        elif a.startswith("-"):
+            j += 1
+        else:
+            sub = a
+            break
+    if sub != "run":
+        return False
+    if root is None:
+        return True
+    return state is not None and os.path.realpath(os.path.join(cwd, state)) == os.path.realpath(root)
+
+
+def own_agent(s, pid):
+    """pid is still the agent run file s names: s beats, or /proc says pid's parent is s's
+    process (asked before that is killed: a stale file's agent pid may be anyone's by now)."""
+    if beating(s):
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1]) == s.get("pid")
+    except (OSError, ValueError, IndexError):
         return False
 
 
@@ -7936,8 +7977,8 @@ def main(argv):
     s.add_argument("--slot", type=int, default=0, help=argparse.SUPPRESS)   # one of a parallel run's slots
     a = p.parse_args(argv[1:])
     a.argv = argv
-    q = Queue(a.state)
     try:
+        q = Queue(a.state)      # makes the state folder: inside the try, so a parent it cannot be made in is said too
         return {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "status": cmd_status, "stats": cmd_stats, "remove": cmd_remove,
             "approve": cmd_approve, "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
             "archive": cmd_archive, "unarchive": cmd_unarchive,
@@ -7950,7 +7991,7 @@ def main(argv):
             raise
         # a full disk, or a state folder this user cannot write: said, not a traceback; a ticket
         # is left as its last whole write had it (write_atomic), and the next run carries on
-        print(f"[queue] could not write the queue's files ({e}): the disk may be full, or {q.root} not "
+        print(f"[queue] could not write the queue's files ({e}): the disk may be full, or {a.state} not "
               "writable by this user; free space or fix its owner, then try again", file=sys.stderr)
         return 1
 

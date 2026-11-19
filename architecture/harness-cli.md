@@ -1151,9 +1151,13 @@ a parallel parent sends it on to each slot), exit 128+N, but leave `run.json`
 with its beat already stale (`ended: "signal N"`), so serve's start runs it
 again (`resume_runner`) even within the 30 s a beat counts as fresh. A signal
 already ignored (`nohup`) stays ignored; on SIGHUP stdout/stderr go to
-`/dev/null` first, since a write to the closed terminal would fail (EIO). A full
+`/dev/null` first, since a write to the closed terminal would fail (EIO). The
+`harness queue run` wrapper runs the script in the background and passes TERM
+and HUP sent to the wrapper alone on to it, then waits for its real exit code
+(INT is not passed on: a Ctrl-C reaches both, and a second one would cut the
+put-back short); other `harness queue` commands `exec` the script. A full
 disk or a state folder this user cannot write (EACCES/EPERM/ENOSPC/EROFS/EDQUOT
-from any command) is one `[queue] could not write the queue's files` line and
+from any command, or a state folder that cannot be made) is one `[queue] could not write the queue's files` line and
 exit 1, not a traceback; `run_going` answers "no run" for a `run.lock` that
 cannot be made, so `list` and `status` work on a read-only folder.
 A run that ends on an upstream outage (exit 3), Ctrl-C (130) or one of those signals

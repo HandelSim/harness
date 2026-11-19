@@ -490,6 +490,17 @@ class OutTest(ApiTest):
 class SessionTest(ApiTest):
     kw = {"opencode_port": 4096}
 
+    def test_messages_pages_are_the_whole_reads_slices(self):
+        """A-3: /messages reads its page with SQL limit/offset; the same as the slice of all."""
+        whole = self.ok(f"/sessions/{ROOT}/messages?limit=1000")
+        n = whole["count"]
+        self.assertGreater(n, 0)
+        for start in range(0, n + 2):
+            for limit in (1, 2, 1000):
+                m = self.ok(f"/sessions/{ROOT}/messages?from={start}&limit={limit}")
+                self.assertEqual((m["from"], m["count"]), (min(start, n), n))
+                self.assertEqual(m["messages"], whole["messages"][start:start + limit])
+
     def test_list_head_messages_part(self):
         rows = self.ok("/sessions")
         ids = [r["id"] for r in rows]
@@ -581,6 +592,38 @@ class DiffTest(ApiTest):
         self.git("checkout", "-q", "main")
         self.write("a.txt", "one\nnot committed\n")
         self.fx.ticket(project=self.proj, in_place=True, base_sha=base, status="done", questions=[])
+
+    def test_queue_polls_do_not_spawn_git_again_per_done_ticket(self):
+        """A-4: the queue's gates ask fix_refused (a git rev-list) for every done ticket; a poll
+        a minute on asks git again only when the branch's ref changed, not every minute."""
+        import subprocess
+        real_popen, real_time, spawned, off = subprocess.Popen, time.time, [], [0]
+
+        class Counting(real_popen):
+            def __init__(self, cmd, *a, **k):
+                if isinstance(cmd, (list, tuple)) and "rev-list" in cmd:
+                    spawned.append(cmd)
+                super().__init__(cmd, *a, **k)
+
+        def poll():
+            r, d = self.fx.get("/poll?t=queue")
+            self.assertEqual(r.status, 200, d)
+            return d
+        with mock.patch("subprocess.Popen", Counting), mock.patch("time.time", lambda: real_time() + off[0]):
+            off[0] = 5
+            poll()
+            first = len(spawned)
+            for i in range(1, 4):   # each a minute and more on: the old memo expired every minute
+                off[0] = 5 + 70 * i
+                poll()
+            self.assertEqual(len(spawned), first, spawned)
+            # a commit on the branch (made without a checkout: the tree has changes): asked again, once
+            sha = self.git("commit-tree", self.git("rev-parse", "ABC-12^{tree}"), "-p", "ABC-12", "-m", "more")
+            self.git("update-ref", "refs/heads/ABC-12", sha)
+            off[0] = 5 + 70 * 5
+            poll()
+            poll()
+            self.assertEqual(len(spawned), first + 1, spawned)
 
     def test_work_and_uncommitted(self):
         d = self.ok("/tickets/ABC-12/diff")

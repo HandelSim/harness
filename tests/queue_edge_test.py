@@ -192,14 +192,29 @@ class HaltForceTest(Edge):
         self.assertTrue(tq.run_going(q))
 
 
+    def test_only_a_run_of_this_queue_passes_for_the_run(self):
+        # Q-2: a name match was enough (an editor on the file, `queue list`, another queue's run)
+        root = self.state
+        yes = [["python3", "/x/ticket_queue.py", "--state", root, "run", "--vault", "v"],
+               ["python3", "ticket_queue.py", f"--state={root}", "run", "--slot", "2"],
+               ["python3", "ticket_queue.py", "--state", os.path.basename(root), "run"]]
+        no = [["vim", "scripts/ticket_queue.py"], ["python3", "/x/ticket_queue.py", "--state", root, "list"],
+              ["python3", "/x/ticket_queue.py", "--state", root + "-other", "run"],
+              ["python3", "-c", "pass", "run.lock", "ticket_queue.py"], ["python3", "/x/ticket_queue.py", "run"]]
+        for argv in yes:
+            self.assertTrue(tq.runs_queue(argv, root, os.path.dirname(root)), argv)
+        for argv in no:
+            self.assertFalse(tq.runs_queue(argv, root, os.path.dirname(root)), argv)
+
     @unittest.skipUnless(os.path.isdir("/proc/self"), "the run's command line is read from /proc")
     def test_halt_force_ends_a_frozen_run_that_no_longer_beats(self):
         # a run frozen whole (its beat thread too): run.json stale, but its pid is the queue's
         os.makedirs(self.state, exist_ok=True)
         code = ("import fcntl, sys, time; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); "
                 "print('locked', flush=True); time.sleep(60)")
-        p = subprocess.Popen([sys.executable, "-c", code, os.path.join(self.state, "run.lock"), "ticket_queue.py"],
-                             stdout=subprocess.PIPE, text=True)
+        # its command line as a run's: ticket_queue.py --state <this queue> run
+        p = subprocess.Popen([sys.executable, "-c", code, os.path.join(self.state, "run.lock"), "ticket_queue.py",
+                              "--state", self.state, "run"], stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait(), p.stdout.close()))
         self.assertEqual(p.stdout.readline().strip(), "locked")
         put(os.path.join(self.state, "run.json"), json.dumps({"pid": p.pid, "beat": int(time.time()) - 3600}))
@@ -390,6 +405,26 @@ class StateDirTest(Edge):
         rc, out = self.q("list")
         self.assertEqual(rc, 0, out)
         self.assertIn("ABC-1", out)
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "root writes anywhere")
+    def test_a_state_folder_that_cannot_be_made_is_a_clear_error(self):
+        parent = os.path.join(self.tmp, "ro")
+        os.makedirs(parent)
+        os.chmod(parent, 0o555)
+        state = os.path.join(parent, "queue")
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        try:
+            for cmd in (("list",), ("halt",)):
+                out = StringIO()
+                with redirect_stdout(out), redirect_stderr(out):
+                    rc = tq.main(["ticket_queue.py", "--state", state, *cmd])
+                self.assertEqual(rc, 1, out.getvalue())
+                self.assertNotIn("Traceback", out.getvalue())
+                self.assertIn(state, out.getvalue())
+            self.assertFalse(os.path.exists(state))
+        finally:
+            os.chmod(parent, 0o755)   # before the tmp folder is removed
 
 
 if __name__ == "__main__":

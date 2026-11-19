@@ -632,14 +632,14 @@ def read_messages(ctx, sid):
     runs, src, row = _find(ctx, sid)
     start = ctx.int_arg("from", 0)
     limit = ctx.int_arg("limit", MSG_LIMIT, 1, MSG_LIMIT_MAX)
-    msgs = runs.messages(src, sid)
+    count, msgs = runs.messages_page(src, sid, start, limit)   # the page alone is read (A-3)
     live = runs.live()
-    start = min(start, len(msgs))
+    start = min(start, count)
     page = [{"id": mid, "index": start + i, "created": t, "role": (info or {}).get("role", ""), "info": info,
              "parts": [_cut_part(p) for p in plist]}
-            for i, (mid, info, t, plist) in enumerate(msgs[start:start + limit])]
+            for i, (mid, info, t, plist) in enumerate(msgs)]
     working = sid in live or time.time() - runs_view._ms(row.get("time_updated")) / 1000 <= runs_view.ACTIVE
-    return {"from": start, "count": len(msgs), "messages": page, "working": working, "live": sid in live}
+    return {"from": start, "count": count, "messages": page, "working": working, "live": sid in live}
 
 
 def read_part(ctx, sid, pid):
