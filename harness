@@ -4777,6 +4777,8 @@ host_proxy_port()      { printf '%s' "${HARNESS_HOST_PORT:-${PROXY_PORT:-8000}}"
 # arbitrary system opencode can silently break print mode.
 HARNESS_HOST_JQ_VERSION="${HARNESS_HOST_JQ_VERSION:-1.7.1}"
 HARNESS_HOST_NODE_VERSION="${HARNESS_HOST_NODE_VERSION:-20.20.2}"
+# Node the desktop app is built with when the machine has no Node >= 22 (harness desktop).
+HARNESS_DESKTOP_NODE_VERSION="${HARNESS_DESKTOP_NODE_VERSION:-22.23.5}"
 HARNESS_HOST_OPENCODE_VERSION="${HARNESS_HOST_OPENCODE_VERSION:-1.19.3}"
 HARNESS_HOST_OPENAI_COMPAT_VERSION="${HARNESS_HOST_OPENAI_COMPAT_VERSION:-2.0.47}"
 
@@ -5079,6 +5081,95 @@ host_python_bin() {
     if command -v py >/dev/null 2>&1 && py -3 --version 2>&1 | grep -q '^Python 3'; then
         printf 'py -3'; return 0
     fi
+    # No usable system Python: harness's own (fetched the first time it is
+    # needed). Callers word-split the result (for 'py -3'), so a path with a
+    # space in it goes out as the bare name, which harness_python_on_path has
+    # already put first on this process's PATH.
+    if harness_ensure_python; then
+        c=$(harness_python_vendored)
+        [[ "$c" =~ [[:space:]] ]] && c=${c##*/} && c=${c%.exe}
+        printf '%s' "$c"; return 0
+    fi
+    return 1
+}
+
+# --- private Python: harness fetches its own when the machine has none ---------
+# A python-build-standalone "install_only" CPython (the portable build uv uses),
+# checksum-verified against the release's SHA256SUMS and unpacked under
+# state/tools. No admin rights, no installer, nothing outside the install root.
+# HARNESS_NO_AUTO_DEPS=1 turns every automatic dependency download off.
+HARNESS_PYTHON_VERSION="${HARNESS_PYTHON_VERSION:-3.12.16}"
+HARNESS_PYTHON_BUILD="${HARNESS_PYTHON_BUILD:-20261110}"
+harness_tools_dir() { printf '%s/tools' "$state_root"; }
+harness_python_dir() { printf '%s/python-%s-%s' "$(harness_tools_dir)" "$HARNESS_PYTHON_VERSION" "$HARNESS_PYTHON_BUILD"; }
+harness_python_vendored() {
+    if [[ "$(harness_detect_os)" == windows ]]; then
+        printf '%s/python/python.exe' "$(harness_python_dir)"
+    else
+        printf '%s/python/bin/python3' "$(harness_python_dir)"
+    fi
+}
+
+# Put harness's own Python (whether or not it is fetched yet) first on PATH, so
+# once it exists every harness command and child process uses it. Run once at
+# launch; a path entry that does not exist yet costs nothing.
+harness_python_on_path() {
+    local d; d=$(harness_python_vendored); d=${d%/*}
+    case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH"; export PATH ;; esac
+}
+
+# The release's target triple for this machine (non-zero when unsupported).
+harness_python_triple() {
+    local arch
+    case "$(uname -m 2>/dev/null)" in
+        x86_64|amd64) arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *) return 1 ;;
+    esac
+    case "$(harness_detect_os)" in
+        windows)
+            # Git Bash on Windows on ARM runs emulated as x64; Windows knows better.
+            [[ "${PROCESSOR_ARCHITEW6432:-${PROCESSOR_ARCHITECTURE:-}}" == ARM64 ]] && arch=aarch64
+            printf '%s-pc-windows-msvc' "$arch" ;;
+        macos) printf '%s-apple-darwin' "$arch" ;;
+        linux) printf '%s-unknown-linux-gnu' "$arch" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 0 when the private Python is ready, fetching it the first time. Concurrent
+# callers (the desktop app runs several harness commands at once) each unpack
+# into their own temp dir and the first complete tree wins, so none runs a
+# half-unpacked one.
+harness_ensure_python() {
+    local exe dir triple name base sha tmpd out rc=0
+    exe=$(harness_python_vendored); dir=$(harness_python_dir)
+    if [[ -x "$exe" ]] && "$exe" --version >/dev/null 2>&1; then return 0; fi
+    [[ "${HARNESS_NO_AUTO_DEPS:-}" == 1 ]] && return 1
+    triple=$(harness_python_triple) || { err "harness: no portable Python for $(harness_detect_os)/$(uname -m); install Python 3 yourself"; return 1; }
+    name="cpython-${HARNESS_PYTHON_VERSION}+${HARNESS_PYTHON_BUILD}-${triple}-install_only.tar.gz"
+    base="https://github.com/astral-sh/python-build-standalone/releases/download/${HARNESS_PYTHON_BUILD}"
+    echo "[harness] Python 3 is not installed; fetching harness's own copy (Python ${HARNESS_PYTHON_VERSION}, ~30 MB, once)..." >&2
+    # host_sha_from_manifest matches the name as a regex: escape its '.' and '+'.
+    sha=$(host_sha_from_manifest "$base/SHA256SUMS" "$(printf '%s' "$name" | sed 's/[.+]/\\&/g')") \
+        || { err "harness: could not read the Python checksum from $base/SHA256SUMS (offline?)"; return 1; }
+    mkdir -p "$(harness_tools_dir)" || return 1
+    tmpd="$dir.part.$$"; rm -rf "$tmpd"; mkdir -p "$tmpd" || return 1
+    if ! host_fetch "$base/${name//+/%2B}" "$tmpd/python.tar.gz" "$sha" \
+        || ! host_extract_archive "$tmpd/python.tar.gz" "$tmpd" tar.gz; then
+        err "harness: could not fetch Python; install Python 3 yourself (python.org) and re-run"
+        rm -rf "$tmpd"; return 1
+    fi
+    rm -f "$tmpd/python.tar.gz"
+    if [[ -x "$exe" ]] && "$exe" --version >/dev/null 2>&1; then rm -rf "$tmpd"; return 0; fi   # another run won
+    rm -rf "$dir"
+    mv "$tmpd" "$dir" 2>/dev/null || rm -rf "$tmpd"
+    out=$("$exe" --version 2>&1) || rc=$?
+    if (( rc == 0 )) && [[ "$out" == "Python 3"* ]]; then
+        echo "[harness] Python ready ($out, $exe)" >&2; return 0
+    fi
+    err "harness: the fetched Python does not run ($exe, exit $rc): $out"
+    host_jq_run_hint "$rc" "$out" "$exe" || true
     return 1
 }
 
@@ -5362,13 +5453,12 @@ host_ensure_toolchain() {
     return 0
 }
 
-# python3 is the one host-mode dependency harness does NOT auto-provision: it
-# bootstraps the proxy venv, so it must already exist to fetch anything. Checked
-# early (before the confirm gate) so a python3-less host fails fast without
-# prompting or downloading.
+# Python 3 bootstraps the proxy venv. host_python_bin uses the system's, else
+# fetches harness's own (harness_ensure_python); this only fails when neither
+# works (offline, unsupported CPU, or HARNESS_NO_AUTO_DEPS=1).
 host_require_python3() {
     if ! host_python_bin >/dev/null 2>&1; then
-        err "host mode needs Python 3 (runs the translating proxy and bootstraps its venv); none found in PATH"
+        err "host mode needs Python 3 (runs the translating proxy and bootstraps its venv); none on PATH and harness could not fetch its own"
         err "  install Python 3 (python3 / python / py) from your OS package manager, then re-run."
         err "  on Windows (Git Bash) the python.org installer provides 'python' and 'py'."
         return 1
@@ -13059,22 +13149,21 @@ cmd_preflight() {
     # gets these from inside the image, so they're irrelevant there.
     if (( host_only )); then
         local hdep
-        for hdep in python3 jq node opencode; do
+        # Each of these is fetched by harness on first use when missing (Python
+        # by host_python_bin, the rest by host_ensure_toolchain), so a missing
+        # one is information, not an error. Nothing is downloaded here.
+        if HARNESS_NO_AUTO_DEPS=1 host_python_bin >/dev/null 2>&1; then
+            echo "  ✓ python3"
+        else
+            echo "  • python3 not installed; harness fetches its own on first use"
+        fi
+        for hdep in jq node opencode; do
             if command -v "$hdep" >/dev/null 2>&1; then
                 echo "  ✓ $hdep"
             else
-                echo "  ✗ $hdep not found (required for 'harness host')"
-                errors=$((errors+1))
+                echo "  • $hdep not on PATH; 'harness host' fetches its own on first use"
             fi
         done
-        if command -v node >/dev/null 2>&1; then
-            local pnmaj
-            pnmaj=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
-            if [[ -z "$pnmaj" ]] || (( pnmaj < 20 )); then
-                echo "  ✗ node $(node --version 2>/dev/null) is too old (host mode needs >= 20)"
-                errors=$((errors+1))
-            fi
-        fi
     fi
 
     # Configuration files. .env is required for both modes; the firewall
@@ -13686,7 +13775,8 @@ usage: harness desktop [start]   launch the desktop app; installs it first when
        harness desktop where     print the installed app and whether it is current
 
 The desktop app is the Electron GUI in desktop/: tabbed agent sessions, the
-ticket queue, settings and keys. Building needs Node.js 22 or newer with npm.
+ticket queue, settings and keys. Building needs Node.js 22 or newer; when
+the machine has none, harness fetches its own into state/tools (once).
 'install' runs npm ci (only when package-lock.json changed), the production
 build and electron-builder, then installs:
   Windows  per user, %LOCALAPPDATA%\Programs\Harness\Harness.exe, with
@@ -13753,26 +13843,63 @@ _desktop_node_hint() {
     esac
 }
 
+# 0 when node (>= 22), npm and npx on PATH can build the app; sets _desktop_node_v.
+_desktop_node_usable() {
+    local major
+    _desktop_node_v=""
+    command -v node >/dev/null 2>&1 || return 1
+    _desktop_node_v=$(node -v 2>/dev/null) || _desktop_node_v=""
+    _desktop_node_v=${_desktop_node_v//$'\r'/}
+    major=${_desktop_node_v#v}; major=${major%%.*}
+    [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 22 )) || return 1
+    command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1
+}
+
+# Node for building the app: the one on PATH when it is new enough, else
+# harness's own (the official nodejs.org build, checksum-verified, under
+# state/tools; fetched once), put first on PATH for this run. Fails only when
+# that is impossible (offline, unsupported CPU, HARNESS_NO_AUTO_DEPS=1).
 _desktop_check_node() {
-    local v major
-    if ! command -v node >/dev/null 2>&1; then
-        err "desktop: building the app needs Node.js 22 or newer, and node is not on PATH"
-        _desktop_node_hint "$1" >&2
-        return 1
+    local plat root exe archive ext base sha tmpd had
+    _desktop_node_usable && return 0
+    had=${_desktop_node_v:-none}
+    if plat=$(host_node_platform 2>/dev/null); then
+        root="$(harness_tools_dir)/node-v${HARNESS_DESKTOP_NODE_VERSION}-${plat}"
+        exe=$(host_node_exe "$root")
+        if [[ ! -x "$exe" ]] || ! "$exe" --version >/dev/null 2>&1; then
+            if [[ "${HARNESS_NO_AUTO_DEPS:-}" != 1 ]]; then
+                echo "harness desktop: Node.js 22+ is not installed (found: $had); fetching harness's own copy (Node ${HARNESS_DESKTOP_NODE_VERSION}, ~30 MB, once)"
+                if [[ "$(harness_detect_os)" == windows ]]; then ext=zip; else ext=tar.gz; fi
+                archive="node-v${HARNESS_DESKTOP_NODE_VERSION}-${plat}.${ext}"
+                base="https://nodejs.org/dist/v${HARNESS_DESKTOP_NODE_VERSION}"
+                tmpd="$root.part.$$"; rm -rf "$tmpd"
+                if sha=$(host_sha_from_manifest "$base/SHASUMS256.txt" "${archive//./\\.}") \
+                    && mkdir -p "$tmpd" \
+                    && host_fetch "$base/$archive" "$tmpd/$archive" "$sha" \
+                    && host_extract_archive "$tmpd/$archive" "$tmpd" "$ext" \
+                    && [[ -d "$tmpd/${archive%."$ext"}" ]]; then
+                    rm -rf "$root"; mv "$tmpd/${archive%."$ext"}" "$root" 2>/dev/null || true
+                else
+                    err "desktop: could not fetch Node.js from $base (offline, or a proxy blocked it?)"
+                fi
+                rm -rf "$tmpd"
+            fi
+        fi
+        if [[ -x "$exe" ]]; then
+            PATH="$(host_node_exe_dir "$root"):$PATH"; export PATH
+            if _desktop_node_usable; then
+                echo "harness desktop: building with harness's own Node $_desktop_node_v"
+                return 0
+            fi
+        fi
     fi
-    v=$(node -v 2>/dev/null) || v=""
-    v=${v//$'\r'/}
-    major=${v#v}; major=${major%%.*}
-    if [[ ! "$major" =~ ^[0-9]+$ ]] || (( major < 22 )); then
-        err "desktop: building the app needs Node.js 22 or newer; this node is ${v:-unknown}"
-        _desktop_node_hint "$1" >&2
-        return 1
+    if [[ "$had" == none ]]; then
+        err "desktop: building the app needs Node.js 22 or newer; node is not on PATH and harness could not fetch its own"
+    else
+        err "desktop: building the app needs Node.js 22 or newer; this node is $had and harness could not fetch its own"
     fi
-    if ! command -v npm >/dev/null 2>&1 || ! command -v npx >/dev/null 2>&1; then
-        err "desktop: npm/npx not found next to node $v (they ship with Node.js)"
-        _desktop_node_hint "$1" >&2
-        return 1
-    fi
+    _desktop_node_hint "$1" >&2
+    return 1
 }
 
 # electron-builder's name for this machine's CPU (x64 or arm64).
@@ -14161,6 +14288,7 @@ main() {
 # Set only for real execution: a sourced test shell must not reap on its
 # own subshell exit.
 if [[ -z "${HARNESS_SOURCE_ONLY:-}" ]]; then
+    harness_python_on_path
     trap '_reap_jq_sidecar' EXIT
     main "$@"
 fi

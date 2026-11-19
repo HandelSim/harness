@@ -187,19 +187,56 @@ ok "T4: stale stamp (desktop/ committed) -> rebuild, swap, new stamp, launch"
 # --- T5: node missing / too old -------------------------------------------------
 C2="$C"; C="$TMP/clone5"; make_clone "$C" git
 mv "$STUBS/node" "$TMP/node.off"
-ARGS=(); run HARNESS_DESKTOP_OS=windows
+ARGS=(); run HARNESS_DESKTOP_OS=windows HARNESS_NO_AUTO_DEPS=1
 [[ $RC != 0 ]] || fail "T5: node missing exited 0"
-grep -q "needs Node.js 22 or newer, and node is not on PATH" <<<"$OUT" || fail "T5: no clear error — $OUT"
+grep -q "needs Node.js 22 or newer; node is not on PATH and harness could not fetch its own" <<<"$OUT" || fail "T5: no clear error — $OUT"
 grep -q "winget install OpenJS.NodeJS.LTS" <<<"$OUT" || fail "T5: no Windows install hint — $OUT"
 mv "$TMP/node.off" "$STUBS/node"
-ARGS=(install); run HARNESS_DESKTOP_OS=macos STUB_NODE_VERSION=v20.18.0
+ARGS=(install); run HARNESS_DESKTOP_OS=macos STUB_NODE_VERSION=v20.18.0 HARNESS_NO_AUTO_DEPS=1
 [[ $RC != 0 ]] || fail "T5: node 20 exited 0"
 grep -q "this node is v20.18.0" <<<"$OUT" || fail "T5: no too-old error — $OUT"
 grep -q "brew install node" <<<"$OUT" || fail "T5: no macOS hint — $OUT"
 ! grep -q '^npm \|^npx ' "$LOG" || fail "T5: built without a usable node"
 [[ ! -e "$C/state/desktop/installed" ]] || fail "T5: stamp written"
+ok "T5: node missing / v20 and auto-fetch off -> clear error with a per-OS install hint, non-zero, no build, no stamp"
+
+# --- T5b: no node 22 -> harness fetches its own Node and builds with it ---------
+# A fake nodejs.org: curl serves SHASUMS256.txt and a tarball whose node/npm/npx
+# log as vnode/vnpm/vnpx, so the build provably ran on the fetched toolchain.
+NV=$(sed -n 's/^HARNESS_DESKTOP_NODE_VERSION="\${HARNESS_DESKTOP_NODE_VERSION:-\(.*\)}"$/\1/p' "$REPO_ROOT/harness")
+[[ -n "$NV" ]] || fail "T5b: HARNESS_DESKTOP_NODE_VERSION default not found"
+NODEFIX="$TMP/nodefix/node-v$NV-linux-x64/bin"; mkdir -p "$NODEFIX"
+for t in node npm npx; do
+    sed "s/printf \"%s\" \"$t\"/printf \"%s\" \"v$t\"/; s/v22.11.0/v$NV/" "$STUBS/$t" >"$NODEFIX/$t"; chmod +x "$NODEFIX/$t"
+done
+tar -czf "$TMP/node.tgz" -C "$TMP/nodefix" "node-v$NV-linux-x64"
+NSHA=$(sha256sum "$TMP/node.tgz"); NSHA=${NSHA%% *}
+stub curl 'o=""; while (( $# )); do [[ "$1" == -o ]] && { o="$2"; shift; }; shift; done
+if [[ -n "$o" ]]; then cp "'"$TMP"'/node.tgz" "$o"; else
+  echo "0000000000000000000000000000000000000000000000000000000000000000  node-v'"$NV"'-linux-x64.tar.xz"
+  echo "'"$NSHA"'  node-v'"$NV"'-linux-x64.tar.gz"; fi'
+mv "$STUBS/node" "$TMP/node.off"; mkdir -p "$TMP/home5b"  # own HOME: T6 needs T4's install intact
+ARGS=(install); run HARNESS_DESKTOP_OS=linux HOME="$TMP/home5b"
+[[ $RC == 0 ]] || fail "T5b: build with the fetched node failed (rc $RC) — $OUT"
+grep -q "fetching harness's own copy (Node $NV" <<<"$OUT" || fail "T5b: no fetch notice — $OUT"
+grep -q "nodejs.org/dist/v$NV/node-v$NV-linux-x64.tar.gz" "$LOG" || fail "T5b: tarball not fetched — $(cat "$LOG")"
+grep -q '^vnpm \[ci\]' "$LOG" && grep -q '^vnpx \[--no-install\] \[electron-builder\]' "$LOG" \
+    || fail "T5b: not built with the fetched node — $(cat "$LOG")"
+[[ -x "$C/state/tools/node-v$NV-linux-x64/bin/node" ]] || fail "T5b: node not kept under state/tools"
+compgen -G "$C/state/tools/*.part.*" >/dev/null && fail "T5b: temp dir left behind"
+[[ -e "$C/state/desktop/installed" ]] || fail "T5b: stamp not written"
+rm -f "$C/state/desktop/installed"
+ARGS=(install); run HARNESS_DESKTOP_OS=linux HOME="$TMP/home5b"
+[[ $RC == 0 ]] || fail "T5b: second build failed — $OUT"
+! grep -q '^curl' "$LOG" || fail "T5b: node fetched again — $(cat "$LOG")"
+grep -q '^vnpx ' "$LOG" || fail "T5b: second build not on the kept node"
+# A node on PATH that is new enough wins; nothing is fetched or used from state.
+mv "$TMP/node.off" "$STUBS/node"; rm -f "$C/state/desktop/installed"
+ARGS=(install); run HARNESS_DESKTOP_OS=linux HOME="$TMP/home5b"
+[[ $RC == 0 ]] && ! grep -q '^curl\|^vnp' "$LOG" && grep -q '^npx ' "$LOG" || fail "T5b: PATH node 22 not preferred — $(cat "$LOG")"
+rm -f "$STUBS/curl"
 C="$C2"
-ok "T5: node missing / v20 -> clear error with a per-OS install hint, non-zero, no build, no stamp"
+ok "T5b: no node 22 -> harness fetches Node $NV (checksum-verified) into state/tools, builds with it, reuses it; a PATH node 22 wins"
 
 # --- T6: failures keep the old install ------------------------------------------
 subst 's/0.1.1/0.1.2/' "$C/desktop/package.json"; (cd "$C" && "${GIT[@]}" commit -qam bump2)

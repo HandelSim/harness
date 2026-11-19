@@ -44,6 +44,10 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 # state_root / env_file / clone_dir globals the helpers read.
 # shellcheck disable=SC1090
 HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" source "$HARNESS" 2>/dev/null
+# Sourced from here, harness resolves clone_dir to tests/ and skips its platform
+# library (harness_detect_os); load it the way the real launch does.
+# shellcheck disable=SC1091
+source "$REPO_ROOT/scripts/lib/platform.sh"
 
 [[ "$(type -t host_require_config)" == "function" ]] || fail "host_require_config not sourced"
 [[ "$(type -t host_write_opencode_config)" == "function" ]] || fail "host helpers not sourced"
@@ -90,8 +94,8 @@ ok "T3b: HARNESS_HOST_CONFIRM is read from .env, and an exported 1 wins over it"
 
 # --- T4: host_preflight fails clearly when deps are absent ------------------
 # Empty PATH => command -v finds none of python3/jq/node/opencode.
-out=$( ( PATH="/nonexistent-dir"; host_preflight ) 2>&1 || true )
-if ( PATH="/nonexistent-dir"; host_preflight ) >/dev/null 2>&1; then
+out=$( ( PATH="/nonexistent-dir"; HARNESS_NO_AUTO_DEPS=1; host_preflight ) 2>&1 || true )
+if ( PATH="/nonexistent-dir"; HARNESS_NO_AUTO_DEPS=1; host_preflight ) >/dev/null 2>&1; then
     fail "T4: host_preflight passed with no deps on PATH"
 fi
 for dep in python3 jq node opencode; do
@@ -287,10 +291,41 @@ got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin )
 # Case C: nothing resolves (both stubs) -> non-zero, no output.
 make_py python3 ""
 make_py python ""
-if got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin ); then
+if got=$( PATH="$PYBIN_DIR:$PATH" HARNESS_NO_AUTO_DEPS=1 host_python_bin ); then
     fail "T8c: host_python_bin succeeded with only dead stubs (returned '$got')"
 fi
-ok "T8: host_python_bin probes --version (rejects the Windows alias stub, falls through to python)"
+
+# Case D: no system Python -> harness fetches its own: the release's SHA256SUMS
+# (the '+' in the asset name must match literally), the checksum-verified
+# tarball, unpacked under state/tools; the second call downloads nothing.
+PYFIX="$TMP_ROOT/pyfix"; mkdir -p "$PYFIX/python/bin"
+printf '#!/bin/sh\necho "Python 3.12.16"\n' >"$PYFIX/python/bin/python3"; chmod +x "$PYFIX/python/bin/python3"
+PYTRIPLE=$(harness_python_triple) || fail "T8d: no triple for $(uname -m)"
+PYNAME="cpython-${HARNESS_PYTHON_VERSION}+${HARNESS_PYTHON_BUILD}-${PYTRIPLE}-install_only.tar.gz"
+tar -czf "$TMP_ROOT/py.tgz" -C "$PYFIX" python
+PYSHA=$(sha256sum "$TMP_ROOT/py.tgz" 2>/dev/null || shasum -a 256 "$TMP_ROOT/py.tgz"); PYSHA=${PYSHA%% *}
+CURL_LOG="$TMP_ROOT/curl.log"; : >"$CURL_LOG"
+curl() {  # -o <dest> <url> fetches the tarball; a bare <url> prints SHA256SUMS
+    local o="" a; for a in "$@"; do [[ "$a" == http* ]] && echo "$a" >>"$CURL_LOG"; done
+    while (( $# )); do [[ "$1" == -o ]] && { o="$2"; shift; }; shift; done
+    if [[ -n "$o" ]]; then cp "$TMP_ROOT/py.tgz" "$o"; else
+        printf '%s  %s\n' 0000000000000000000000000000000000000000000000000000000000000000 "cpython-${HARNESS_PYTHON_VERSION}+${HARNESS_PYTHON_BUILD}-x-install_only.tar.gz"
+        printf '%s  %s\n' "$PYSHA" "$PYNAME"; fi
+}
+make_py python3 ""
+got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin 2>/dev/null ) || fail "T8d: no Python after the fetch"
+[[ "$got" == "$(harness_python_vendored)" && -x "$got" ]] || fail "T8d: got '$got', want $(harness_python_vendored)"
+grep -q 'SHA256SUMS$' "$CURL_LOG" && grep -q '%2B' "$CURL_LOG" || fail "T8d: wrong URLs: $(cat "$CURL_LOG")"
+: >"$CURL_LOG"
+got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin 2>/dev/null ) || fail "T8d: second call failed"
+[[ ! -s "$CURL_LOG" ]] || fail "T8d: fetched again: $(cat "$CURL_LOG")"
+# A tampered tarball is refused and leaves nothing behind.
+rm -rf "$(harness_python_dir)"; echo junk >>"$TMP_ROOT/py.tgz"
+if PATH="$PYBIN_DIR:$PATH" host_python_bin >/dev/null 2>&1; then fail "T8d: checksum mismatch accepted"; fi
+[[ ! -e "$(harness_python_dir)" ]] || fail "T8d: a refused download left $(harness_python_dir)"
+compgen -G "$(harness_python_dir).part.*" >/dev/null && fail "T8d: temp dir left behind"
+unset -f curl
+ok "T8: host_python_bin probes --version (rejects the Windows alias stub, falls through to python); with no Python it fetches harness's own once, checksum-verified"
 
 # --- T9: cmd_host gates on the upstream auth probe like container mode -------
 # Regression: host mode skipped _gate_on_upstream_auth / _print_upstream_models,
