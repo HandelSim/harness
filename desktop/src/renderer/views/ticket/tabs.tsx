@@ -7,6 +7,8 @@ import { api, bridge, enc } from '../../core/bridge';
 import { ago, bytes, dateTime, plural } from '../../core/format';
 import { Button, EmptyState, GateButton, Pill, Seg } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
+import { Markdown } from '../../ui/Markdown';
+import { openPanel } from '../../shell/dock';
 import {
   appendOut, answerBody, draftKey, emptyTail, liveSession, mergeAnswers, optionLabel, pickOut, splitComments,
   statusLabel, unansweredBlocking, validateComments, FIX_MAX_CHARS, FIX_MAX_COMMENTS, OUT_CAP, SOFT_ERRORS, str,
@@ -155,6 +157,36 @@ function QuestionCard({ q, value, changed, onChange, disabled }: { q: Question; 
   );
 }
 
+/** The plan's text (web parity: serve/runs.py _t_docs reads wiki/notes/tickets/<KEY>-plan.md from the ticket's vault).
+ *  Read through GET /vault/file, which serves the active vault: shown only when the ticket ran with that vault (or
+ *  names none); a missing file or any error hides the section (the web version still has it). */
+export const planRel = (key: string): string => `wiki/notes/tickets/${key}-plan.md`;
+export function PlanDoc({ t }: { t: Ticket }) {
+  const st = useTopic('status');
+  const active = (st?.data.value as { vault?: { dir?: string } | null } | undefined)?.vault?.dir ?? '';
+  const own = typeof t.state.vault === 'string' ? t.state.vault : '';
+  const rel = planRel(t.key);
+  const ok = !!active && (!own || own.replace(/[\\/]+$/, '') === active.replace(/[\\/]+$/, ''));
+  const [text, setText] = useState('');
+  useEffect(() => {
+    let live = true;
+    if (!ok) { setText(''); return; }
+    void bridge.api.get<{ kind?: string; text?: string }>(api('/vault/file'), { path: rel }).then((r) => {
+      if (live) setText(r.ok && r.data?.kind === 'markdown' ? String(r.data.text ?? '') : '');
+    });
+    return () => { live = false; };
+  }, [rel, ok, t.state.plan_sig]);
+  if (!text.trim()) return null;
+  return (
+    <details class="tk-section" open data-testid="ticket-plan-doc">
+      <summary class="section-title">The plan
+        <Button size="sm" variant="ghost" icon="folder" onClick={(e: Event) => { e.preventDefault(); openPanel('vault-file', rel, { title: `${t.key}-plan.md`, params: { path: rel } }); }}>Open in the vault</Button>
+      </summary>
+      <Markdown text={text} />
+    </details>
+  );
+}
+
 export function PlanTab({ t, run, approve, notice, setNotice }: {
   t: Ticket; run: Run; approve: () => Promise<unknown>; notice: string; setNotice: (s: string) => void;
 }) {
@@ -193,7 +225,7 @@ export function PlanTab({ t, run, approve, notice, setNotice }: {
   const assumptions = Array.isArray(s.assumptions) ? (s.assumptions as { id?: unknown; text?: unknown }[]) : [];
 
   if (!review && !asking && !qs.length && !s.criteria?.length) {
-    return <EmptyState icon="check" text="Nothing to answer or review right now." />;
+    return <><EmptyState icon="check" text="Nothing to answer or review right now." /><PlanDoc t={t} /></>;
   }
   return (
     <div class="tk-plan" data-testid="ticket-plan">
@@ -204,6 +236,7 @@ export function PlanTab({ t, run, approve, notice, setNotice }: {
         </div>
       ) : null}
       {!review && !asking ? <div class="notice"><Icon name="info" size={16} /><div>This ticket is {statusLabel(s.status).toLowerCase()}; the plan below is for reference.</div></div> : null}
+      <PlanDoc t={t} />
       {s.criteria?.length ? (
         <section class="tk-section">
           <div class="section-title">Acceptance criteria <span class="badge">{s.criteria.length}</span></div>

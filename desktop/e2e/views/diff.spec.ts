@@ -22,8 +22,18 @@ test('changes tab: diff, show more, a line comment sent with fix', async ({ win,
   const p = await openChanges(win);
   await expect(p.getByTestId('diff-file')).toHaveCount(2);
   await expect(p.getByTestId('diff-totals')).toContainText('2 files');
-  await p.getByRole('button', { name: /19 more lines/ }).click();
-  await expect(p.getByTestId('diff-body').first()).toContainText('line 1 of src/app.ts');
+  // review 2 P2-2: the hunk header's "19 more lines" is keyboard-reachable (cursor onto it, Enter), and the cursor is
+  // announced through aria-activedescendant on the listbox
+  const body0 = p.getByTestId('diff-body').first();
+  await expect(body0).toHaveAttribute('role', 'listbox');
+  await expect(body0.getByRole('button', { name: /19 more lines/ })).toBeVisible();
+  await body0.focus();
+  await win.keyboard.press('ArrowDown');
+  const cur = await body0.getAttribute('aria-activedescendant');
+  expect(cur).toBeTruthy();
+  await expect(body0.locator(`[id="${cur}"]`)).toHaveAttribute('data-testid', 'diff-hunk');
+  await win.keyboard.press('Enter');
+  await expect(body0).toContainText('line 1 of src/app.ts');
   await p.getByTestId('diff-line').filter({ hasText: 'const c = a + b;' }).click();
   await p.getByTestId('diff-comment-box').locator('textarea').fill('Name c better');
   await p.getByTestId('diff-comment-save').click();
@@ -36,6 +46,11 @@ test('changes tab: diff, show more, a line comment sent with fix', async ({ win,
   await expect(p.getByTestId('diff-comment')).toHaveCount(0);
   await p.getByTestId('diff-view-uncommitted').click();
   await expect(p.getByTestId('empty-state')).toBeVisible();
+  // parity: the Plan tab shows the plan's own text (wiki/notes/tickets/<KEY>-plan.md, read through /vault/file)
+  await (mock as unknown as Routes).setRoute('/vault/file?path=wiki/notes/tickets/DEMO-2-plan.md',
+    { path: 'wiki/notes/tickets/DEMO-2-plan.md', kind: 'markdown', text: '# Plan\n\n## Goal\n\nMake **login** work.' });
+  await p.getByTestId('ticket-tab-plan').click();
+  await expect(p.getByTestId('ticket-plan-doc').locator('strong')).toHaveText('login');
 });
 
 test('changes tab: a big diff renders collapsed files and capped lines; keyboard comments', async ({ win, mock }) => {
@@ -63,4 +78,12 @@ test('changes tab: a big diff renders collapsed files and capped lines; keyboard
   await win.keyboard.type('keyboard note');
   await win.keyboard.press('Control+Enter');
   await expect(p.getByTestId('diff-comment')).toContainText('big/f0.txt:1');
+  // P2-3: "Show more" adds a step of rows (here the rest of the 1000-line file), not an unbounded render
+  await expect(p.getByTestId('diff-show-all').first()).toContainText('400 of 1001 shown');
+  await p.getByTestId('diff-show-all').first().click();
+  expect(await p.getByTestId('diff-line').count()).toBe(7 * 399 + 1000);
+  await expect(p.getByTestId('diff-show-all')).toHaveCount(7);
+  // typing the whole-change comment does not disturb the diff (tray is its own component)
+  await p.getByTestId('diff-general').fill('overall note');
+  await expect(p.getByTestId('diff-send')).toContainText('2 comments');
 });

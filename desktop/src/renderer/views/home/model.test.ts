@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Queue, TicketSummary } from '../../../shared/api';
-import { activityRows, filterPages, greeting, queueSummary, usageView } from './model';
+import { activityRows, filterPages, greeting, pubPath, queueSummary, usageView } from './model';
 
 test('usageView reads read_ledger tuples and scales model bars to the biggest', () => {
   assert.equal(usageView(null), null);
@@ -53,4 +53,9 @@ test('greeting by hour', () => {
   assert.equal(greeting(9), 'Good morning');
   assert.equal(greeting(13), 'Good afternoon');
   assert.equal(greeting(20), 'Good evening');
+});
+
+test('pubPath encodes each segment of rel (never the raw server url)', () => {
+  assert.equal(pubPath('a/b c.html'), '/pub/a/b%20c.html');
+  assert.equal(pubPath('x/50% #1?.html'), '/pub/x/50%25%20%231%3F.html');
 });

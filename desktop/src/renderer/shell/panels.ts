@@ -6,9 +6,20 @@ export const VIEW_TITLES: Record<ViewId, string> = {
   keys: 'Keys', updates: 'Updates', settings: 'Settings',
 };
 /** Serve page each native view falls back to (parity matrix 3.16). */
+// Only GET pages serve/pub.py routes: findings and Jira are panels of the queue page (anchors), there is no
+// /runs/findings or Jira page (/runs/queue/jira is the panel's JSON), and /settings/system is POST-only.
 export const VIEW_WEB: Record<ViewId, string> = {
-  home: '/', queue: '/runs/queue', sessions: '/runs', findings: '/runs/findings', vault: '/vault', jira: '/runs/queue/jira',
-  debug: '/runs/debug', keys: '/settings', updates: '/settings/system', settings: '/settings',
+  home: '/', queue: '/runs/queue', sessions: '/runs', findings: '/runs/queue#findings', vault: '/vault', jira: '/runs/queue#jira',
+  debug: '/runs/debug', keys: '/settings', updates: '/settings', settings: '/settings',
+};
+const seg = (rel: string) => rel.split('/').map(encodeURIComponent).join('/');
+/** Web pages for one thing (serve/pub.py runs_get / vault_get). */
+export const WEB = {
+  session: (sid: string) => `/runs/${encodeURIComponent(sid)}`,
+  debugReport: (kind: string, name: string) => `/runs/debug/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`,
+  vaultFile: (rel: string) => `/vault/browse/${seg(rel)}`,
+  findingsAgent: '/runs/queue#findings-agent',
+  findingsNotes: '/runs/findings/notes',
 };
 
 export type PanelKind = 'view' | 'terminal' | 'chat' | 'transcript' | 'ticket' | 'diff' | 'web' | 'vault-file';

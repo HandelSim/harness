@@ -32,6 +32,16 @@ test('home shows the overview and opens a live run from the keyboard', async ({ 
   await expect(win.getByTestId('home-modes')).toContainText('container');
   await expect(win.getByTestId('home-page-reports/weekly.html')).toBeVisible();
   await win.screenshot({ path: 'test-results/w2e-home.png' });
+  // a ~300px panel (640px window + sidebar): no horizontal scroll, the greeting is not cut to "Good ..."
+  const narrow = await win.getByTestId('view-home').evaluate(async (v: HTMLElement) => {
+    const old = v.style.width; v.style.width = '300px';
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const body = v.querySelector('.home-body') as HTMLElement; const h1 = v.querySelector('.view-head h1') as HTMLElement;
+    const out = { body: body.scrollWidth - body.clientWidth, h1: h1.scrollWidth - h1.clientWidth, head: (v.querySelector('.view-head') as HTMLElement).scrollWidth - (v.querySelector('.view-head') as HTMLElement).clientWidth };
+    v.style.width = old;
+    return out;
+  });
+  expect(narrow).toEqual({ body: 0, h1: 0, head: 0 });
   await win.getByTestId('home-live-ses_live0001').focus();
   await win.keyboard.press('Enter');
   await expect(win.getByTestId('transcript-ses_live0001')).toBeVisible();

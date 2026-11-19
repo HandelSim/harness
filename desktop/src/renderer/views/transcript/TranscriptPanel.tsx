@@ -8,6 +8,7 @@ import { act, useTopic } from '../../core/app';
 import { api, bridge, enc } from '../../core/bridge';
 import { clock, tokens } from '../../core/format';
 import { openWeb, type PanelCtx } from '../../shell/dock';
+import { WEB } from '../../shell/panels';
 import { AsOf, Button, GateButton, Pill } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
 import { Markdown } from '../../ui/Markdown';
@@ -70,10 +71,15 @@ export default function TranscriptPanel({ ctx }: { ctx: PanelCtx }) {
   useEffect(() => { ctx.setTitle(h?.row.title || sid.slice(0, 12)); }, [h?.row.title, sid]);
   useEffect(() => { ctx.setTabState(working ? 'working' : 'idle'); }, [working]);
 
+  // bumped on every sid change and on unmount: a page loop of an older sid (or a closed panel) stops (P2-5)
+  const gen = useRef(0);
+  useEffect(() => () => { gen.current++; }, []);
   const load = async (): Promise<boolean> => {
+    const g = gen.current;
     let list = msgsRef.current;
     for (let i = 0; i < MAX_PAGES; i++) {
       const r = await bridge.api.get<MessagesPage>(api(`/sessions/${enc(sid)}/messages`), { from: nextFrom(list) });
+      if (g !== gen.current) return false;
       if (!r.ok) { setErr(r.error.message); return false; }
       if (!r.data) break;
       const before = list.length;
@@ -90,7 +96,7 @@ export default function TranscriptPanel({ ctx }: { ctx: PanelCtx }) {
     return true;
   };
 
-  useEffect(() => { msgsRef.current = []; setMsgs([]); setShown(TAIL); stick.current = true; if (sid) void load(); }, [sid]);
+  useEffect(() => { gen.current++; msgsRef.current = []; setMsgs([]); setShown(TAIL); stick.current = true; if (sid) void load(); }, [sid]);
   useEffect(() => {
     if (!visible || !sid || !(working || h?.row.working || h?.row.live)) return;
     const t = setInterval(() => { void load(); }, 2000);
@@ -129,7 +135,7 @@ export default function TranscriptPanel({ ctx }: { ctx: PanelCtx }) {
         </span>
         <AsOf e={head} />
         {h ? <GateButton size="sm" gate={h.stop} icon="stop" onClick={() => void act(`/sessions/${enc(sid)}/stop`, {}, { refresh: [`session:${sid}`] })}>Stop</GateButton> : null}
-        <Button size="sm" icon="globe" iconOnly title="Open in the web page" onClick={() => openWeb(`/sessions/${enc(sid)}`, { title: sid.slice(0, 12) })} />
+        <Button size="sm" icon="globe" iconOnly title="Open in the web page" onClick={() => openWeb(WEB.session(sid), { title: sid.slice(0, 12) })} />
       </div>
       <div class="transcript-list" ref={listRef} onScroll={onScroll}>
         {err && !msgs.length ? <div class="notice notice--warn">{err}</div> : null}

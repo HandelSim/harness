@@ -1,10 +1,11 @@
 // Debug view: the /debug list (queue debug runs and standalone reports, newest first) beside the selected report
 // (/debug/<kind>/<name>, Markdown). Up/Down move the selection; the selection survives a restart (panel params).
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTopic } from '../../core/app';
 import { api, bridge } from '../../core/bridge';
 import { ago } from '../../core/format';
 import { openPanel, openWeb, type PanelCtx } from '../../shell/dock';
+import { VIEW_WEB, WEB } from '../../shell/panels';
 import { AsOf, Button, EmptyState, ErrorPanel, Pill, Seg, Skeleton, TopicBody } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
 import { Markdown } from '../../ui/Markdown';
@@ -41,10 +42,10 @@ export default function DebugView({ ctx }: { ctx: PanelCtx }) {
         </label>
         <span class="grow" />
         <AsOf e={e} />
-        <Button size="sm" variant="ghost" icon="globe" iconOnly aria-label="Open the web version" title="Open the web version" onClick={() => openWeb('/debug', { title: 'Debug (web)' })} />
+        <Button size="sm" variant="ghost" icon="globe" iconOnly aria-label="Open the web version" title="Open the web version" onClick={() => openWeb(VIEW_WEB.debug, { title: 'Debug (web)' })} />
       </div>
       <div class="view-body dbg-split">
-        <TopicBody e={e} webPath="/debug" openWeb={(p) => openWeb(p)}>
+        <TopicBody e={e} webPath={VIEW_WEB.debug} openWeb={(p) => openWeb(p)}>
           {() => !rows.length ? <EmptyState icon="debug" text={q || kind !== 'all' ? 'No report matches.' : 'No debug runs or reports yet.'} /> : (
             <>
               <VirtualList class="dbg-list" items={rows} rowHeight={ROW_H} focusIndex={idx} tabIndex={0} role="listbox" aria-label="Debug reports"
@@ -77,9 +78,11 @@ function Report({ r }: { r: DebugRow }) {
   const [text, setText] = useState<string | null>(null);
   const [err, setErr] = useState<{ code: string; message: string } | null>(null);
   const [n, setN] = useState(0);
+  const shownId = useRef('');
   useEffect(() => {
     let live = true;
-    setText(null); setErr(null);
+    // another report: skeleton; the same one rewritten (mtime) or reloaded: keep its text (and scroll) until the new one
+    if (shownId.current !== debugId(r)) { setText(null); setErr(null); shownId.current = debugId(r); }
     void bridge.api.get<{ text: string }>(api(reportPath(r))).then((res) => {
       if (!live) return;
       if (res.ok) setText(res.data?.text ?? ''); else setErr(res.error);
@@ -96,7 +99,7 @@ function Report({ r }: { r: DebugRow }) {
           onClick={() => openPanel('transcript', r.session, { title: r.title || r.session.slice(0, 12), params: { sid: r.session } })}>Transcript</Button> : null}
         <Button size="sm" variant="ghost" icon="refresh" iconOnly aria-label="Reload report" title="Reload" onClick={() => setN(n + 1)} />
         <Button size="sm" variant="ghost" icon="globe" iconOnly aria-label="Open the web version" title="Open the web version"
-          onClick={() => openWeb(`/debug/${encodeURIComponent(r.kind)}/${encodeURIComponent(r.name)}`, { title: `${r.name} (web)` })} />
+          onClick={() => openWeb(WEB.debugReport(r.kind, r.name), { title: `${r.name} (web)` })} />
       </div>
       <div class="dbg-text">
         {err ? (err.code === 'not-found' ? <EmptyState icon="debug" text={r.verdict === 'running' ? 'Still looking; no report yet.' : 'This report is gone.'} /> : <ErrorPanel error={err} onRetry={() => setN(n + 1)} />)

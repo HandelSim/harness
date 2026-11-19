@@ -32,15 +32,17 @@ const PRESETS: { value: Preset; label: string; hint: string }[] = [
   { value: 'custom', label: 'Custom', hint: 'pick the stages' },
 ];
 
-function AddTickets() {
+function AddTickets({ initialKeys = '' }: { initialKeys?: string }) {
   const recents = appState.value?.recents?.projects ?? [];
   const [kind, setKind] = useState<Kind>('jira');
-  const [keys, setKeys] = useState('');
+  const [keys, setKeys] = useState(initialKeys);
   const [title, setTitle] = useState('');
   const [desc, setDesc] = useState('');
   const [project, setProject] = useState(recents[0] ?? '');
   const [start, setStart] = useState<Start>('');
   const [cont, setCont] = useState('');
+  const [base, setBase] = useState('');     // web parity: Target branch (serve/runs.py add form `base`)
+  const [branch, setBranch] = useState(''); // web parity: Work branch name (`branch`)
   const [preset, setPreset] = useState<Preset>('full');
   const [stages, setStages] = useState<string[]>(['plan', 'implement', 'review', 'fix', 'push']);
   const [after, setAfter] = useState<'wait' | 'go' | 'defaults'>('wait');
@@ -104,6 +106,8 @@ function AddTickets() {
     if (kind === 'jira') body.keys = keys; else { body.title = title; body.desc = desc; }
     if (start) body.start = start;
     if (start === 'continue') body.cont = cont;
+    if (base.trim()) body.base = base.trim();
+    if (branch.trim()) body.branch = branch.trim();
     if (preset === 'custom') body.stages = stages;
     if (tree) body.repo_modes = modes;
     if (note.trim()) body.note = note;
@@ -167,6 +171,16 @@ function AddTickets() {
             <datalist id="add-branches">{branchNames.map((b) => <option key={b} value={b} />)}</datalist>
           </Field>
         ) : null}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(200px, 100%), 1fr))', gap: 'var(--sp-3)' }}>
+          <Field label="Target branch" hint="Where the work lands. Empty: the branch the folder is on.">
+            <input class="input mono" data-testid="add-base" list="add-base-branches" value={base} spellcheck={false} placeholder="main"
+              onInput={(e) => setBase((e.target as HTMLInputElement).value)} />
+            <datalist id="add-base-branches">{branchNames.map((b) => <option key={b} value={b} />)}</datalist>
+          </Field>
+          <Field label="Work branch name" hint="Empty: named after the ticket.">
+            <input class="input mono" data-testid="add-branch" value={branch} spellcheck={false} onInput={(e) => setBranch((e.target as HTMLInputElement).value)} />
+          </Field>
+        </div>
         {tree ? (
           <Field label="Repositories" hint="How each repository's changes land: on a work branch, or left uncommitted in the folder.">
             <div class="col" data-testid="add-repos" style={{ gap: 'var(--sp-1)' }}>
@@ -212,4 +226,5 @@ function AddTickets() {
   );
 }
 
-export function openAddTickets(): void { openDialog(<AddTickets />); }
+/** `keys`: Jira keys to start with (the Jira view's picks). */
+export function openAddTickets(keys = ''): void { openDialog(<AddTickets initialKeys={keys} />); }

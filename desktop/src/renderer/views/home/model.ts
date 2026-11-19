@@ -104,3 +104,7 @@ export function greeting(hour: number): string {
   if (hour < 18) return 'Good afternoon';
   return 'Good evening';
 }
+
+/** Web path of a published page, built from its rel path (serve's `url` is "/pub/" + rel unencoded, so a `#`, `?` or `%`
+ *  in a name would open the wrong page). */
+export const pubPath = (rel: string): string => '/pub/' + rel.split('/').map(encodeURIComponent).join('/');

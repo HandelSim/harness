@@ -3,7 +3,8 @@
 // so a huge diff never freezes the UI, Show more lines (/lines), click-a-line review comments sent with Fix (POST
 // /tickets/K/fix, gated by ticket.actions.fix). Used as the ticket panel's Changes tab and as the 'diff' panel kind.
 import { Fragment } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { memo } from 'preact/compat';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Diff, Ticket } from '../../../shared/api';
 import { act, useTopic } from '../../core/app';
 import { api, bridge, enc } from '../../core/bridge';
@@ -35,31 +36,28 @@ export function ChangesTab({ ticketKey, t, standalone }: { ticketKey: string; t:
     const r = await bridge.api.get<DiffData>(api(`/tickets/${enc(ticketKey)}/diff`), q);
     if (n !== seq.current) return;
     setLoading(false);
-    if (!r.ok) { setErr(r.error); return; }
+    // a failed switch keeps showing the old diff, so the selectors go back to what is shown
+    if (!r.ok) { setErr(r.error); const cur = dRef.current; if (cur) setSel({ repo: cur.repo, view: cur.view }); return; }
     setErr(null);
     if (r.data) { setD(r.data); setSel({ repo: r.data.repo, view: r.data.view }); }
   };
+  const dRef = useRef<DiffData | null>(null);
+  dRef.current = d;
   useEffect(() => { void load(); }, [ticketKey]);
 
   const [draft, setDraft, clearDraft] = useJsonDraft<{ items: ReviewComment[] }>(draftKey(ticketKey, 'review'), { items: [] });
   const items = Array.isArray(draft.items) ? draft.items : [];
-  const [general, setGeneral] = useState('');
-  const [sendErr, setSendErr] = useState('');
-  const put = (c: ReviewComment) => setDraft({ items: putComment(items, c) });
+  // stable callbacks over refs, so a memoised FileBlock re-renders only when its own rows or comments change (P2-3)
+  const live = useRef({ items, setDraft });
+  live.current = { items, setDraft };
+  const put = useCallback((c: ReviewComment) => { const l = live.current; l.setDraft({ items: putComment(l.items, c) }); }, []);
   const drop = (i: number) => setDraft({ items: items.filter((_, j) => j !== i) });
-  const send = async () => {
-    setSendErr('');
-    const all = general.trim() ? putComment(items, { text: general.trim() }) : items;
-    const why = reviewError(all);
-    if (why) { setSendErr(why); return; }
-    const r = await act(`/tickets/${enc(ticketKey)}/fix`, { comments: fixItems(all) }, { refresh: [`ticket:${ticketKey}`, 'queue'] });
-    if (r.ok) { clearDraft(); setGeneral(''); }
-    else if (!SOFT_ERRORS.has(r.error.code)) setSendErr(r.error.message || r.error.code);
-  };
 
   const parsed = useMemo(() => (d ? parseDiff(d.diff || '') : { files: [], cut: false }), [d?.diff]);
   const [rowsOverride, setRowsOverride] = useState<Record<string, Row[]>>({});
   useEffect(() => { setRowsOverride({}); }, [d?.diff, d?.repo, d?.view]);
+  const setRows = useCallback((path: string, rows: Row[]) => setRowsOverride((o) => ({ ...o, [path]: rows })), []);
+  const byFile = useFileComments(items, d?.repo ?? '.', d?.view ?? '');
   const files = parsed.files;
   const tot = totals(files);
   const canComment = !!d && viewTakesComments(d.view);
@@ -131,57 +129,97 @@ export function ChangesTab({ ticketKey, t, standalone }: { ticketKey: string; t:
           {files.map((f, i) => (
             <div key={`${d.repo}\n${d.view}\n${f.path}`} ref={(el) => { fileRefs.current[f.path] = el; }}>
               <FileBlock f={f} rows={rowsOverride[f.path] ?? f.rows} startOpen={i < OPEN_FILES} d={d} ticketKey={ticketKey}
-                canComment={canComment} items={items} put={put}
-                setRows={(rows) => setRowsOverride((o) => ({ ...o, [f.path]: rows }))} />
+                canComment={canComment} items={byFile.get(f.path) ?? NONE} put={put} setRows={setRows} />
             </div>
           ))}
         </div>
       </div>
-      <section class="dv-tray" aria-label="Review comments" data-testid="diff-tray">
-        <div class="section-title">Review comments <span class="badge tnum" data-testid="diff-count">{items.length}/{FIX_MAX_COMMENTS}</span></div>
-        {!canComment ? <div class="meta">Comments are taken on the ticket's work and uncommitted views.</div> : <div class="meta">Click a line (or focus the diff and press Enter) to comment on it. Comments are kept until you send them.</div>}
-        {items.length ? (
-          <ol class="dv-tray-list">
-            {items.map((c, i) => (
-              <li key={i} data-testid="diff-comment">
-                <span class="mono meta ellipsis" title={commentWhere(c)}>{commentWhere(c)}</span>
-                <span class="tk-pre grow">{c.text}</span>
-                <Button size="sm" variant="ghost" icon="x" iconOnly aria-label="Remove comment" onClick={() => drop(i)} />
-              </li>
-            ))}
-          </ol>
-        ) : null}
-        <textarea class="textarea" rows={2} maxLength={FIX_MAX_CHARS} value={general} placeholder="A comment on the whole change"
-          aria-label="A comment on the whole change" data-testid="diff-general" onInput={(e) => setGeneral((e.target as HTMLTextAreaElement).value)} />
-        {sendErr ? <div class="inline-err" role="alert" data-testid="diff-send-error">{sendErr}</div> : null}
-        <div class="row">
-          <Button size="sm" disabled={!general.trim()} onClick={() => { put({ text: general.trim() }); setGeneral(''); }}>Add comment</Button>
-          <span class="spacer" />
-          <GateButton gate={t?.actions.fix} variant="primary" size="sm" icon="send" testid="diff-send"
-            disabled={!items.length && !general.trim()} onClick={send}>
-            Send {plural(items.length + (general.trim() ? 1 : 0), 'comment')} to the fixer
-          </GateButton>
-        </div>
-      </section>
+      <Tray ticketKey={ticketKey} t={t} items={items} canComment={canComment} put={put} drop={drop} clearDraft={clearDraft} />
     </div>
   );
 }
 
-function FileBlock({ f, rows, startOpen, d, ticketKey, canComment, items, put, setRows }: {
+const NONE: ReviewComment[] = [];
+/** Comments per file path for the shown repo/view; a file's array keeps its identity while its comments do not change. */
+function useFileComments(items: ReviewComment[], repo: string, view: string): Map<string, ReviewComment[]> {
+  const prev = useRef(new Map<string, ReviewComment[]>());
+  return useMemo(() => {
+    const m = new Map<string, ReviewComment[]>();
+    for (const c of items) {
+      if (!c.path || (c.repo || '.') !== repo || (c.view || 'work') !== view) continue;
+      const a = m.get(c.path);
+      if (a) a.push(c); else m.set(c.path, [c]);
+    }
+    for (const [k, a] of m) { const o = prev.current.get(k); if (o && o.length === a.length && o.every((x, i) => x === a[i])) m.set(k, o); }
+    prev.current = m;
+    return m;
+  }, [items, repo, view]);
+}
+
+/** The whole-change comment and Send; its own component so typing re-renders only the tray (P2-3). */
+function Tray({ ticketKey, t, items, canComment, put, drop, clearDraft }: {
+  ticketKey: string; t: Ticket | null; items: ReviewComment[]; canComment: boolean;
+  put: (c: ReviewComment) => void; drop: (i: number) => void; clearDraft: () => void;
+}) {
+  const [general, setGeneral] = useState('');
+  const [sendErr, setSendErr] = useState('');
+  const send = async () => {
+    setSendErr('');
+    const all = general.trim() ? putComment(items, { text: general.trim() }) : items;
+    const why = reviewError(all);
+    if (why) { setSendErr(why); return; }
+    const r = await act(`/tickets/${enc(ticketKey)}/fix`, { comments: fixItems(all) }, { refresh: [`ticket:${ticketKey}`, 'queue'] });
+    if (r.ok) { clearDraft(); setGeneral(''); }
+    else if (!SOFT_ERRORS.has(r.error.code)) setSendErr(r.error.message || r.error.code);
+  };
+  return (
+    <section class="dv-tray" aria-label="Review comments" data-testid="diff-tray">
+      <div class="section-title">Review comments <span class="badge tnum" data-testid="diff-count">{items.length}/{FIX_MAX_COMMENTS}</span></div>
+      {!canComment ? <div class="meta">Comments are taken on the ticket's work and uncommitted views.</div> : <div class="meta">Click a line (or focus the diff and press Enter) to comment on it; Enter on a hunk header shows the lines above. Comments are kept until you send them.</div>}
+      {items.length ? (
+        <ol class="dv-tray-list">
+          {items.map((c, i) => (
+            <li key={i} data-testid="diff-comment">
+              <span class="mono meta ellipsis" title={commentWhere(c)}>{commentWhere(c)}</span>
+              <span class="tk-pre grow">{c.text}</span>
+              <Button size="sm" variant="ghost" icon="x" iconOnly aria-label="Remove comment" onClick={() => drop(i)} />
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      <textarea class="textarea" rows={2} maxLength={FIX_MAX_CHARS} value={general} placeholder="A comment on the whole change"
+        aria-label="A comment on the whole change" data-testid="diff-general" onInput={(e) => setGeneral((e.target as HTMLTextAreaElement).value)} />
+      {sendErr ? <div class="inline-err" role="alert" data-testid="diff-send-error">{sendErr}</div> : null}
+      <div class="row">
+        <Button size="sm" disabled={!general.trim()} onClick={() => { put({ text: general.trim() }); setGeneral(''); }}>Add comment</Button>
+        <span class="spacer" />
+        <GateButton gate={t?.actions.fix} variant="primary" size="sm" icon="send" testid="diff-send"
+          disabled={!items.length && !general.trim()} onClick={send}>
+          Send {plural(items.length + (general.trim() ? 1 : 0), 'comment')} to the fixer
+        </GateButton>
+      </div>
+    </section>
+  );
+}
+
+let blockN = 0;
+const FileBlock = memo(function FileBlock({ f, rows, startOpen, d, ticketKey, canComment, items, put, setRows }: {
   f: FileView; rows: Row[]; startOpen: boolean; d: DiffData; ticketKey: string; canComment: boolean;
-  items: ReviewComment[]; put: (c: ReviewComment) => void; setRows: (r: Row[]) => void;
+  items: ReviewComment[]; put: (c: ReviewComment) => void; setRows: (path: string, r: Row[]) => void;
 }) {
   const [open, setOpen] = useState(startOpen);
-  const [all, setAll] = useState(false);
+  // rows are rendered FILE_LINE_CAP at a time; "Show more" adds MORE_STEP, never the whole file in one commit (P2-3)
+  const [limit, setLimit] = useState(FILE_LINE_CAP);
   const [cursor, setCursor] = useState(-1);
   const [editing, setEditing] = useState<number>(-1);
   const [moreErr, setMoreErr] = useState('');
-  const shown = all ? rows : rows.slice(0, FILE_LINE_CAP);
+  const uid = useMemo(() => `dv${++blockN}`, []);
+  const shown = rows.length > limit ? rows.slice(0, limit) : rows;
   const byAnchor = useMemo(() => {
     const m = new Map<string, ReviewComment>();
-    for (const c of items) if (c.path === f.path && (c.repo || '.') === d.repo && (c.view || 'work') === d.view) m.set(anchorKey(c), c);
+    for (const c of items) m.set(anchorKey(c), c);
     return m;
-  }, [items, f.path, d.repo, d.view]);
+  }, [items]);
   const anchorOf = (r: Row): ReviewComment | null => {
     const a = rowAnchor(r);
     return a ? { text: '', path: f.path, line: a.line, side: a.side, code: r.text, repo: d.repo, view: d.view } : null;
@@ -194,14 +232,18 @@ function FileBlock({ f, rows, startOpen, d, ticketKey, canComment, items, put, s
     const r = await bridge.api.get<{ lines: string[]; total: number }>(api(`/tickets/${enc(ticketKey)}/lines`),
       { repo: d.repo, view: d.view, rev: d.rev || '', path: f.path, from: g.from, to: g.to });
     if (!r.ok) { setMoreErr(r.error.message || r.error.code); return; }
-    setRows(insertLines(rows, i, g.from, r.data?.lines ?? []));
+    setRows(f.path, insertLines(rows, i, g.from, r.data?.lines ?? []));
   };
   const onKey = (e: KeyboardEvent) => {
     if ((e.target as HTMLElement).closest('textarea')) return;
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'j' || e.key === 'k') {
       e.preventDefault();
       setCursor((c) => Math.max(0, Math.min(shown.length - 1, c + (e.key === 'ArrowDown' || e.key === 'j' ? 1 : -1))));
-    } else if (e.key === 'Enter' && cursor >= 0) { e.preventDefault(); startEdit(cursor); }
+    } else if (e.key === 'Enter' && cursor >= 0) {
+      e.preventDefault();
+      // a hunk header's Enter is its "N more lines" (the button itself stays out of the tab order)
+      if (shown[cursor]?.kind === 'hunk') void more(cursor); else startEdit(cursor);
+    }
   };
   useEffect(() => {
     if (cursor < 0) return;
@@ -220,13 +262,15 @@ function FileBlock({ f, rows, startOpen, d, ticketKey, canComment, items, put, s
       </button>
       {open ? (
         f.binary || !rows.length ? <div class="meta dv-none">{f.binary ? 'Binary file' : 'No text changes'}</div> : (
-          <div class="dv-body" tabIndex={0} role="grid" aria-label={`Diff of ${f.path}`} onKeyDown={onKey} data-testid="diff-body">
+          <div class="dv-body" tabIndex={0} role="listbox" aria-label={`Diff of ${f.path}`} onKeyDown={onKey} data-testid="diff-body"
+            aria-activedescendant={cursor >= 0 && cursor < shown.length ? `${uid}-${cursor}` : undefined}>
             {moreErr ? <div class="inline-err" role="alert">{moreErr}</div> : null}
             {shown.map((r, i) => {
               if (r.kind === 'hunk') {
                 const g = gapAbove(rows, i);
                 return (
-                  <div key={`h${i}`} class="dv-hunk" data-i={i} data-cur={cursor === i ? '1' : undefined}>
+                  <div key={`h${i}`} class="dv-hunk" data-i={i} data-cur={cursor === i ? '1' : undefined} id={`${uid}-${i}`}
+                    role="option" aria-selected={cursor === i} data-testid="diff-hunk">
                     {g ? <button type="button" class="dv-more" tabIndex={-1} onClick={() => more(i)} title="Show the lines above">
                       <Icon name="chevronDown" size={12} />{g.to - g.from + 1} more lines</button> : null}
                     <span class="mono">{r.text}</span>
@@ -238,7 +282,8 @@ function FileBlock({ f, rows, startOpen, d, ticketKey, canComment, items, put, s
               return (
                 <Fragment key={`r${i}`}>
                   <div class={`dv-line dv-line--${r.kind}`} data-i={i} data-cur={cursor === i ? '1' : undefined}
-                    data-c={c ? '1' : undefined} role="row" onClick={() => startEdit(i)} data-testid="diff-line">
+                    data-c={c ? '1' : undefined} role="option" aria-selected={cursor === i} id={`${uid}-${i}`}
+                    onClick={() => startEdit(i)} data-testid="diff-line">
                     <span class="dv-n tnum">{r.old ?? ''}</span>
                     <span class="dv-n tnum">{r.new ?? ''}</span>
                     <span class="dv-sign">{r.kind === 'add' ? '+' : r.kind === 'del' ? '−' : ' '}</span>
@@ -253,9 +298,9 @@ function FileBlock({ f, rows, startOpen, d, ticketKey, canComment, items, put, s
                 </Fragment>
               );
             })}
-            {!all && rows.length > FILE_LINE_CAP ? (
-              <button type="button" class="btn btn--sm dv-showall" onClick={() => setAll(true)} data-testid="diff-show-all">
-                Show all {rows.length} lines
+            {rows.length > limit ? (
+              <button type="button" class="btn btn--sm dv-showall" onClick={() => setLimit(limit + MORE_STEP)} data-testid="diff-show-all">
+                Show {Math.min(MORE_STEP, rows.length - limit)} more lines ({limit} of {rows.length} shown)
               </button>
             ) : null}
           </div>
@@ -263,7 +308,8 @@ function FileBlock({ f, rows, startOpen, d, ticketKey, canComment, items, put, s
       ) : null}
     </section>
   );
-}
+});
+const MORE_STEP = 2000;
 
 function CommentBox({ initial, where, onSave, onCancel }: { initial: string; where: string; onSave: (t: string) => void; onCancel: () => void }) {
   const [text, setText] = useState(initial);

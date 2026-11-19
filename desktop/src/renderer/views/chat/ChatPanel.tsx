@@ -9,6 +9,7 @@ import { bridge } from '../../core/bridge';
 import { ago } from '../../core/format';
 import { isTyping } from '../../core/keymap';
 import { openWeb, type PanelCtx } from '../../shell/dock';
+import { VIEW_WEB } from '../../shell/panels';
 import { hooks } from '../../shell/commands';
 import { AsOf, Button, EmptyState, ErrorPanel, Seg, Skeleton } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
@@ -20,6 +21,7 @@ import css from './chat.css' with { type: 'text' };
 if (!document.getElementById('css-chat')) { const el = document.createElement('style'); el.id = 'css-chat'; el.textContent = css as string; document.head.append(el); }
 
 const ROW_H = 46;
+const CONV_DEBOUNCE_MS = 150;
 
 /** The transcript's ctx: the chat panel's own, keyed by the session, its title and tab state mapped onto the chat tab. */
 function useSubCtx(ctx: PanelCtx, sid: string): PanelCtx {
@@ -62,6 +64,11 @@ export default function ChatPanel({ ctx }: { ctx: PanelCtx }) {
   const cur = pickSession(list, sid);
   const row = list.find((r) => r.id === cur);
   const setSid = (s: string) => { setSidS(s); ctx.update({ sid: s }); };
+  // the conversation follows the selection after a short pause, so holding an arrow key through the list does not
+  // mount (and page in) a transcript per row; a click shows it at once (P2-5)
+  const [convSid, setConvSid] = useState(cur);
+  useEffect(() => { if (cur === convSid) return; const t = setTimeout(() => setConvSid(cur), CONV_DEBOUNCE_MS); return () => clearTimeout(t); }, [cur]);
+  const convRow = list.find((r) => r.id === convSid) ?? (convSid === cur ? row : undefined);
   const setScope = (s: Scope) => { setScopeS(s); ctx.update({ scope: s }); };
   useEffect(() => { if (!cur) ctx.setTitle('Chat'); }, [cur]);
   const onKey = (ev: KeyboardEvent) => {
@@ -89,7 +96,7 @@ export default function ChatPanel({ ctx }: { ctx: PanelCtx }) {
             </div>
           </div>
           {rows === undefined ? (
-            e?.unavailable.value ? <EmptyState icon="globe" text="This serve does not list sessions to the app yet." action={<Button icon="globe" onClick={() => openWeb('/sessions')}>Open in Web panel</Button>} />
+            e?.unavailable.value ? <EmptyState icon="globe" text="This serve does not list sessions to the app yet." action={<Button icon="globe" onClick={() => openWeb(VIEW_WEB.sessions)}>Open in Web panel</Button>} />
               : e?.error.value ? <ErrorPanel error={e.error.value} onRetry={() => store.load('sessions')} />
                 : <div data-testid="chat-loading" class="chat-pad"><Skeleton rows={6} /></div>
           ) : !list.length ? (
@@ -99,7 +106,7 @@ export default function ChatPanel({ ctx }: { ctx: PanelCtx }) {
             <VirtualList class="chat-list" role="listbox" aria-label="Sessions" tabIndex={0} data-testid="chat-list" onKeyDown={onKey}
               aria-activedescendant={cur ? `chat-row-${cur}` : undefined} items={list} rowHeight={ROW_H} focusIndex={list.findIndex((r) => r.id === cur)}
               row={(r: SessionRow) => (
-                <div key={r.id} id={`chat-row-${r.id}`} class="chat-row" role="option" aria-selected={r.id === cur} data-testid={`chat-row-${r.id}`} onClick={() => setSid(r.id)}>
+                <div key={r.id} id={`chat-row-${r.id}`} class="chat-row" role="option" aria-selected={r.id === cur} data-testid={`chat-row-${r.id}`} onClick={() => { setSid(r.id); setConvSid(r.id); }}>
                   <span class={`dot ${r.live ? (r.working ? 'dot--live' : 'dot--ok') : ''}`} aria-label={r.live ? 'live' : 'ended'} />
                   <span class="chat-row-text">
                     <span class="ellipsis chat-row-title">{r.title || r.id}</span>
@@ -111,7 +118,7 @@ export default function ChatPanel({ ctx }: { ctx: PanelCtx }) {
           )}
         </aside>
         <section class="chat-main">
-          {cur ? <Conversation ctx={ctx} sid={cur} row={row} />
+          {cur && convSid ? <Conversation ctx={ctx} sid={convSid} row={convRow} />
             : <EmptyState icon="chat" text="Pick a session to read it and, while it runs, talk to it." />}
         </section>
       </div>

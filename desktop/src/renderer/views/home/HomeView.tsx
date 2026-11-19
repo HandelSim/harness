@@ -9,7 +9,7 @@ import { openPanel, openView, openWeb, type PanelCtx } from '../../shell/dock';
 import { hooks } from '../../shell/commands';
 import { AsOf, Button, ErrorPanel, Pill, Skeleton } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
-import { activityRows, filterPages, greeting, queueSummary, usageView } from './model';
+import { activityRows, filterPages, greeting, pubPath, queueSummary, usageView } from './model';
 import css from './home.css' with { type: 'text' };
 
 if (!document.getElementById('css-home')) { const el = document.createElement('style'); el.id = 'css-home'; el.textContent = css as string; document.head.append(el); }
@@ -94,7 +94,7 @@ function Pages({ h }: { h: Home }) {
         <div class="col home-gap">
           {total > 8 ? <input class="input" placeholder="Filter by title or path" aria-label="Filter pages" value={q} onInput={(ev) => setQ((ev.target as HTMLInputElement).value)} /> : null}
           {shown.map((p) => {
-            const go = () => openWeb(p.url || `/pub/${p.rel.split('/').map(encodeURIComponent).join('/')}`, { title: p.title || p.rel });
+            const go = () => openWeb(pubPath(p.rel), { title: p.title || p.rel });
             return (
               <div key={p.rel} class="list-row" role="button" tabIndex={0} data-testid={`home-page-${p.rel}`} onClick={go} onKeyDown={onEnter(go)}>
                 <span class="ellipsis grow">{p.title || p.rel}</span><span class="meta mono ellipsis">{p.rel}</span>
@@ -143,13 +143,13 @@ function Body({ h, st }: { h: Home; st: Status | undefined }) {
             <div class="home-tiles tnum">{usage.tiles.map((t) => <div key={t.label} class="home-stat"><span class="meta">{t.label}</span><b>{n(t.value)}</b></div>)}</div>
             <span class="meta">Last hour: {n(usage.hour.total)} tokens in {n(usage.hour.replies)} {usage.hour.replies === 1 ? 'reply' : 'replies'}. Reasoning {tokens(usage.reasoning)} and cached prompt {tokens(usage.cached)} tokens are inside the totals.</span>
             {usage.models.length ? (
-              <table class="home-models tnum">
+              <div class="home-scroll-x"><table class="home-models tnum">
                 <thead><tr><th>Model</th><th>Replies</th><th>Prompt</th><th>Completion</th><th>Total</th></tr></thead>
                 <tbody>{usage.models.map((m) => (
                   <tr key={m.name}><td><span class="mono ellipsis">{m.name}</span><span class="home-bar" style={{ width: `${m.pct}%` }} /></td>
                     <td>{n(m.replies)}</td><td>{n(m.prompt)}</td><td>{n(m.completion)}</td><td>{n(m.total)}</td></tr>
                 ))}</tbody>
-              </table>
+              </table></div>
             ) : null}
             {usage.remaining ? <span class="meta">Upstream remaining (latest reply): {usage.remaining}</span> : null}
           </div>

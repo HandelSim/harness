@@ -1,11 +1,12 @@
 // Vault file panel ('vault-file' kind): one vault file from /vault/file. Markdown renders through ui/Markdown with its
 // in-vault links rewritten to open here (another vault-file tab); images load as bytes into a blob URL (the page's CSP
 // allows blob: images, not the server's URL); text shows up to the server's cap with a notice when cut.
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { VaultOverview } from '../../../shared/api';
 import { useTopic } from '../../core/app';
 import { api, bridge } from '../../core/bridge';
 import { openWeb, type PanelCtx } from '../../shell/dock';
+import { WEB } from '../../shell/panels';
 import { Button, EmptyState, ErrorPanel, Skeleton } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
 import { Markdown } from '../../ui/Markdown';
@@ -21,6 +22,13 @@ export default function VaultFilePanel({ ctx }: { ctx: PanelCtx }) {
   const [n, setN] = useState(0);
   const vault = useTopic('vault');
   const pages = ((vault?.data.value as VaultOverview | undefined)?.pages ?? []) as PageRow[];
+  // the same path in another vault is another file: refetch when the active vault changes (P2-4)
+  const vname = (vault?.data.value as VaultOverview | undefined)?.name ?? '';
+  const seenVault = useRef(vname);
+  useEffect(() => {
+    if (vname && seenVault.current && seenVault.current !== vname) setN((x) => x + 1);
+    if (vname) seenVault.current = vname;
+  }, [vname]);
   useEffect(() => { ctx.setTitle(rel.slice(rel.lastIndexOf('/') + 1) || 'Vault file'); }, [rel]);
   useEffect(() => {
     let live = true;
@@ -46,7 +54,7 @@ export default function VaultFilePanel({ ctx }: { ctx: PanelCtx }) {
         <span class="mono ellipsis grow" title={rel} data-testid="vault-file-path">{rel}</span>
         <Button size="sm" variant="ghost" icon="refresh" iconOnly aria-label="Reload" title="Reload" onClick={() => setN(n + 1)} />
         <Button size="sm" variant="ghost" icon="globe" iconOnly aria-label="Open the web version" title="Open the web version"
-          onClick={() => openWeb(`/vault?path=${encodeURIComponent(rel)}`, { title: `${rel} (web)` })} />
+          onClick={() => openWeb(WEB.vaultFile(rel), { title: `${rel} (web)` })} />
       </div>
       <div class="view-body vfile-body" onClick={onClick}>
         {!rel ? <EmptyState icon="file" text="No file chosen." />

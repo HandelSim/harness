@@ -11,6 +11,7 @@ import { ago, dateTime, basename } from '../../core/format';
 import { isTyping } from '../../core/keymap';
 import { toast } from '../../core/toast';
 import { openPanel, openWeb, type PanelCtx } from '../../shell/dock';
+import { VIEW_WEB, WEB } from '../../shell/panels';
 import { closeDialog, openDialog } from '../../shell/ui';
 import { AsOf, Button, EmptyState, ErrorPanel, Pill, Skeleton, Tabs } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
@@ -144,7 +145,7 @@ function Board({ rows, total, archived, q, src, cat }: { rows: FindingView[]; to
           <span class="spacer" />
           <Button size="sm" icon="copy" disabled={!picked.length} onClick={() => copy(picked.map(copyText).join('\n'), `${picked.length} findings`)}>Copy</Button>
           {archived ? <Button size="sm" icon="retry" disabled={!picked.length} testid="findings-restore-selected"
-            onClick={async () => { for (const p of picked) await act('/findings/restore', { id: p.id }, { quiet: true }); toast({ kind: 'ok', title: `${picked.length} restored` }); void store.load('findings'); setChecked(new Set()); }}>Restore</Button>
+            onClick={async () => { const r = await act('/findings/restore', { sel: picked.map((p) => p.id) }, { refresh: [...REFRESH] }); if (r.ok) setChecked(new Set()); }}>Restore</Button>
             : <Button size="sm" icon="archive" disabled={!picked.length} testid="findings-archive-selected"
               onClick={async () => { const r = await act('/findings/archive', { sel: picked.map((p) => p.id) }, { refresh: [...REFRESH] }); if (r.ok) setChecked(new Set()); }}>Archive</Button>}
         </div>
@@ -373,16 +374,16 @@ export default function FindingsView({ ctx }: { ctx: PanelCtx }) {
           </>
         ) : null}
         <AsOf e={tab === 'agent' || tab === 'notes' ? ae : e} />
-        <Button size="sm" icon="globe" iconOnly title="Open the web version" onClick={() => openWeb(tab === 'notes' ? '/runs/findings/notes' : tab === 'agent' ? '/runs/findings/agent' : '/runs/findings')} />
+        <Button size="sm" icon="globe" iconOnly title="Open the web version" onClick={() => openWeb(tab === 'notes' ? WEB.findingsNotes : tab === 'agent' ? WEB.findingsAgent : VIEW_WEB.findings)} />
       </div>
       <Tabs<Tab> value={tab} onChange={setTab} testidPrefix="findings-tab-"
         tabs={[{ id: 'open', label: 'Open', badge: d ? b.openTotal : undefined }, { id: 'archived', label: 'Archived', badge: d ? b.archivedTotal : undefined },
           { id: 'agent', label: 'Agent' }, { id: 'notes', label: 'What it learned', badge: fa ? kn : undefined }]} />
       <div class="view-body view-body--flush findings-body">
-        {listTab ? topicState(e, () => <Board key={tab} rows={tab === 'open' ? b.open : b.archived} total={tab === 'open' ? b.openTotal : b.archivedTotal} archived={tab === 'archived'} q={q} src={src} cat={cat} />, '/runs/findings')
+        {listTab ? topicState(e, () => <Board key={tab} rows={tab === 'open' ? b.open : b.archived} total={tab === 'open' ? b.openTotal : b.archivedTotal} archived={tab === 'archived'} q={q} src={src} cat={cat} />, VIEW_WEB.findings)
           : topicState(ae, () => (tab === 'agent'
             ? <div class="fpad"><Agent fa={fa!} nowS={nowS} starting={starting} setStarting={setStarting} openNotes={() => setTab('notes')} /></div>
-            : <Knowledge fa={fa!} pick={note} setPick={setNote} />), tab === 'agent' ? '/runs/findings/agent' : '/runs/findings/notes')}
+            : <Knowledge fa={fa!} pick={note} setPick={setNote} />), tab === 'agent' ? WEB.findingsAgent : WEB.findingsNotes)}
       </div>
     </div>
   );

@@ -52,6 +52,11 @@ test('findings board, agent card and notes', async ({ mock, launch }) => {
   // archived tab
   await win.getByTestId('findings-tab-archived').click();
   await expect(win.getByTestId('finding-f3')).toBeVisible();
+  // review 2 P2-6: Restore on a selection is one POST with the whole selection (as Archive is)
+  await win.getByTestId('findings-archived-list').focus();
+  await win.keyboard.press('Space');
+  await win.getByTestId('findings-restore-selected').click();
+  await expect.poll(async () => (await mock.requests('/findings/restore')).map((r) => r.body)).toContainEqual({ sel: ['f3'] });
 
   // agent: stop asks first
   await win.getByTestId('findings-tab-agent').click();

@@ -29,6 +29,16 @@ test('vault pages: windowed list, filter + Enter opens a page; its links open in
   await expect(img).toBeVisible();
   await expect(img).toHaveAttribute('src', /^blob:/);
   await win.screenshot({ path: 'test-results/w2f-vault-file.png' });
+  // review 2 P2-6: a very large page is shown as plain text first, rendered on request
+  await (mock as unknown as { setRoute(k: string, d: unknown): Promise<void> }).setRoute('/vault/file?path=wiki/notes/plan.md',
+    { path: 'wiki/notes/plan.md', kind: 'markdown', text: '# Big **page**\n\n' + 'word '.repeat(70000) });
+  const plan = win.getByTestId('panel-vault-file:wiki/notes/plan.md');
+  await win.getByTestId('tab-vault-file:wiki/notes/plan.md').click();
+  await plan.getByRole('button', { name: 'Reload' }).click();
+  await expect(plan.getByTestId('md-too-big')).toBeVisible();
+  await expect(plan.getByTestId('vault-file-md').locator('strong')).toHaveCount(0);
+  await plan.getByTestId('md-render-anyway').click();
+  await expect(plan.getByTestId('vault-file-md').locator('strong')).toHaveText('page');
 });
 
 test('vault files tree expands lazily and opens a text file; ingest shows status and stops', async ({ win, mock }) => {
@@ -42,6 +52,13 @@ test('vault files tree expands lazily and opens a text file; ingest shows status
   await win.getByTestId('vault-tab-files').click();
   const tree = win.getByTestId('vault-tree');
   await expect(tree.getByTestId('vault-tree-row')).toHaveCount(3);
+  await tree.getByTestId('vault-tree-row').filter({ hasText: 'wiki' }).click();
+  await expect(tree.getByTestId('vault-tree-row')).toHaveCount(5);
+  // review 2 P2-4: Reload refetches the tree too (it used to keep the old one until the tab was left)
+  const treeGets = (await mock.requests('/vault/tree')).length;
+  await win.getByTestId('vault-reload').click();
+  await expect(tree.getByTestId('vault-tree-row')).toHaveCount(3);
+  await expect.poll(async () => (await mock.requests('/vault/tree')).length).toBeGreaterThan(treeGets);
   await tree.getByTestId('vault-tree-row').filter({ hasText: 'wiki' }).click();
   await expect(tree.getByTestId('vault-tree-row')).toHaveCount(5);
   // keyboard: the focused tree moves with arrows and opens with Enter

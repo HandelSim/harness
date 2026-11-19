@@ -38,6 +38,13 @@ test('chat lists live runs first and sends through the transcript composer', asy
   await expect(win.getByTestId('transcript-ses_old00002')).toContainText('an old question');
   await expect(win.getByTestId('chat-readonly')).toBeVisible();
   await expect(win.getByTestId('chat-open-oc')).toBeVisible();
+  // review 2 P2-5: stepping through the list quickly does not mount (and page in) each row's transcript
+  const liveGets = (await mock.requests('/sessions/ses_live0001/messages')).length;
+  await win.keyboard.press('ArrowUp');
+  await win.keyboard.press('ArrowDown');
+  await win.waitForTimeout(600);
+  await expect(win.getByTestId('chat-row-ses_old00002')).toHaveAttribute('aria-selected', 'true');
+  expect((await mock.requests('/sessions/ses_live0001/messages')).length).toBe(liveGets);
 
   // filter and the Live scope
   await win.getByTestId('chat-filter').fill('old');

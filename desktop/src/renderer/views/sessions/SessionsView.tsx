@@ -5,6 +5,7 @@ import { useTopic } from '../../core/app';
 import { ago, basename, cost, tokens } from '../../core/format';
 import { openPanel, openWeb, type PanelCtx } from '../../shell/dock';
 import { hooks } from '../../shell/commands';
+import { VIEW_WEB, WEB } from '../../shell/panels';
 import { AsOf, Button, EmptyState, TopicBody } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
 import { sortSessions } from '../transcript/model';
@@ -24,10 +25,10 @@ export default function SessionsView({ ctx }: { ctx: PanelCtx }) {
         </label>
         <span class="grow" />
         <AsOf e={e} />
-        <Button size="sm" icon="globe" iconOnly title="Open the web version" onClick={() => openWeb('/sessions', { title: 'Sessions (web)' })} />
+        <Button size="sm" icon="globe" iconOnly title="Open the web version" onClick={() => openWeb(VIEW_WEB.sessions, { title: 'Sessions (web)' })} />
       </div>
       <div class="view-body slist">
-        <TopicBody e={e} webPath="/sessions" openWeb={(p) => openWeb(p)}>
+        <TopicBody e={e} webPath={VIEW_WEB.sessions} openWeb={(p) => openWeb(p)}>
           {(rows: SessionRow[]) => {
             const list = sortSessions(rows ?? [], q);
             if (!list.length) return <EmptyState icon="sessions" text={q ? 'No session matches the filter.' : 'No sessions yet.'} />;

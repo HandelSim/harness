@@ -1,10 +1,16 @@
 /* Home view (PLAN 3.3). Loaded as text and injected once by HomeView (lazy chunks' CSS is not loaded by the build). */
-.home-body { display: flex; flex-direction: column; gap: var(--sp-3); }
-.home-health { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--sp-3); }
+.home-body { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; overflow-x: hidden; }
+/* narrow panels (a 640px window with the sidebar open leaves ~300px): the header wraps instead of truncating the
+   greeting to "Good ..." and pushing the as-of/globe cluster off the edge; grids never ask for more than the panel */
+.home-view > .view-head { flex-wrap: wrap; row-gap: var(--sp-1); }
+.home-view > .view-head h1 { min-width: 0; flex: 0 1 auto; white-space: normal; overflow-wrap: anywhere; }
+/* the five-column usage table has a min-content width (~270px) wider than a 300px panel: it scrolls in its card */
+.home-scroll-x { overflow-x: auto; min-width: 0; }
+.home-health { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); gap: var(--sp-3); }
 .home-tile { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
 .home-tile[role="button"] { cursor: pointer; }
 .home-tile[role="button"]:hover { background: var(--surface-hover); }
-.home-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--sp-3); align-items: start; }
+.home-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: var(--sp-3); align-items: start; }
 .home-card { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
 .home-card--wide { grid-column: 1 / -1; }
 .home-card-head { display: flex; align-items: center; gap: var(--sp-2); color: var(--text-3); }
@@ -13,7 +19,7 @@
 .home-counts { display: flex; flex-wrap: wrap; gap: var(--sp-4); }
 .home-count { display: flex; flex-direction: column; }
 .home-count b, .home-stat b { font-size: var(--text-16); font-weight: var(--weight-medium); color: var(--text-1); }
-.home-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: var(--sp-2); }
+.home-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(130px, 100%), 1fr)); gap: var(--sp-2); }
 .home-stat { display: flex; flex-direction: column; padding: var(--sp-2) var(--sp-3); border-radius: var(--r-sm); background: var(--surface-2); }
 .home-models { width: 100%; border-collapse: collapse; font-size: var(--text-12); }
 .home-models th { text-align: right; color: var(--text-3); font-weight: var(--weight-medium); padding: 2px var(--sp-2); }

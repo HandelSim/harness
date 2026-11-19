@@ -51,6 +51,10 @@ test('vaultHref round-trips', () => {
   assert.ok(h.startsWith('#vault:'));
   assert.equal(parseVaultHref(h), 'wiki/a b#.md');
   assert.equal(parseVaultHref('https://x'), null);
+  // review 2 P2-6: a hand-written #vault: link cannot climb out or reach .git
+  for (const bad of ['..%2F..%2Fetc%2Fpasswd', 'a%2F..%2F..%2Fx', '%2Fetc%2Fpasswd', '.git%2Fconfig', 'a%5C..%5Cb', 'a%2F%2Fb', '.%2Fa'])
+    assert.equal(parseVaultHref('#vault:' + bad), null, bad);
+  assert.equal(parseVaultHref('#vault:notes%2Fa..b.md'), 'notes/a..b.md');
   assert.equal(parseVaultHref(null), null);
 });
 

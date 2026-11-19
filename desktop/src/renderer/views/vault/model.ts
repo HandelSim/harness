@@ -67,7 +67,12 @@ export const VAULT_HREF = '#vault:';
 export function vaultHref(rel: string): string { return VAULT_HREF + encodeURIComponent(rel); }
 export function parseVaultHref(href: string | null | undefined): string | null {
   if (!href || !href.startsWith(VAULT_HREF)) return null;
-  try { return decodeURIComponent(href.slice(VAULT_HREF.length)) || null; } catch { return null; }
+  let rel: string;
+  try { rel = decodeURIComponent(href.slice(VAULT_HREF.length)); } catch { return null; }
+  // a hand-written #vault: link skips resolveRel: still no absolute path, no `..`/`.` segment, nothing under .git
+  const segs = rel.split(/[\\/]/);
+  if (!rel || rel.startsWith('/') || segs.some((s) => !s || s === '..' || s === '.') || segs[0] === '.git' || rel.includes('\0')) return null;
+  return rel;
 }
 
 const IMG_RE = /\.(png|jpe?g|gif|webp|svg)$/i;

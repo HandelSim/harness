@@ -25,6 +25,7 @@ export default function VaultView({ ctx }: { ctx: PanelCtx }) {
   const pick = (s: Sec) => { setSec(s); ctx.update({ sec: s }); };
   const d = e?.data.value;
   const noVault = !d && e?.error.value?.code === 'unavailable';
+  const [reloadN, setReloadN] = useState(0);
   return (
     <div class="view vault-view" data-testid="view-vault">
       <div class="view-head">
@@ -33,7 +34,7 @@ export default function VaultView({ ctx }: { ctx: PanelCtx }) {
         <VaultSwitcher active={d?.name ?? ''} />
         <span class="grow" />
         <AsOf e={e} />
-        <Button size="sm" variant="ghost" icon="refresh" iconOnly aria-label="Reload" title="Reload" onClick={() => { void store.load('vault'); void store.load('ingest'); }} />
+        <Button size="sm" variant="ghost" icon="refresh" iconOnly aria-label="Reload" title="Reload" onClick={() => { void store.load('vault'); void store.load('ingest'); setReloadN((x) => x + 1); }} testid="vault-reload" />
         <Button size="sm" variant="ghost" icon="globe" iconOnly aria-label="Open the web version" title="Open the web version" onClick={() => openWeb('/vault', { title: 'Vault (web)' })} />
       </div>
       {noVault ? (
@@ -50,7 +51,7 @@ export default function VaultView({ ctx }: { ctx: PanelCtx }) {
             <TopicBody e={e} webPath="/vault" openWeb={(p) => openWeb(p)}>
               {(v) => (
                 sec === 'pages' ? <Pages pages={(v.pages ?? []) as PageRow[]} />
-                  : sec === 'files' ? <Files />
+                  : sec === 'files' ? <Files key={`${v.name}:${reloadN}`} />
                     : sec === 'ingest' ? <IngestPane />
                       : <Log log={(v as { log?: { sha: string; author: string; when: string; subject: string }[] }).log ?? []} />
               )}

@@ -5,9 +5,11 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Jira, JiraRow } from '../../../shared/api';
 import { api, bridge } from '../../core/bridge';
 import { plural } from '../../core/format';
+import { isTyping } from '../../core/keymap';
 import { toast } from '../../core/toast';
 import { hooks } from '../../shell/commands';
 import { openPanel, openWeb, type PanelCtx } from '../../shell/dock';
+import { VIEW_WEB } from '../../shell/panels';
 import { Button, EmptyState, ErrorPanel, Pill, Seg, Skeleton } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
 import { VirtualList } from '../queue/virtual';
@@ -46,10 +48,10 @@ export default function JiraView({ ctx }: { ctx: PanelCtx }) {
     try { await navigator.clipboard.writeText(ks.join(' ')); toast({ kind: 'ok', title: `Copied ${plural(ks.length, 'key')}` }); }
     catch { toast({ kind: 'warn', title: 'Could not copy to the clipboard' }); }
   };
-  const addAll = async () => {
-    if (keys.length) await copy(keys);
-    hooks.addTickets();
-    if (keys.length) toast({ kind: 'info', title: 'Paste the keys into Ticket keys' });
+  // the picked keys go straight into the dialog's Ticket keys (no clipboard round trip)
+  const addAll = () => {
+    if (!keys.length) { hooks.addTickets(); return; }
+    void import('../queue/AddTicketsDialog').then((m) => m.openAddTickets(keys.join(' ')));
   };
   const openRow = (r: JiraRow) => {
     if (r.queued) openPanel('ticket', r.key, { title: r.key, params: { key: r.key } });
@@ -58,6 +60,7 @@ export default function JiraView({ ctx }: { ctx: PanelCtx }) {
   const onKey = (ev: KeyboardEvent) => {
     if (ev.key === 'ArrowDown') { ev.preventDefault(); setCur((c) => Math.min(rows.length - 1, c + 1)); }
     else if (ev.key === 'ArrowUp') { ev.preventDefault(); setCur((c) => Math.max(0, c - 1)); }
+    else if (isTyping(ev.target)) return;   // the filter keeps Space and Enter; arrows still move the cursor
     else if (ev.key === ' ' && rows[cur]) { ev.preventDefault(); toggle(rows[cur].key); }
     else if (ev.key === 'Enter' && rows[cur]) { ev.preventDefault(); openRow(rows[cur]); }
   };
@@ -75,7 +78,7 @@ export default function JiraView({ ctx }: { ctx: PanelCtx }) {
         <Button size="sm" variant="ghost" icon="copy" disabled={!keys.length} onClick={() => copy(keys)} testid="jira-copy">Copy {keys.length ? keys.length : ''}</Button>
         <Button size="sm" icon="plus" onClick={addAll} testid="jira-add">Add tickets…</Button>
         <Button size="sm" variant="ghost" icon="refresh" iconOnly aria-label="Reload" title="Reload" onClick={() => load()} testid="jira-reload" />
-        <Button size="sm" variant="ghost" icon="globe" iconOnly aria-label="Open the web version" title="Open the web version" onClick={() => openWeb(`/jira?list=${list}${mine ? '&mine=1' : ''}`, { title: 'Jira (web)' })} />
+        <Button size="sm" variant="ghost" icon="globe" iconOnly aria-label="Open the web version" title="Open the web version" onClick={() => openWeb(VIEW_WEB.jira, { title: 'Jira (web)' })} />
       </div>
       <div class="view-body jr-body">
         {!d ? (err ? <ErrorPanel error={err} onRetry={() => load()} /> : <Skeleton rows={8} />) : (
