@@ -25,3 +25,4 @@
 .srow-num { text-align: right; }
 @container (max-width: 640px) { .srow { grid-template-columns: 8px minmax(0, 1fr) 72px; } .srow > :nth-child(3), .srow > :nth-child(4), .srow > :nth-child(5) { display: none; } }
 .sessions-view { container-type: inline-size; }
+.transcript-earlier { align-self: center; flex: none; }

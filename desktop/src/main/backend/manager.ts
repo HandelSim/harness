@@ -1,7 +1,9 @@
 // Backend manager (1.2): locate -> config check -> attach or spawn -> up, with reconnect, respawn limits,
 // stale detection, access-code login and quit policy.
 import { spawn, type ChildProcess } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, renameSync, statSync } from 'node:fs';
+import { open } from 'node:fs/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { API_VERSION, type Queue, type Status } from '../../shared/api';
@@ -23,11 +25,15 @@ export interface ManagerDeps {
   health(ok: boolean, failures: number, nextInMs: number): void;
   accessCode(): string | null; saveAccessCode(code: string): void;
   lastProject(): string | null;
+  /** consent-host: a native confirmation in main (L8); absent = allowed (tests). */
+  confirmHost?(): Promise<boolean>;
 }
 
 const RING = 400;
 const READY_MS = 120000;
 const RESPAWN = [1000, 5000, 15000];
+const LOG_ROTATE = 5 * 1024 * 1024;
+const STOP_CLI_MS = 5000;
 
 export class BackendManager {
   st: BackendState = { phase: 'locating', root: null, url: null, port: null, owned: false, pid: null, stale: false,
@@ -35,7 +41,16 @@ export class BackendManager {
   client: ServeClient | null = null;
   status: Status | null = null;
   poller: Poller;
-  private child: ChildProcess | null = null;
+  private child: ChildProcess | null = null;   // the serve this app spawned and is waiting on / watching
+  private childPort = 0;
+  private children = new Set<ChildProcess>();  // every spawned serve not yet seen to exit: all are stopped on quit
+  private inflight: Promise<void> | null = null;
+  private logFile = '';
+  private logOff = 0;
+  private logAll = '';                          // output since the last spawn (classify input), capped
+  private logPartial = '';
+  private logDec = new StringDecoder('utf8');
+  private tailing: Promise<void> = Promise.resolve();
   private respawns: number[] = [];
   private skipProbe = false;
   private gen = 0;              // bumps on every (re)start so stale async work is dropped
@@ -62,7 +77,22 @@ export class BackendManager {
 
   private setStale(s: boolean): void { if (s !== this.st.stale) this.set({ stale: s }); }
 
-  async start(): Promise<void> {
+  /** Single-flight: a start while one is in flight joins it (H1). Use fresh() to restart with new inputs. */
+  start(): Promise<void> {
+    if (this.inflight) return this.inflight;
+    const p: Promise<void> = this.startNow().finally(() => { if (this.inflight === p) this.inflight = null; });
+    this.inflight = p;
+    return p;
+  }
+
+  /** Cancel an in-flight start (its async steps drop out on the gen check), wait for it, then start again. */
+  private async fresh(): Promise<void> {
+    this.gen++;
+    if (this.inflight) await this.inflight.catch(() => undefined);
+    await this.start();
+  }
+
+  private async startNow(): Promise<void> {
     const g = ++this.gen;
     this.stopping = false;
     this.set({ phase: 'locating', problem: null, missing: [] });
@@ -106,19 +136,24 @@ export class BackendManager {
       const c = new ServeClient(url);
       const s = await c.get<Status>('/api/v1/status', undefined, undefined, 5000);
       if (g !== this.gen) return;
-      if (s.ok && s.data?.mode === 'serve') { await this.attach(url, false, g); return; }
+      if (s.ok && s.data?.mode === 'serve') { await this.attach(url, this.ownsPort(port), g); return; }
       if (!s.ok && s.status === 404) {
         this.set({ phase: 'incompatible', url, port, problem: { code: 'old-serve', message: 'the running harness serve predates the app API: restart the backend' } });
         return;
       }
-      if (!s.ok && s.error.code === 'auth') { await this.attach(url, false, g); return; }
+      if (!s.ok && s.error.code === 'auth') { await this.attach(url, this.ownsPort(port), g); return; }
       // viewer (or anything else of ours): harness serve takes the port over by itself
       await this.spawnServe(root, port, g);
       return;
     }
     if (h) {
-      // another install owns the port: next free one from port+10
-      const free = await findFreePort(port + 10);
+      // another install owns the port. Ours may already run on a fallback port (kept from an earlier launch, L3):
+      // attach to it instead of spawning a second serve for the same state; else spawn on the next free one.
+      const alt = await findServe(port + 10, 10, want);
+      if (g !== this.gen) return;
+      if (alt) { await this.attach(`http://127.0.0.1:${alt}`, this.ownsPort(alt), g); return; }
+      const free = this.child ? this.childPort : await findFreePort(port + 10);
+      if (g !== this.gen) return;
       await this.spawnServe(root, free, g);
       return;
     }
@@ -199,56 +234,116 @@ export class BackendManager {
     } catch { return { ok: false, status: 0 }; }
   }
 
+  private ownsPort(port: number): boolean { return !!this.child && this.childPort === port; }
+
+  /** Spawn serve, or adopt the one a cancelled start already spawned (H1: never a second child, never a dead end). */
   private async spawnServe(root: string, port: number, g: number): Promise<void> {
-    if (this.child) return;
-    this.set({ phase: 'starting', owned: true, port, url: `http://127.0.0.1:${port}`, logTail: [] });
+    let child = this.child;
+    if (child) port = this.childPort;
+    this.set({ phase: 'starting', owned: true, port, url: `http://127.0.0.1:${port}`, ...(child ? {} : { logTail: [] }) });
+    if (!child) {
+      const c = this.spawnChild(root, port);
+      if (!c) return;
+      child = c;
+    }
+    const url = `http://127.0.0.1:${port}`;
+    const t0 = Date.now();
+    const mine = () => this.child === child && g === this.gen;
+    while (mine() && Date.now() - t0 < READY_MS) {
+      await sleep(250);
+      await this.tailLog();
+      if (!mine()) return;
+      const h = await healthz(url);
+      if (!h || !mine()) continue;
+      if (await this.attach(url, true, g)) return;
+      if (this.st.phase !== 'starting' && this.st.phase !== 'down') return;
+    }
+    if (mine() && this.st.phase === 'starting') {
+      this.set({ phase: 'down', problem: { code: 'timeout', message: 'harness serve did not come up in 120 s' } });
+    }
+  }
+
+  /** The child writes to serve.log directly (no pipes into this process: a kept serve outlives the app, L2);
+   * the log is tailed for logTail while starting and on exit. */
+  private spawnChild(root: string, port: number): ChildProcess | null {
     const extra: Record<string, string> = { HARNESS_OPEN: '0' };
     if (this.d.settings().backend.hostConsent) extra.HARNESS_HOST_CONFIRM = '1';
     if (this.skipProbe) extra.HARNESS_SKIP_AUTH_PROBE = '1';
     const cwd = this.d.lastProject() || this.d.home;
+    let fd = -1;
     let child: ChildProcess;
     try {
+      mkdirSync(this.d.logDir, { recursive: true });
+      this.logFile = join(this.d.logDir, 'serve.log');
+      try { if (statSync(this.logFile).size > LOG_ROTATE) renameSync(this.logFile, this.logFile + '.1'); } catch { /* none yet */ }
+      fd = openSync(this.logFile, 'a', 0o600);
+      this.logOff = fstatSync(fd).size;
+      this.logAll = ''; this.logPartial = ''; this.logDec = new StringDecoder('utf8');
       child = spawn('bash', [join(root, 'harness'), 'serve', '--port', String(port)], {
-        cwd: existsSync(cwd) ? cwd : this.d.home, env: cliEnv(extra), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
-    } catch (e) { this.set({ phase: 'down', owned: false, problem: { code: 'spawn', message: String(e) } }); return; }
+        cwd: existsSync(cwd) ? cwd : this.d.home, env: cliEnv(extra), stdio: ['ignore', fd, fd], detached: true });
+    } catch (e) {
+      this.set({ phase: 'down', owned: false, problem: { code: 'spawn', message: String(e) } });
+      return null;
+    } finally { if (fd >= 0) { try { closeSync(fd); } catch { /* ignore */ } } }
     this.child = child;
+    this.childPort = port;
+    this.children.add(child);
     this.set({ pid: child.pid ?? null });
-    mkdirSync(this.d.logDir, { recursive: true });
-    const logFile = join(this.d.logDir, 'serve.log');
-    let all = '';
-    let partial = '';
-    const onData = (c: Buffer) => {
-      const s = c.toString('utf8');
-      try { appendFileSync(logFile, s, { mode: 0o600 }); } catch { /* ignore */ }
-      if (all.length < 200000) all += s;
-      const lines = (partial + s).split('\n');
-      partial = lines.pop() || '';
+    let done = false;
+    const gone = (code: number | null, err?: Error) => {
+      if (done) return;
+      done = true;
+      this.children.delete(child);
+      if (this.child !== child) return;          // stopped, or replaced: whoever replaced it owns the state
+      this.child = null;
+      if (this.stopping) return;
+      const g = this.gen;
+      void this.tailLog().then(() => {
+        if (g !== this.gen || this.stopping) return;
+        if (err) {                                 // async spawn failure (ENOENT, EAGAIN, ...): no 'exit' follows (L15)
+          log('warn', `serve spawn failed: ${err.message}`);
+          this.set({ phase: 'down', owned: false, pid: null, problem: { code: 'spawn', message: `could not start harness serve: ${err.message}` } });
+          return;
+        }
+        log('warn', `owned serve exited with ${code}`);
+        if (this.st.phase === 'starting') { void this.failed(root, port, this.logAll, g); return; }
+        this.set({ phase: 'reconnecting', pid: null });
+        this.scheduleRespawn(root, port, g);
+      });
+    };
+    child.on('exit', (code) => gone(code));
+    child.on('error', (e) => gone(null, e));
+    return child;
+  }
+
+  /** Read what serve appended to serve.log since the last read (serialised; never blocks main on sync I/O). */
+  private tailLog(): Promise<void> {
+    this.tailing = this.tailing.then(() => this.tailOnce()).catch(() => undefined);
+    return this.tailing;
+  }
+
+  private async tailOnce(): Promise<void> {
+    if (!this.logFile) return;
+    const fh = await open(this.logFile, 'r').catch(() => null);
+    if (!fh) return;
+    try {
+      const { size } = await fh.stat();
+      if (size < this.logOff) this.logOff = 0;
+      if (size === this.logOff) return;
+      const n = Math.min(size - this.logOff, 512 * 1024);
+      const buf = Buffer.alloc(n);
+      const { bytesRead } = await fh.read(buf, 0, n, this.logOff);
+      this.logOff += bytesRead;
+      const s = this.logDec.write(buf.subarray(0, bytesRead));
+      if (this.logAll.length < 200000) this.logAll += s;
+      const lines = (this.logPartial + s).split('\n');
+      this.logPartial = lines.pop() || '';
       if (lines.length) {
         const tail = [...this.st.logTail, ...lines.map((l) => l.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))].slice(-RING);
         this.st = { ...this.st, logTail: tail };
         if (this.st.phase === 'starting') this.d.emit(this.get());
       }
-    };
-    child.stdout!.on('data', onData); child.stderr!.on('data', onData);
-    let exited = false;
-    child.on('exit', (code) => {
-      exited = true;
-      this.child = null;
-      if (this.stopping || g !== this.gen) return;
-      log('warn', `owned serve exited with ${code}`);
-      if (this.st.phase === 'starting') { void this.failed(root, port, all, g); return; }
-      this.set({ phase: 'reconnecting', pid: null });
-      this.scheduleRespawn(root, port, g);
-    });
-    const t0 = Date.now();
-    while (!exited && Date.now() - t0 < READY_MS && g === this.gen) {
-      await sleep(250);
-      const h = await healthz(this.st.url!);
-      if (h && !exited) { if (await this.attach(this.st.url!, true, g)) return; if (this.st.phase !== 'starting' && this.st.phase !== 'down') return; }
-    }
-    if (!exited && g === this.gen && this.st.phase === 'starting') {
-      this.set({ phase: 'down', problem: { code: 'timeout', message: 'harness serve did not come up in 120 s' } });
-    }
+    } finally { await fh.close().catch(() => undefined); }
   }
 
   private async failed(root: string, port: number, out: string, g: number): Promise<void> {
@@ -288,21 +383,25 @@ export class BackendManager {
       case 'restart':
         await this.stopServe(true);
         this.respawns = [];
-        await this.start();
+        await this.fresh();
         break;
       case 'stop': await this.stopServe(true); this.set({ phase: 'down', problem: { code: 'stopped', message: 'backend stopped' } }); break;
       case 'set-root':
         if (!validRoot(a.root)) { this.set({ problem: { code: 'bad-root', message: `${a.root} is not a harness install` } }); break; }
+        await this.stopServe(true);              // the old install's serve must not keep running under the new root
         this.d.patchSettings({ backend: { installRoot: a.root } });
-        await this.start();
+        await this.fresh();
         break;
       case 'create-env':
         if (root && !existsSync(join(root, '.env')) && existsSync(join(root, '.env.example'))) {
           copyFileSync(join(root, '.env.example'), join(root, '.env'));
+          try { chmodSync(join(root, '.env'), 0o600); } catch { /* best effort */ }
         }
-        await this.start();
+        await this.fresh();
         break;
-      case 'consent-host': this.d.patchSettings({ backend: { hostConsent: true } }); this.set({}); break;
+      case 'consent-host':
+        if (this.d.confirmHost && !(await this.d.confirmHost())) break;
+        this.d.patchSettings({ backend: { hostConsent: true } }); this.set({}); break;
       case 'login': {
         if (!this.client) break;
         const ok = await this.client.login(a.code).catch(() => false);
@@ -324,20 +423,24 @@ export class BackendManager {
     return this.get();
   }
 
-  /** Stop an owned serve (harness serve stop, then the process group). An attached serve is never stopped. */
-  async stopServe(force: boolean): Promise<void> {
+  /** Stop an owned serve: SIGTERM every spawned serve's process group first, then `harness serve stop` (capped,
+   * L1) for a serve that re-exec'd or was respawned. An attached serve (not ours) is never stopped. */
+  async stopServe(_force: boolean): Promise<void> {
     this.gen++;
     this.stopping = true;
     this.poller.stop();
     if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
-    if (!this.st.owned && !force) return;
-    if (!this.st.owned) return;
-    if (this.st.root) await runHarness(this.st.root, ['serve', 'stop'], { timeoutMs: 20000 }).catch(() => null);
-    const c = this.child;
-    if (c && c.pid) { try { process.kill(-c.pid, 'SIGTERM'); } catch { /* gone */ } }
+    if (this.reprobeTimer) { clearTimeout(this.reprobeTimer); this.reprobeTimer = null; }
+    const kids = [...this.children];
+    if (!this.st.owned && !kids.length) return;
+    for (const c of kids) if (c.pid) { try { process.kill(-c.pid, 'SIGTERM'); } catch { /* gone */ } }
     this.child = null;
+    if (this.st.root) await runHarness(this.st.root, ['serve', 'stop'], { timeoutMs: STOP_CLI_MS }).catch(() => null);
     this.set({ owned: false, pid: null });
   }
+
+  /** Spawned serves still alive (tests, diagnostics). */
+  spawned(): number[] { return [...this.children].map((c) => c.pid ?? 0); }
 
   busy(): boolean {
     const r = this.lastQueue?.runner;
@@ -347,9 +450,9 @@ export class BackendManager {
   /** Quit policy (1.2 step 9). */
   async onQuit(): Promise<void> {
     this.poller.stop();
-    if (!this.st.owned) return;
+    if (!this.st.owned && !this.children.size) return;
     const pol = this.d.settings().backend.onQuit;
-    if (pol === 'keep' || (pol === 'keep-if-busy' && this.busy())) { this.child?.unref(); return; }
+    if (pol === 'keep' || (pol === 'keep-if-busy' && this.busy())) { for (const c of this.children) c.unref(); return; }
     await this.stopServe(true);
   }
 }
@@ -361,6 +464,14 @@ export async function healthz(url: string): Promise<{ state: string; pid: number
     if (r.status !== 200) return null;
     return { state: String(r.headers['x-harness-state'] || ''), pid: Number(r.headers['x-harness-pid'] || 0), stale: r.headers['x-harness-stale'] === '1' };
   } catch { return null; }
+}
+
+/** First port in [from, from+n) whose /healthz reports `state` (our install), probed in parallel. */
+async function findServe(from: number, n: number, state: string): Promise<number | null> {
+  const ports = Array.from({ length: n }, (_, i) => from + i).filter((p) => p < 65536);
+  const hs = await Promise.all(ports.map((p) => healthz(`http://127.0.0.1:${p}`)));
+  const i = hs.findIndex((h) => h && h.state === state);
+  return i < 0 ? null : ports[i];
 }
 
 async function findFreePort(from: number): Promise<number> {

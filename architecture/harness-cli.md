@@ -38,7 +38,8 @@ key, so after sourcing the script drops group/other access to it
 upstream calls (auth probe, model lists, doctor) hand curl the
 `Authorization` header as a config on stdin (`_curl_auth_config | curl -K
 -`), so the key does not show in `ps` (`harness config set PROXY_API_KEY
-<key>` still takes it as an argument).
+<key>` takes it as an argument; `config set KEY --stdin` reads it from stdin
+instead, which is what the desktop app's key vault uses).
 
 Independent, but not equivalent: compose's dotenv parser reads an unquoted
 value to end of line, while `source` ends the assignment at the first space or
@@ -199,7 +200,7 @@ installer. Three commands cover post-install setup:
   - `config get [KEY]` / `config list` print values (`config list --tsv`:
     `KEY<TAB>shown value<TAB>secret 1/0<TAB>description`, secrets masked, for
     serve's Settings page, which groups them, `QUEUE_PARALLEL` and `QUEUE_WATCH` under Ticket queue, `FINDINGS_MODEL` under Findings agent);
-    `config set KEY VALUE` writes one (`QUEUE_PARALLEL` only a whole number of 1 or more, `QUEUE_WATCH` only 0 or 1). **Not a whitelist** — `set` writes any key; the picker/`get`
+    `config set KEY VALUE` writes one (`QUEUE_PARALLEL` only a whole number of 1 or more, `QUEUE_WATCH` only 0 or 1); `config set KEY --stdin` takes VALUE from stdin instead (one line, CR/LF dropped, multi-line refused; a hidden prompt on a tty) so secrets stay off argv. **Not a whitelist** — `set` writes any key; the picker/`get`
     just surface the common ones.
   - Reads use `_config_read_key` (straight from `$env_file`, so they reflect
     on-disk state). Writes use `_config_write_key` — the same atomic
@@ -1114,7 +1115,8 @@ exits; a halt file older than the run's lock is stale and dropped), `halt
 its agent's process group from run.json, and each slot's from a `run-I.json`,
 `taskkill /T` on Windows, waits for
 `run.lock`; a pid is trusted (`trusted`) when its file beats or, on Linux,
-`/proc/PID/cmdline` names `ticket_queue.py` (a run frozen whole); otherwise,
+`/proc/PID/cmdline` names `ticket_queue.py` (a run frozen whole; without /proc,
+`ps -o command=`, an absolute `--state` only); otherwise,
 while `run.lock` is held, it waits 10 s for the run that has just taken the
 lock to beat, then refuses (exit 1): a stale file's pid may be another
 process's after a restart; then puts every running ticket back, `stopped` when it had a
@@ -1150,15 +1152,21 @@ terminal closed) end a run as Ctrl-C does (`Terminated`, a `KeyboardInterrupt`;
 a parallel parent sends it on to each slot), exit 128+N, but leave `run.json`
 with its beat already stale (`ended: "signal N"`), so serve's start runs it
 again (`resume_runner`) even within the 30 s a beat counts as fresh. A signal
-already ignored (`nohup`) stays ignored; on SIGHUP stdout/stderr go to
-`/dev/null` first, since a write to the closed terminal would fail (EIO). The
+already ignored (`nohup`) stays ignored; on SIGHUP a stdout/stderr that is not a
+file, pipe or socket goes to `/dev/null` first, since a write to the closed terminal
+would fail (EIO); serve's `runner.out` keeps the end line. A further TERM/HUP is ignored
+while the ticket is put back, unless it comes 60 s (`SIGNAL_AGAIN`) after the first
+(a hung put-back); a parallel parent kills a slot still putting back after 120 s. The
 `harness queue run` wrapper runs the script in the background and passes TERM
 and HUP sent to the wrapper alone on to it, then waits for its real exit code
 (INT is not passed on: a Ctrl-C reaches both, and a second one would cut the
 put-back short); other `harness queue` commands `exec` the script. A full
 disk or a state folder this user cannot write (EACCES/EPERM/ENOSPC/EROFS/EDQUOT
 from any command, or a state folder that cannot be made) is one `[queue] could not write the queue's files` line and
-exit 1, not a traceback; `run_going` answers "no run" for a `run.lock` that
+exit 1, not a traceback (one on a path outside the state folder, not a full disk, is
+printed naming that path); a disk that fills mid-run ends the run that way too
+(`run_tickets` re-raises ENOSPC/EDQUOT rather than blocking a ticket it cannot save),
+the ticket left as its last whole write had it for the next run; `run_going` answers "no run" for a `run.lock` that
 cannot be made, so `list` and `status` work on a read-only folder.
 A run that ends on an upstream outage (exit 3), Ctrl-C (130) or one of those signals
 puts the ticket it was on back to `queued` at its stage, uncounted, with the
@@ -1394,7 +1402,11 @@ answer, 408, 429 or 5xx; if it does not answer the ticket goes back at its
 stage, uncounted, and the run waits (`wait_out`: looks again after 2, 5, 10,
 then every 30 min, `waiting {since, next, until, why}` in `run.json`, a halt
 still ends it) up to `--outage-wait` (`QUEUE_OUTAGE_WAIT`, 6 h; 0: exit 3 at
-once), then exits 3. A launch that ends non-zero within 60 s having started
+once), then exits 3. A 401/403 (a locked or expired key: `key_refused`) is the same
+wait with its own reason ("the upstream refuses the key ... harness unlock") in
+`waiting.why`, the step and the exit-3 line; it ends by itself once the key works,
+and a `LaunchFailed` while the upstream refuses the key (`refused_key`, one request)
+is that wait, not counted against the ticket. A launch that ends non-zero within 60 s having started
 nothing (no note, no commit on its branch, no `--watch` session write:
 `LaunchFailed`) goes back the same way, uncounted (`launch_fails`), and
 blocks the ticket the third time in a row. An agent with nothing new (its
@@ -3095,7 +3107,9 @@ the body.
 endpoint calls: `status home queue sessions findings findings-agent vault
 ingest debug ticket:<KEY> session:<sid>`; a removed ticket or session is
 `{"gone": true}`. One failing topic is an `error` entry; the rest answer.
-`/status` caches proxy health 5 s and the git version 60 s.
+`/status` caches proxy health 5 s and the git version 60 s (`_cached`: only the
+first call waits; an expired value is served while one thread fetches the next). A 500
+`internal` names the exception type only (the text, which can hold paths, goes to serve's log).
 
 **Reads (GET).** `/status`, `/opencode` (`{port, url, user, password}`; 404
 without opencode web), `/home`, `/queue`, `/queue/runner-log`,
@@ -3108,8 +3122,8 @@ query), `/sessions?q=&limit=&all=1`, `/sessions/<sid>`,
 4000 characters is cut, `truncated: true`), `/sessions/<sid>/parts/<pid>`,
 `/sessions/<sid>/export`, `/follow?since=&queue=1|findings=1`, `/findings`,
 `/findings/agent`, `/findings/notes/<slug>/<name>`, `/vaults`, `/vault`,
-`/vault/ingest`, `/vault/tree?path=`, `/vault/file?path=` (no `..`, no
-`.git`, text up to 1 MiB, an image as its `/vault/file/` URL), `/settings`
+`/vault/ingest`, `/vault/tree?path=`, `/vault/file?path=` (`vault_view.resolve`: no `..`, no
+`.git`, a backslash read as `/`; the tree hides `.git` only, `.gitignore`/`.github` are listed; text up to 1 MiB, an image as its `/vault/file/` URL), `/settings`
 (a secret config value is `(set, N chars)`, never the value),
 `/update`, `/jira?list=&mine=1`, `/debug`,
 `/debug/<runs|reports>/<name>`. A session row's `web` is the session's

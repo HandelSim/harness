@@ -95,6 +95,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -175,6 +176,7 @@ ALL_STAGES = ("plan", "test", "implement", "review", "fix", "push")
 DEFAULT_STAGES = ("plan", "implement", "review", "fix", "push")
 POLL = 2                   # seconds between looks at the agent, the stop and halt files
 ASLEEP = 120               # a gap this long between two looks: the machine slept, and the time is not counted
+SIGNAL_AGAIN = 60          # s after a first SIGTERM/SIGHUP when another ends a hung put-back (catch_term)
 BEAT = 3                   # seconds between run.json beats
 OWNER_NOTE_CAP = 4_000     # chars of one owner note
 OWNER_NOTES_MAX = 50
@@ -245,19 +247,23 @@ class Terminated(KeyboardInterrupt):
 
 def catch_term():
     """cmd_run's handlers: the first SIGTERM or SIGHUP raises Terminated in the main
-    thread; one more while the run puts its ticket back does not cut that short.
-    A signal already ignored (nohup) stays ignored. Returns the handlers to put back
-    (none off the main thread, where Python allows none)."""
+    thread; one more while the run puts its ticket back does not cut that short, unless
+    it comes SIGNAL_AGAIN s after the first (a put-back hung on a docker stop or a git
+    lock: the run is not left deaf to all but SIGKILL). A signal already ignored (nohup)
+    stays ignored. Returns the handlers to put back (none off the main thread, where
+    Python allows none)."""
     if threading.current_thread() is not threading.main_thread():
         return {}
     seen = []
 
     def on(signum, frame):
         if signum == getattr(signal, "SIGHUP", None):   # the terminal is gone: a write to it fails (EIO)
-            with contextlib.suppress(OSError):          # and would cut the putting back short; the logs
-                sys.stdout = sys.stderr = open(os.devnull, "w")   # keep the record (log.md, run.log)
-        if not seen:
-            seen.append(signum)
+            for name in ("stdout", "stderr"):           # and would cut the putting back short; the logs keep
+                if not file_or_pipe(getattr(sys, name)):   # the record (log.md, run.log). A file or pipe
+                    with contextlib.suppress(OSError):     # (serve's runner.out, a kill -HUP) is kept
+                        setattr(sys, name, open(os.devnull, "w"))
+        if not seen or time.monotonic() - seen[0] > SIGNAL_AGAIN:
+            seen[:] = [time.monotonic()]
             raise Terminated(signum)
     old = {}
     for name in ("SIGTERM", "SIGHUP"):
@@ -266,6 +272,16 @@ def catch_term():
             with contextlib.suppress(OSError, ValueError):
                 old[sig] = signal.signal(sig, on)
     return old
+
+
+def file_or_pipe(stream):
+    """stream writes to a file, pipe or socket (not a terminal, which a hung-up one may
+    no longer even say it is: isatty() fails on it)."""
+    try:
+        mode = os.fstat(stream.fileno()).st_mode
+    except (OSError, ValueError, AttributeError):
+        return False
+    return stat.S_ISREG(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
 
 
 def uncatch_term(old):
@@ -3283,6 +3299,27 @@ def upstream_ok(ctx):
         return False
 
 
+KEY_REFUSED = ("the upstream refuses the key (locked or expired: harness unlock, or a new key with harness "
+               "config set; the run goes on by itself once it answers)")
+
+
+def key_refused(e):
+    """HTTP 401 (a locked, expired or wrong key) or 403 (a key without access): not an
+    outage that passes by itself, though the run's wait still ends once the owner fixes it."""
+    return re.match(r"HTTP 40[13]\b", str(e)) is not None
+
+
+def refused_key(ctx):
+    """Infra when one tiny request says the upstream refuses the key (key_refused), else None."""
+    try:
+        wait_call(ctx, call_model, ctx.proxy, ctx.verify_model,
+                  [{"role": "user", "content": "Reply with the single word OK."}], 60, deadline=120)
+    except InfraError as x:
+        if key_refused(x):
+            return Infra(str(x))
+    return None
+
+
 def hhmm(t):
     return time.strftime("%H:%M", time.localtime(t))
 
@@ -3294,12 +3331,14 @@ def wait_out(ctx, e):
     pause is over). After ctx.outage_wait seconds of it the run ends: Infra."""
     o = ctx.outage
     o.setdefault("since", time.time())
-    what = "a launch failed having started nothing" if isinstance(e, LaunchFailed) else "the upstream does not answer"
+    what = ("a launch failed having started nothing" if isinstance(e, LaunchFailed)
+            else KEY_REFUSED if key_refused(e) else "the upstream does not answer")
     while True:
         waited = time.time() - o["since"]
         left = ctx.outage_wait - waited
         if left <= 0:
-            raise Infra(f"{str(e)[:200]}; waited {waited / 60:.0f} min") from None
+            raise Infra((f"{KEY_REFUSED.split(' (')[0]} ({str(e)[:200]}): harness unlock, or a new key"
+                         if key_refused(e) else str(e)[:200]) + f"; waited {waited / 60:.0f} min") from None
         n = o.get("n", 0)
         secs = min(OUTAGE_PAUSES[min(n, len(OUTAGE_PAUSES) - 1)], left)
         o["n"] = n + 1
@@ -5877,9 +5916,14 @@ def run_parallel(q, a, locked_at):
                 for k in kids:
                     with contextlib.suppress(OSError):
                         k.send_signal(e.signum)
-            for k in kids:
+            end = time.monotonic() + 2 * SIGNAL_AGAIN   # a slot hung in its put-back: ended, its ticket
+            for k in kids:                                # taken again (an orphan) by the next run
                 with contextlib.suppress(KeyboardInterrupt):
-                    k.wait()
+                    try:
+                        k.wait(timeout=max(1, end - time.monotonic()))
+                    except subprocess.TimeoutExpired:
+                        k.kill()
+                        k.wait()
             if isinstance(e, Terminated):
                 print(f"\n[queue] ended by signal {e.signum}; 'harness queue run' (or harness serve's start) "
                       "carries on from the same stage", file=sys.stderr)
@@ -6301,6 +6345,8 @@ def run_tickets(q, ctx):
                     sync_vault(ctx, key, int(time.time() * 1000))
                     raise
             except Infra as e:   # the ticket goes back; the run waits for the upstream and carries on
+                if isinstance(e, LaunchFailed):   # a refused key fails every launch at once: an outage
+                    e = refused_key(ctx) or e     # to wait out with its reason, not this ticket's fault
                 n = st.get("launch_fails", 0) + 1 if isinstance(e, LaunchFailed) else 0
                 if n >= LAUNCH_TRIES:   # not passing: something about this ticket's launch
                     st.pop("launch_fails", None)
@@ -6323,6 +6369,13 @@ def run_tickets(q, ctx):
                 raise
             except Exception as e:  # noqa: BLE001 - one ticket's failure must not stop the queue
                 import traceback
+                if disk_full(e):   # not this ticket's failure: every later write fails too, and a block
+                    # could not be saved (the run went on to exit 0 with the ticket left "running").
+                    # main says so, non-zero; state.json is its last whole write (write_atomic), and
+                    # the next run takes the ticket again (an orphan's agent reaped) where it was
+                    with contextlib.suppress(Exception):
+                        q.log(key, "error", traceback.format_exc(), echo=False)
+                    raise
                 try:
                     q.log(key, "error", traceback.format_exc())
                     block(ctx, st, f"the queue hit an error of its own ({type(e).__name__}: {str(e)[:200]}); the "
@@ -7384,9 +7437,22 @@ def trusted(info, q=None):
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0")]
         cwd = os.readlink(f"/proc/{pid}/cwd")
-    except OSError:   # no /proc (macOS, Windows), or gone: the beat alone decides
-        return False
+    except OSError:   # gone, or no /proc (macOS, Windows): there ps, when there is one
+        if os.path.isdir("/proc/self"):
+            return False
+        argv, cwd = ps_argv(pid), None
     return runs_queue(argv, q.root if q is not None else None, cwd)
+
+
+def ps_argv(pid):
+    """pid's command line as POSIX ps prints it (words split at spaces: a state path with a
+    space in it does not match, so such a run is spared, never someone else's killed); []
+    without ps (Windows) or when pid is gone."""
+    try:
+        r = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, timeout=10, **TEXT)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return r.stdout.split() if r.returncode == 0 else []
 
 
 def runs_queue(argv, root, cwd):
@@ -7410,7 +7476,9 @@ def runs_queue(argv, root, cwd):
         return False
     if root is None:
         return True
-    return state is not None and os.path.realpath(os.path.join(cwd, state)) == os.path.realpath(root)
+    if state is not None and cwd is None and not os.path.isabs(state):
+        return False   # ps gives no cwd: a relative --state cannot be told apart
+    return state is not None and os.path.realpath(os.path.join(cwd or "", state)) == os.path.realpath(root)
 
 
 def own_agent(s, pid):
@@ -7989,6 +8057,11 @@ def main(argv):
     except OSError as e:
         if e.errno not in NO_WRITE:
             raise
+        if e.filename and not under(e.filename, a.state) and not disk_full(e):
+            # not the queue's files (an editor or harness not executable, an unreadable project
+            # file): named as it is, not blamed on the state folder
+            print(f"[queue] {e.strerror or e}: {e.filename}", file=sys.stderr)
+            return 1
         # a full disk, or a state folder this user cannot write: said, not a traceback; a ticket
         # is left as its last whole write had it (write_atomic), and the next run carries on
         print(f"[queue] could not write the queue's files ({e}): the disk may be full, or {a.state} not "
@@ -7998,6 +8071,18 @@ def main(argv):
 
 NO_WRITE = {getattr(__import__("errno"), n) for n in ("EACCES", "EPERM", "ENOSPC", "EROFS", "EDQUOT")
             if hasattr(__import__("errno"), n)}
+FULL = {getattr(__import__("errno"), n) for n in ("ENOSPC", "EDQUOT") if hasattr(__import__("errno"), n)}
+
+
+def disk_full(e):
+    return isinstance(e, OSError) and e.errno in FULL
+
+
+def under(path, root):
+    try:
+        return os.path.commonpath([os.path.realpath(path), os.path.realpath(root)]) == os.path.realpath(root)
+    except (ValueError, TypeError, OSError):
+        return False
 
 
 if __name__ == "__main__":

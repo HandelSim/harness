@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Message, SessionRow } from '../../../shared/api';
-import { mergePage, nextFrom, partView, sortSessions } from './model';
+import { mergePage, nextFrom, partView, sortSessions, tailStart, TAIL } from './model';
 
 const M = (index: number, text = `m${index}`): Message => ({ id: `id${index}`, index, created: index, role: 'assistant', info: {}, parts: [{ id: `p${index}`, type: 'text', text }] });
 
@@ -32,4 +32,24 @@ test('sortSessions puts working first then most recent, and filters', () => {
   const rows = [R('a', 1), R('b', 5), R('c', 2, true, 'Fix parser')];
   assert.deepEqual(sortSessions(rows).map((r) => r.id), ['c', 'b', 'a']);
   assert.deepEqual(sortSessions(rows, 'parser').map((r) => r.id), ['c']);
+});
+
+test('mergePage (M7): an unchanged re-read returns the same array; a growing last message keeps the others', () => {
+  const page = (from: number, ms: Message[]) => ({ from, count: 5000, messages: ms, working: true, live: true });
+  const all = Array.from({ length: 5000 }, (_, i) => M(i, `m${i}`));
+  const l = mergePage([], page(0, all));
+  assert.equal(l.length, 5000);
+  const ipc = (m: Message) => JSON.parse(JSON.stringify(m)) as Message;   // every poll hands back new objects
+  assert.equal(mergePage(l, page(4999, [ipc(l[4999])])), l, 'same content: same array, no render');
+  const grown = mergePage(l, page(4998, [ipc(l[4998]), M(4999, 'm4999 more')]));
+  assert.notEqual(grown, l);
+  assert.equal(grown[4998], l[4998], 'unchanged message keeps identity (memoised view skips it)');
+  assert.notEqual(grown[4999], l[4999]);
+  assert.equal(grown[0], l[0]);
+});
+
+test('tailStart: only the newest TAIL of a 5,000-message transcript is rendered until "Show earlier"', () => {
+  assert.equal(5000 - tailStart(5000, TAIL), TAIL);
+  assert.equal(tailStart(5000, TAIL * 2), 5000 - TAIL * 2);
+  assert.equal(tailStart(50, TAIL), 0);
 });

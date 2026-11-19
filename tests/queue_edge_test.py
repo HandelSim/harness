@@ -85,6 +85,26 @@ class SignalTest(Edge):
 
     def test_sighup_stops_the_agent_and_puts_the_ticket_back(self):
         self.check_ended_by(signal.SIGHUP)
+        # stdout is a file here (serve's runner.out, a kill -HUP), not a closed terminal: kept (Q-4)
+        self.assertIn("ended by signal 1", self.out())
+
+    def test_a_second_signal_long_after_the_first_ends_a_hung_put_back(self):
+        from unittest import mock
+        old = tq.catch_term()
+        self.addCleanup(tq.uncatch_term, old)
+        now = [1000.0]
+
+        def hit():
+            os.kill(os.getpid(), signal.SIGTERM)
+            for _ in range(50):   # the handler runs in this (the main) thread between bytecodes
+                time.sleep(0.01)
+        with mock.patch.object(tq.time, "monotonic", lambda: now[0]):
+            with self.assertRaises(tq.Terminated):
+                hit()
+            hit()   # one more while the ticket is put back: that is not cut short
+            now[0] += tq.SIGNAL_AGAIN + 1
+            with self.assertRaises(tq.Terminated):   # a minute later: the put-back hangs, it is
+                hit()
 
     def test_sigterm_to_a_parallel_run_reaches_its_slots(self):
         os.environ.update(FAKE_SLEEP="60")
@@ -224,6 +244,43 @@ class HaltForceTest(Edge):
         self.assertEqual(p.wait(timeout=10), -signal.SIGKILL)
         self.assertLess(time.time() - t0, 8)   # no wait for a beat that will not come
         self.assertFalse(os.path.exists(os.path.join(self.state, "run.json")))
+
+
+class NoProcTest(Edge):
+    """Without /proc (macOS; review Q-3) halt --force still tells a frozen run of this
+    queue (ps) from anyone else's pid; Windows has no ps: the beat alone decides there."""
+
+    def fake_run(self, *argv):
+        script = os.path.join(self.tmp, "bin", "ticket_queue.py")
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        put(script, "import time\ntime.sleep(60)\n")
+        p = subprocess.Popen([sys.executable, script, *argv])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        return p
+
+    def test_ps_says_what_proc_would(self):
+        from unittest import mock
+        import builtins
+        q = tq.Queue(self.state)
+        mine = self.fake_run("--state", self.state, "run", "--vault", self.vault)
+        other = self.fake_run("--state", os.path.join(self.tmp, "elsewhere"), "run")
+        rel = self.fake_run("--state", "state", "run")
+        list_ = self.fake_run("--state", self.state, "list")
+        real_open, real_isdir = builtins.open, os.path.isdir
+
+        def no_proc_open(path, *a, **k):
+            if str(path).startswith("/proc/"):
+                raise FileNotFoundError(2, "No such file or directory", path)
+            return real_open(path, *a, **k)
+        time.sleep(0.3)
+        self.assertTrue(tq.trusted({"pid": mine.pid, "beat": 0}, q))   # /proc, as before
+        with mock.patch.object(builtins, "open", no_proc_open), \
+                mock.patch.object(tq.os.path, "isdir", lambda p: p != "/proc/self" and real_isdir(p)):
+            self.assertTrue(tq.trusted({"pid": mine.pid, "beat": 0}, q))
+            for p in (other, rel, list_, self.innocent()):
+                self.assertFalse(tq.trusted({"pid": p.pid, "beat": 0}, q), p.args)
+            with mock.patch.object(tq.subprocess, "run", side_effect=FileNotFoundError("ps")):
+                self.assertFalse(tq.trusted({"pid": mine.pid, "beat": 0}, q))   # no ps: the beat decides
 
 
 class ConcurrencyTest(Edge):
@@ -384,15 +441,34 @@ class StateDirTest(Edge):
             return real(path, *a, **k)
         with mock.patch.object(tq, "write_atomic", side_effect=filling):
             rc, out = self.run_queue()
-        # one ticket's failure does not stop the queue (run_tickets): the run goes on, the
-        # error in the ticket's log; the ticket keeps its last whole write, no run holding it
-        self.assertEqual(rc, 0, out)
+        # not one ticket's failure: every later write fails too (a block could not be saved), so
+        # the run ends non-zero, said (it used to go on and exit 0), the error in the ticket's log;
+        # the ticket keeps its last whole write, no run holding it
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the disk may be full", out)
+        self.assertNotIn("Traceback", out)
         self.assertIn("No space left on device", cat(os.path.join(self.state, "ABC-1", "log.md")))
         self.assertEqual(self.status()["status"], "running")
         self.assertFalse(tq.run_holds(tq.Queue(self.state), "ABC-1"))
         self.assertFalse(os.path.exists(os.path.join(self.state, "run.json")))
         rc, out = self.run_queue()   # space freed
         self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+
+    def test_a_permission_error_elsewhere_is_named_not_blamed_on_the_state_folder(self):
+        import errno
+        from unittest import mock
+        for err, said, not_said in (
+                (PermissionError(errno.EACCES, "Permission denied", "/opt/editor"), "/opt/editor",
+                 "the disk may be full"),
+                (PermissionError(errno.EACCES, "Permission denied", os.path.join(self.state, "x")),
+                 "the disk may be full", "Traceback"),
+                (OSError(errno.ENOSPC, "No space left on device", "/other/disk/clone"), "the disk may be full",
+                 "Traceback")):
+            with mock.patch.object(tq, "cmd_list", side_effect=err):
+                rc, out = self.q("list")
+            self.assertEqual(rc, 1, out)
+            self.assertIn(said, out)
+            self.assertNotIn(not_said, out)
 
     @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "root writes anywhere")
     def test_an_unwritable_state_folder_is_a_clear_error(self):
@@ -425,6 +501,254 @@ class StateDirTest(Edge):
             self.assertFalse(os.path.exists(state))
         finally:
             os.chmod(parent, 0o755)   # before the tmp folder is removed
+
+
+KILL_IN_CLONE = r"""
+import os, signal, sys
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import ticket_queue as tq
+q = tq.Queue(sys.argv[2])
+st = q.load("ABC-1")
+st["status"] = "running"   # as process() leaves it before the clone
+q.save(st)
+where, real_git, real_rq = sys.argv[3], tq.git, tq.run_quiet
+
+def git(cwd, *a, **k):
+    if where == "fetch" and a[:1] == ("fetch",) and os.path.basename(cwd) == "repo":   # into the clone
+        os.kill(os.getpid(), signal.SIGKILL)
+    return real_git(cwd, *a, **k)
+
+def run_quiet(cmd, *a, **k):
+    if where == "clone" and cmd[:2] == ["git", "clone"]:   # the clone cut short: a .git with half a HEAD
+        os.makedirs(os.path.join(cmd[-1], ".git", "objects"), exist_ok=True)
+        open(os.path.join(cmd[-1], ".git", "HEAD"), "w").write("ref: refs/hea")
+        os.kill(os.getpid(), signal.SIGKILL)
+    return real_rq(cmd, *a, **k)
+tq.git, tq.run_quiet = git, run_quiet
+tq.make_clone(q, st)
+"""
+
+
+class CloneKillTest(Edge):
+    """SIGKILL (a power cut, the OOM killer) inside make_clone: the clone is complete only
+    once base_sha is saved, so the next run clones again; the start's ref left in the
+    project (refs/harness-queue-ref/KEY) is overwritten and deleted by that clone."""
+
+    def check(self, where):
+        self.add("ABC-1")
+        script = os.path.join(self.tmp, "kill_in_clone.py")
+        put(script, KILL_IN_CLONE)
+        r = subprocess.run([sys.executable, script, tq.__file__, self.state, where],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, -signal.SIGKILL, r.stderr)
+        st = self.status()
+        self.assertNotIn("base_sha", st)
+        self.assertEqual(st["status"], "running")
+        self.assertTrue(os.path.isdir(os.path.join(self.state, "ABC-1", "repo")))   # what the kill left
+        refs = lambda: self.git_p("for-each-ref", "--format=%(refname)", "refs/harness-queue-ref")   # noqa: E731
+        if where == "fetch":
+            self.assertEqual(refs(), "refs/harness-queue-ref/ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        self.assertNotIn("failed", [h.get("result") for h in st.get("history", [])])
+        self.assertEqual(refs(), "")
+        repo = os.path.join(self.state, "ABC-1", "repo")
+        self.assertEqual(sh("git", "-C", repo, "for-each-ref", "refs/harness-queue-ref"), "")
+        self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch"))
+
+    def test_killed_inside_git_clone(self):
+        self.check("clone")
+
+    def test_killed_after_the_start_ref_was_made_in_the_project(self):
+        self.check("fetch")
+
+
+class KeyRefusedTest(Edge):
+    """The upstream answers 401 (a locked or expired key) to every call: not retried within
+    a call (a 4xx), and waited out as an outage with its own owner-visible reason; a launch
+    that dies at once while the key is refused is that, not the ticket's fault."""
+
+    def refuse(self, code=401):
+        def post(h):
+            h.rfile.read(int(h.headers["Content-Length"]))
+            h.reply(code, {"error": {"type": "key_locked", "message": "key locked",
+                                     "unlock_url": "https://example.invalid/unlock"}})
+        old = qt.FakeProxy.do_POST
+        qt.FakeProxy.do_POST = post
+        self.addCleanup(setattr, qt.FakeProxy, "do_POST", old)
+
+    def test_a_401_is_one_try_and_a_key_reason(self):
+        from unittest import mock
+        e401, e403, e502 = (tq.InfraError(f"HTTP {c}: x") for c in (401, 403, 502))
+        self.assertEqual([tq.key_refused(e) for e in (e401, e403, e502, tq.InfraError("timed out"))],
+                         [True, True, False, False])
+        self.assertFalse(tq.transient(e401))
+        q = tq.Queue(self.state)
+        ctx = type("C", (), {"q": q, "key": "", "proxy": "p", "verify_model": "m"})()
+        with mock.patch.object(tq, "call_model", side_effect=e401) as cm, mock.patch.object(tq, "step"):
+            with self.assertRaises(tq.Infra):
+                tq.probe(ctx)
+            self.assertEqual(cm.call_count, 1)
+            self.assertIsInstance(tq.refused_key(ctx), tq.Infra)
+        with mock.patch.object(tq, "call_model", side_effect=e502):
+            self.assertIsNone(tq.refused_key(ctx))
+        # the wait says why, in run.json (the viewer) and the step; the key fixed, it carries on
+        beats = []
+        ctx = type("C", (), {"q": q, "key": "", "outage": {}, "outage_wait": 3600, "proxy": "p",
+                             "verify_model": "m"})()
+        with mock.patch.object(tq, "beat", lambda c, **k: beats.append(k)), mock.patch.object(tq, "pause"), \
+                mock.patch.object(tq, "upstream_ok", return_value=True), mock.patch("sys.stderr"):
+            tq.wait_out(ctx, tq.Infra(str(e401)))
+        self.assertIn("refuses the key", beats[0]["step"])
+        self.assertIn("HTTP 401", beats[0]["waiting"]["why"])
+        ctx.outage, ctx.outage_wait = {}, 0
+        with self.assertRaises(tq.Infra) as cm:
+            tq.wait_out(ctx, tq.Infra(str(e401)))
+        self.assertIn("refuses the key", str(cm.exception))
+        self.assertIn("harness unlock", str(cm.exception))
+
+    def check_run(self):
+        self.add("ABC-1")
+        rc, out = self.run_queue()   # --outage-wait 0: the wait ends the run at once
+        st = self.status()
+        self.assertEqual((rc, st["status"], st["stage"]), (3, "queued", "plan"), out)
+        self.assertIn("refuses the key", out)
+        self.assertIn("HTTP 401", out)
+        self.assertNotIn("launch_fails", st)
+        return out
+
+    def test_the_verifier_gets_401(self):
+        self.refuse()
+        self.check_run()
+
+    def test_every_launch_dies_while_the_key_is_refused(self):
+        self.refuse()
+        os.environ["FAKE_EXIT"] = "9:1"   # harness -p dies at once, having done nothing
+        self.check_run()
+        self.assertTrue(os.path.exists(self.calls + ".exits"))   # the launch path, not the verifier's
+
+
+class ClockJumpTest(Edge):
+    """The wall clock set forward or back under a running queue (NTP, a VM resumed): beats
+    are wall-clock stamps, so one may look stale (forward) or come from the future (back).
+    Neither starts a second runner (run.lock), and the runner's next beat (every BEAT s)
+    puts it right: staleness is never frozen."""
+
+    def test_beats_across_clock_jumps(self):
+        from unittest import mock
+        now = time.time()
+        info = {"beat": int(now)}
+        self.assertTrue(tq.beating(info))
+        with mock.patch.object(tq.time, "time", return_value=now + 3600):
+            self.assertFalse(tq.beating(info))   # forward: stale at once
+        with mock.patch.object(tq.time, "time", return_value=now - 3600):
+            self.assertFalse(tq.beating(info))   # back: a beat from the future is not taken as fresh for an hour
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
+        self.add("ABC-1")
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        run_json = os.path.join(self.state, "run.json")
+        for jump in (3600, -3600):   # the last beat as the clock now reads it
+            info = self.run_json()
+            info["beat"] = int(time.time()) + jump
+            tq.write_atomic(run_json, json.dumps(info) + "\n")
+            self.assertFalse(tq.runner(tq.Queue(self.state))["running"])
+            rc, out = self.q("run", "--vault", self.vault, "--proxy", self.proxy, "--harness", self.harness,
+                             "--default-model", "free-withtools")
+            self.assertEqual(rc, 1, out)   # no second runner: run.lock, not the beat, says one runs
+            self.assertIn("another 'harness queue run' is running", out)
+            self.wait_for(lambda: tq.runner(tq.Queue(self.state))["running"], "the next beat", tq.BEAT + 5)
+        p.send_signal(signal.SIGINT)
+        p.wait(timeout=60)
+
+
+class ProjectVariantTest(Edge):
+    """add and run on project folders of other shapes: not a repository, no commits yet, a
+    detached HEAD, a git worktree, a repository inside another, a folder below the top, a
+    symlink to a folder inside a repository (real local repositories, no network)."""
+
+    def bare_repo(self, path, commit=True):
+        os.makedirs(path)
+        sh("git", "-c", "init.defaultBranch=main", "init", "-q", path)
+        for k, v in (("user.name", "T"), ("user.email", "t@example.com")):
+            sh("git", "-C", path, "config", k, v)
+        if commit:
+            put(os.path.join(path, "README"), "x\n")
+            sh("git", "-C", path, "add", "README")
+            sh("git", "-C", path, "commit", "-q", "-m", "init")
+        return path
+
+    def refused(self, project, said):
+        rc, out = self.q("add", "ABC-1", "--project", project)
+        self.assertEqual(rc, 1, out)
+        self.assertIn(said, out)
+        self.assertNotIn("Traceback", out)
+        self.assertIsNone(self.status())
+        self.assertEqual(tq.Queue(self.state).order(), [])
+
+    def runs_done(self, project, base):
+        rc, out = self.q("add", "ABC-1", "--project", project)
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual((st["project"], st["base"]), (os.path.realpath(project), base))
+        rc, out = self.run_queue("--push", "0")
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        return st
+
+    def test_not_a_repository_is_refused(self):
+        plain = os.path.join(self.tmp, "plain dir é")
+        os.makedirs(plain)
+        self.refused(plain, "is not in a git repository (use --dir)")
+
+    def test_a_repository_with_no_commits_is_refused(self):
+        self.refused(self.bare_repo(os.path.join(self.tmp, "empty"), commit=False), "main is not a commit")
+
+    def test_a_detached_head_starts_from_its_commit(self):
+        sha = self.git_p("rev-parse", "HEAD")
+        self.git_p("checkout", "-q", "--detach")
+        st = self.runs_done(self.project, sha)
+        self.assertEqual(st["start_sha"], sha)
+        self.assertEqual(self.git_p("rev-parse", "HEAD"), sha)   # the project left as it was
+        self.assertNotEqual(subprocess.run(["git", "-C", self.project, "symbolic-ref", "-q", "HEAD"]).returncode, 0)
+
+    def test_a_git_worktree_is_a_project(self):
+        wt = os.path.join(self.tmp, "wt 中")
+        self.git_p("worktree", "add", "-q", "-b", "side", wt)
+        self.runs_done(wt, "side")
+        self.assertIn("ABC-1", self.git_p("branch", "--list", "ABC-1"))   # the branch is the repository's
+
+    def test_a_repository_inside_another(self):
+        outer = self.bare_repo(os.path.join(self.tmp, "outer"))
+        inner = self.bare_repo(os.path.join(outer, "inner"))
+        self.runs_done(inner, "main")
+        self.assertIn("ABC-1", sh("git", "-C", inner, "branch", "--list", "ABC-1"))
+        self.assertEqual(sh("git", "-C", outer, "branch", "--list", "ABC-1"), "")   # not the outer one's
+
+    def test_a_folder_below_the_top_and_a_symlink_to_it(self):
+        sub = os.path.join(self.project, "src")
+        os.makedirs(sub)
+        put(os.path.join(sub, "a.txt"), "a\n")
+        self.git_p("add", "src")
+        self.git_p("commit", "-q", "-m", "src")
+        link = os.path.join(self.tmp, "link to src")
+        os.symlink(sub, link)
+        rc, out = self.q("add", "ABC-1", "--project", link)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["project"], os.path.realpath(self.project))   # the repository's top
+        rc, out = self.run_queue("--push", "0")
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+
+    def test_a_project_folder_gone_after_add_blocks_with_why(self):
+        proj = self.bare_repo(os.path.join(self.tmp, "gone"))
+        rc, out = self.q("add", "ABC-1", "--project", proj)
+        self.assertEqual(rc, 0, out)
+        os.rename(proj, proj + ".moved")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "blocked"), out)
+        self.assertIn("is not there", st["reason"])
 
 
 if __name__ == "__main__":

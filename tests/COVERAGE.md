@@ -789,7 +789,7 @@ non-green rows — the gap.
 | C039 | green  | tests/unit_chatgpt_test.sh (T20)            | `.env` rewritten to the CHATGPT_* trio only; `cmd_preflight` output must match `harness chatgpt preflight`. The original `.env` is restored and the same grep must NOT match. | |
 | C040 | green  | tests/unit_config_test.sh (T14)             | `_config_value_truncated` is asserted true for `('a=1', 'a=1; b=2')` and false for identical values, a non-prefix difference (`'a=1'` vs `'z=9; a=1'`), an empty sourced value, and an empty on-disk value. | The `doctor_check fail` rendering that consumes the predicate is verified by hand, not by a test: `cmd_doctor` needs `harness_container_runtime`, which `HARNESS_SOURCE_ONLY=1` does not load. |
 
-## Q — Ticket queue robustness (`scripts/ticket_queue.py`, 11 IDs)
+## Q — Ticket queue robustness (`scripts/ticket_queue.py`, 16 IDs)
 
 Not counted in the summary stats above (added after that audit). All are
 driven docker-free by `tests/queue_edge_test.py` (run as Q1b of
@@ -805,9 +805,14 @@ driven docker-free by `tests/queue_edge_test.py` (run as Q1b of
 | Q006 | green  | tests/queue_edge_test.py (HaltForceTest) | `test_halt_force_spares_a_pid_a_stale_run_json_names` (an innocent pid survives, rc 1, under 15 s); `test_halt_force_ends_a_frozen_run_that_no_longer_beats` (a stale run.json whose pid is a `ticket_queue.py` process is SIGKILLed at once). | |
 | Q007 | green  | tests/queue_edge_test.py (UnreadableStateTest) | `test_a_state_file_that_is_not_a_ticket_is_skipped_not_a_crash`. | |
 | Q008 | green  | tests/queue_edge_test.py (StateDirTest) | `test_a_full_disk_is_said_not_a_traceback` (ENOSPC from `write_atomic` for add/note/move); `test_an_unwritable_state_folder_is_a_clear_error` (chmod 555; skipped as root). | |
-| Q009 | green  | tests/queue_edge_test.py (StateDirTest) | `test_a_disk_that_fills_mid_run_leaves_the_ticket_for_the_next_run`. | |
+| Q009 | green  | tests/queue_edge_test.py (StateDirTest) | `test_a_disk_that_fills_mid_run_leaves_the_ticket_for_the_next_run`: ENOSPC on every state.json write after the take; rc 1, the full-disk line, no traceback; the next run finishes. | |
 | Q010 | green  | tests/queue_edge_test.py (ConcurrencyTest, RestartTest) | `test_a_second_run_is_refused_while_one_goes`; `test_the_run_after_a_restart_gets_past_what_the_dead_run_left`. | |
 | Q011 | green  | tests/queue_edge_test.py (ProjectShapeTest) | the four `ProjectShapeTest` tests. | |
+| Q012 | green  | tests/queue_edge_test.py (CloneKillTest) | a child process runs `make_clone` and SIGKILLs itself inside `git clone` (a cut `.git`) or at the fetch into the clone (the project's `refs/harness-queue-ref/ABC-1` left); rc -9, no `base_sha`; the next run is rc 0 `done`, no `failed` history, the ref gone in project and clone, branch pushed. | |
+| Q013 | green  | tests/queue_edge_test.py (KeyRefusedTest) | `call_model` mocked to 401: one call, `probe` raises `Infra`, `wait_out` beats with "refuses the key"/`HTTP 401` and ends with "harness unlock"; the fake proxy answering 401 to every POST: rc 3, ticket `queued` at plan, no `launch_fails`, both through the verifier and with every launch dying at once (`FAKE_EXIT`). | |
+| Q014 | green  | tests/queue_edge_test.py (ClockJumpTest) | `beating` with `time.time` mocked ±1 h; a live run's run.json beat set ±1 h: `runner` says not running, a second `run` gets rc 1 "another ... is running", and `runner` is running again within BEAT+5 s. | serve's `runs.py` RUN_FRESH check has no lower bound (a future beat counts as fresh); not this leg's file. |
+| Q015 | green  | tests/queue_edge_test.py (ProjectVariantTest) | 7 tests on real temp repos (`init.defaultBranch=main`): refusals with rc 1, no traceback and an empty order; the rest `add` then `run --push 0` to `done` with the project/base asserted. | Submodule as the project: covered by `QT NestedReposTest`, not here. |
+| Q016 | green  | tests/queue_edge_test.py (SignalTest, StateDirTest, NoProcTest) | `test_sighup_...` asserts "ended by signal 1" in the run's output file; `test_a_second_signal_long_after_the_first_ends_a_hung_put_back` (in-process handler, `time.monotonic` mocked); `test_a_permission_error_elsewhere_is_named_not_blamed_on_the_state_folder`; `test_ps_says_what_proc_would` (open of /proc mocked to fail, real `ps`). | `run_parallel`'s 120 s slot bound is from reading. Windows (no ps): untested. |
 
 ---
 

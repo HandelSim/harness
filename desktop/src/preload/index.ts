@@ -16,7 +16,7 @@ const bridge: Bridge = {
     ipcRenderer.on(event, fn);
     return () => { ipcRenderer.removeListener(event, fn); };
   },
-  app: { info: () => inv('app:info') },
+  app: { info: () => inv('app:info'), busy: () => inv('app:busy') },
   backend: { get: () => inv('backend:get'), action: (a) => inv('backend:action', a) },
   api: {
     get: (path, query, sig) => inv('api:get', { path, query, sig }),
@@ -29,6 +29,7 @@ const bridge: Bridge = {
     configSet: (key, value) => inv('harness:config-set', { key, value }),
     job: (job) => inv('harness:job', { job }),
     updateGet: () => inv('harness:update-get'),
+    jobs: () => inv('harness:jobs'),
   },
   keys: {
     list: () => inv('keys:list'),
@@ -38,6 +39,7 @@ const bridge: Bridge = {
     activate: (id) => inv('keys:activate', { id }),
     probe: (target) => inv('keys:probe', target),
     clearActive: (kind) => inv('keys:clear-active', { kind }),
+    setStoreInactive: (on) => inv('keys:set-store-inactive', { on }),
   },
   settings: { get: () => inv('settings:get'), set: (patch) => inv('settings:set', { patch }) },
   state: { get: () => inv('state:get'), set: (patch) => inv('state:set', { patch }) },

@@ -58,9 +58,15 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
 - `HARNESS_DESKTOP_SERVE_URL` sets attach-only mode, which never spawns serve.
 - Live data comes from one multiplexed conditional poll
   (`/api/v1/poll?t=topic~sig`) of the topics visible panels subscribe to.
-  Cadence is 1 s when busy, 3 s when focused, 5 s when blurred, and 15 s when
-  hidden (status and queue only). After a failure it backs off 1, 2, 5 and
-  15 s. Main sends a topic to the renderer only when it changes.
+  Cadence is 1 s when busy (2 s when busy and blurred), 3 s when focused, 5 s
+  when blurred, and 15 s when hidden (status and queue only). After a failure
+  it backs off 1, 2, 5 and 15 s; `poller.pollNow()` skips the wait. More than
+  24 topics are split over several requests. Main sends a topic to the
+  renderer only when it changes (a topic-set change re-sends only topics new
+  to that window), and forwards a topic error once; the renderer store keeps
+  data identity for a same-sig re-send, so it does not re-render.
+- The queue list renders only the rows in view above 200 tickets; the
+  transcript renders the newest 200 messages, with "Show earlier".
 - Quit policy: keep-if-busy (default), stop, or keep. An attached serve that
   the app did not start is never stopped.
 
@@ -78,20 +84,29 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   256 KiB.
 - Main keeps a 256 KiB replay ring per terminal for re-attach. If the host
   dies, every terminal is marked exited.
+- A terminal panel removed without its close confirm (layout undo or reset)
+  kills its PTY unless the new layout re-attaches to it. At renderer start,
+  PTYs from an earlier page that no restored panel claims are killed.
 
 ## Keys (`src/main/keys/`)
 
 - Metadata and secrets live in `userData/keys.json` (mode 600). Secrets are
   encrypted with `safeStorage` when the OS keyring is real.
 - Without a keyring (`basic_text`) the app keeps no inactive secrets
-  (single-key mode). `.env` then holds the only copy of the key.
+  (single-key mode). `.env` then holds the only copy of the key. The owner can
+  opt in to keeping them anyway (`storeInactive`, `keys:set-store-inactive`);
+  turning it off drops the stored inactive secrets from disk (they stay in
+  memory for the run).
 - Making a key active:
   1. probe the candidate directly (`POST <base>/v1/chat/completions` with
      `max_tokens:1`)
-  2. write it with `harness config set`
+  2. write it with `harness config set KIND --stdin` (the secret goes on
+     stdin, never on argv where `ps` shows it)
   3. check it with `harness unlock`
   4. if upstream rejects it, go back to the previous key automatically
-- Secrets never reach the renderer or the logs. A key locks 14 days after the
+- Secrets never reach the renderer or the logs. The renderer gets `chars` (the
+  length) and `last4` only for secrets of 16+ characters (a short PIN or
+  access code would be mostly given away). A key locks 14 days after the
   later of its creation and its last unlock.
 
 ## Updates
@@ -105,6 +120,20 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   - on Linux, the app is not an AppImage
 - Harness itself updates through the CLI runner: `harness check-updates`, then
   `harness upgrade --no-prompt`.
+- The Updates view confirms Restart to update and Upgrade first, listing what
+  they interrupt (`app:busy`: open terminals, a running queue run, running
+  jobs). Opening the view re-attaches to a running upgrade / check job
+  (`harness:jobs`) instead of starting a second one.
+
+## Notifications (`src/renderer/core/notify.ts`)
+
+- The renderer diffs the `queue` topic and the app update phase and shows a
+  native notification (`notify:show`) only while the window is unfocused or
+  hidden: a ticket needs the owner (questions, plan review, blocked), a
+  ticket is done, the queue run ended, an update is ready.
+- Per-kind toggles in `settings.notifications`. At most 4 per minute; several
+  events of one kind in one poll collapse into one. A click routes to the
+  ticket panel or the view (`notify:click`).
 
 ## Where state lives
 

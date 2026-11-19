@@ -2425,6 +2425,8 @@ usage:
                                  prints KEY, value, secret (1/0), description
                                  tab-separated, for programs
   harness config set KEY VALUE   set KEY to VALUE (any key; VALUE may be empty)
+  harness config set KEY --stdin read VALUE from stdin (one line), so a secret
+                                 never shows in ps; hidden prompt on a tty
 
 Secrets (PROXY_API_KEY and the like) are shown masked. Upstream URL hosts
 (PROXY_API_URL, OAI_API_URL, CHATGPT_BASE_URL) need no allowlist entry: the
@@ -2467,11 +2469,28 @@ _config_tsv() {
 _config_set() {
     local key="${1:-}"
     if [[ -z "$key" ]]; then
-        err "usage: harness config set <KEY> <value>"
+        err "usage: harness config set <KEY> <value>  (or <KEY> --stdin)"
         return 1
     fi
     shift
     local value="$*"
+    # `config set KEY --stdin` reads VALUE from stdin (one line; trailing CR/LF
+    # dropped) so a secret never sits on argv, where other local users can read
+    # it in `ps` / /proc/*/cmdline. The desktop app's key vault uses this form.
+    if [[ $# -eq 1 && "$1" == "--stdin" ]]; then
+        if [[ -t 0 ]]; then
+            printf 'value for %s (input hidden): ' "$key" >&2
+            IFS= read -rs value || true
+            printf '\n' >&2
+        else
+            value=$(cat) || value=""
+        fi
+        value="${value%$'\r'}"
+        if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+            err "harness config set $key --stdin: the value must be a single line"
+            return 1
+        fi
+    fi
     if [[ "$key" == QUEUE_PARALLEL && -n "$value" && ! "$value" =~ ^[1-9][0-9]*$ ]]; then
         err "QUEUE_PARALLEL must be a whole number of tickets at a time, 1 or more (got '$value')"
         return 1

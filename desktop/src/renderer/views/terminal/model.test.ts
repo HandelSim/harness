@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { specTitle, baseName, pasteLines, pasteNeedsConfirm, WebglSlots, isLaunchFailure, exitText, PendingBuffer, canTryHost } from './model';
+import { specTitle, baseName, pasteLines, pasteNeedsConfirm, WebglSlots, isLaunchFailure, exitText, PendingBuffer, canTryHost, unclaimedPtys } from './model';
 
 test('baseName and specTitle', () => {
   assert.equal(baseName('/home/u/proj/'), 'proj');
@@ -51,4 +51,11 @@ test('pending buffer is bounded and expires', () => {
   b.push('x', 'y', 0);
   b.push('z', 'w', 500);         // gc drops x (older than ttl)
   assert.deepEqual(b.ids, ['z']);
+});
+
+test('unclaimedPtys (H3): kills old ptys no restored panel claims, keeps claimed and newly started ones', () => {
+  const info = (id: string, startedAt: number) => ({ id, spec: { kind: 'shell' } as never, pid: 1, startedAt, exited: null });
+  const list = [info('a', 100), info('b', 100), info('c', 900), info('d', 100)];
+  assert.deepEqual(unclaimedPtys(list, ['b', undefined, 7], 500), ['a', 'd']);
+  assert.deepEqual(unclaimedPtys([], ['x'], 500), []);
 });

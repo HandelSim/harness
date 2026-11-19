@@ -32,6 +32,7 @@ export interface KeyMeta {
   addedAt: number; createdAt: number | null; expiresAt: number | null; lastUnlockAt: number | null;
   locksAt: number | null;                 // computed: max(createdAt, lastUnlockAt) + 14 days; null when unknown
   probe: KeyProbe | null;
+  chars?: number;                         // secret length; last4 is '' for secrets shorter than 16 (L10)
 }
 export interface KeyVaultState {
   secure: boolean; backend: string; storeInactive: boolean;
@@ -54,7 +55,21 @@ export interface AppUpdateState {
   releasePage: string;
 }
 export interface HarnessUpdateState { branch: string; local: string; available: boolean | null; text: string; checkedAt: number | null }
-export interface PathInfo { exists: boolean; dir: boolean; git: { branch: string } | null; entries?: string[] }
+/** `git` probe of a folder (shell:path-info). isRepo false: `error` says why when git refused (e.g. safe.directory). */
+export interface GitProbe {
+  isRepo: boolean; root: string;          // root: --show-toplevel ('' when not a repo)
+  branch: string;                         // symbolic-ref -q --short HEAD; '' when detached
+  detached: boolean; hasCommits: boolean; // hasCommits false: a fresh `git init` (branch is the unborn one)
+  inSubfolder: boolean;                   // the folder is inside the repo, not its root
+  error?: string;
+}
+export interface PathInfo { exists: boolean; dir: boolean; git: { branch: string } | null; entries?: string[];
+  real?: string;                          // realpath of the folder (symlinks resolved); use it as the project identity
+  repo?: GitProbe }
+/** What a quit / restart-to-update would interrupt (app:busy). */
+export interface AppBusy { terminals: number; queueRunning: boolean; ownedServe: boolean; onQuit: Settings['backend']['onQuit']; jobs: string[] }
+/** A harness CLI job main is running or ran recently (harness:jobs). `output` is the tail kept for re-attach. */
+export interface JobInfo { id: string; job: 'doctor' | 'check-updates' | 'upgrade' | 'serve-stop'; running: boolean; code: number | null; startedAt: number; output: string }
 
 export interface Settings {
   appearance: { theme: 'dark' | 'light' | 'system'; accent: string; density: 'comfortable' | 'compact';
@@ -93,7 +108,8 @@ export interface BridgeEvents {
 }
 export interface Bridge {
   on<K extends keyof BridgeEvents>(event: K, cb: (payload: BridgeEvents[K]) => void): () => void;
-  app: { info(): Promise<AppInfo> };
+  app: { info(): Promise<AppInfo>;
+    busy(): Promise<AppBusy> };            // what quit / restart-to-update would interrupt (W15 confirm)
   backend: { get(): Promise<BackendState>; action(a: BackendAction): Promise<BackendState> };
   api: { get<T>(path: string, query?: Record<string, string | number | boolean>, sig?: string): Promise<ReadResult<T>>;
     post(path: string, body?: Record<string, unknown>): Promise<ActionResult>;
@@ -102,12 +118,14 @@ export interface Bridge {
   harness: { configList(): Promise<{ ok: boolean; rows: ConfigRow[]; message: string }>;
     configSet(key: string, value: string): Promise<{ ok: boolean; msg: string }>;
     job(job: 'doctor' | 'check-updates' | 'upgrade' | 'serve-stop'): Promise<{ id: string }>;
-    updateGet(): Promise<HarnessUpdateState> };
+    updateGet(): Promise<HarnessUpdateState>;
+    jobs(): Promise<JobInfo[]> };           // running + recent jobs (output tail) for re-attach; job() returns a running job's id instead of starting another
   keys: { list(): Promise<KeyVaultState>;
     add(k: { kind: KeyKind; label: string; secret: string; createdAt?: number; expiresAt?: number; team?: boolean; activate?: boolean }): Promise<KeyOpResult>;
     update(k: { id: string; label?: string; createdAt?: number | null; expiresAt?: number | null; team?: boolean }): Promise<KeyOpResult>;
     remove(id: string): Promise<KeyOpResult>; activate(id: string): Promise<KeyOpResult>;
-    probe(target: { id: string } | { active: KeyKind }): Promise<KeyProbe>; clearActive(kind: KeyKind): Promise<KeyOpResult> };
+    probe(target: { id: string } | { active: KeyKind }): Promise<KeyProbe>; clearActive(kind: KeyKind): Promise<KeyOpResult>;
+    setStoreInactive(on: boolean): Promise<KeyOpResult> };  // M9: keep inactive keys without an OS keyring (obfuscated)
   settings: { get(): Promise<Settings>; set(patch: DeepPartial<Settings>): Promise<Settings> };
   state: { get(): Promise<AppState>; set(patch: Partial<AppState>): Promise<void> };
   pty: { spawn(spec: PtySpec, cols: number, rows: number): Promise<{ ok: true; id: string } | { ok: false; error: { code: string; message: string } }>;

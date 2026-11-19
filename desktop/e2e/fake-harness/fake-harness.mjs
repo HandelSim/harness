@@ -12,7 +12,7 @@ const st = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
 st.config ||= {}; st.calls ||= [];
 const SECRET = /KEY|SECRET|TOKEN|PASSWORD|COOKIE/;
 // a call is logged with secret values replaced by their length, as a real log must never hold them
-st.calls.push(args.map((a, i) => (i === 3 && args[0] === 'config' && args[1] === 'set' && SECRET.test(args[2]) ? `<${a.length} chars>` : a)));
+st.calls.push(args.map((a, i) => (i === 3 && args[0] === 'config' && args[1] === 'set' && SECRET.test(args[2]) && a !== '--stdin' ? `<${a.length} chars>` : a)));
 const save = () => writeFileSync(file, JSON.stringify(st, null, 2));
 const out = (s) => process.stdout.write(s.endsWith('\n') ? s : s + '\n');
 const err = (s) => process.stderr.write(s.endsWith('\n') ? s : s + '\n');
@@ -32,7 +32,8 @@ if (cmd === 'config' && sub === 'list') {
   if (st.env === 'missing' && !existsSync(join(root, '.env'))) { err(`ERROR: missing ${root}/.env`); code = 1; }
   else for (const [k, d] of KEYS) { const v = val(k); const s = SECRET.test(k); out(`${k}\t${s && v ? `(set, ${v.length} chars)` : v}\t${s ? 1 : 0}\t${d}`); }
 } else if (cmd === 'config' && sub === 'set') {
-  const [k, v = ''] = rest;
+  // `config set KEY --stdin` (M8): the value comes on stdin, one line
+  const [k, v = ''] = rest.length === 2 && rest[1] === '--stdin' ? [rest[0], readFileSync(0, 'utf8').replace(/\r?\n$/, '')] : rest;
   if (!k || !KEYS.some(([n]) => n === k)) { err(`ERROR: unknown key ${k}`); code = 1; }
   else { st.config[k] = v; if (!existsSync(join(root, '.env'))) writeFileSync(join(root, '.env'), '# fake\n'); out(`[harness] ${k} set`); }
 } else if (cmd === 'config' && sub === 'get') {

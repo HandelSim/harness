@@ -1,6 +1,7 @@
 // Transcript panel (3.7): a session's messages, followed while it works. Server text goes through the one Markdown
 // component (assistant/user text) or as text (tool input/output). A live update never moves the scroll when the
 // reader has scrolled up (a "N new" pill appears instead) and never touches the composer draft.
+import { Component } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { Message, MessagesPage, SessionHead } from '../../../shared/api';
 import { act, useTopic } from '../../core/app';
@@ -11,9 +12,15 @@ import { AsOf, Button, GateButton, Pill } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
 import { Markdown } from '../../ui/Markdown';
 import { useDraft } from '../ticket/parts';
-import { mergePage, nextFrom, partView } from './model';
+import { mergePage, nextFrom, partView, tailStart, TAIL } from './model';
 
 const MAX_PAGES = 40;
+
+/** Memoised on message identity: mergePage keeps the object of an unchanged message, so a poll re-renders only what grew. */
+class MessageItem extends Component<{ m: Message }> {
+  shouldComponentUpdate(n: { m: Message }): boolean { return n.m !== this.props.m; }
+  render() { return <MessageView m={this.props.m} />; }
+}
 
 function MessageView({ m }: { m: Message }) {
   const user = m.role === 'user';
@@ -52,6 +59,7 @@ export default function TranscriptPanel({ ctx }: { ctx: PanelCtx }) {
   const [err, setErr] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
   const [unseen, setUnseen] = useState(0);
+  const [shown, setShown] = useState(TAIL);
   const listRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const msgsRef = useRef<Message[]>([]);
@@ -74,14 +82,15 @@ export default function TranscriptPanel({ ctx }: { ctx: PanelCtx }) {
       if (list.length >= r.data.count || list.length === before) break;
     }
     const added = list.length - msgsRef.current.length;
-    msgsRef.current = list;
     setErr(null);
+    if (list === msgsRef.current) return true;     // the page changed nothing: no render (M7)
+    msgsRef.current = list;
     setMsgs(list);
     if (added > 0 && !stick.current) setUnseen((n) => n + added);
     return true;
   };
 
-  useEffect(() => { msgsRef.current = []; setMsgs([]); stick.current = true; if (sid) void load(); }, [sid]);
+  useEffect(() => { msgsRef.current = []; setMsgs([]); setShown(TAIL); stick.current = true; if (sid) void load(); }, [sid]);
   useEffect(() => {
     if (!visible || !sid || !(working || h?.row.working || h?.row.live)) return;
     const t = setInterval(() => { void load(); }, 2000);
@@ -125,7 +134,11 @@ export default function TranscriptPanel({ ctx }: { ctx: PanelCtx }) {
       <div class="transcript-list" ref={listRef} onScroll={onScroll}>
         {err && !msgs.length ? <div class="notice notice--warn">{err}</div> : null}
         {!err && !msgs.length ? <div class="empty"><span class="spin" /></div> : null}
-        {msgs.map((m) => <MessageView key={m.id} m={m} />)}
+        {tailStart(msgs.length, shown) > 0 ? (
+          <button class="btn btn--sm btn--ghost transcript-earlier" data-testid="transcript-earlier"
+            onClick={() => { stick.current = false; setShown((n) => n + TAIL); }}>Show earlier ({tailStart(msgs.length, shown)})</button>
+        ) : null}
+        {msgs.slice(tailStart(msgs.length, shown)).map((m) => <MessageItem key={m.id} m={m} />)}
       </div>
       {unseen > 0 ? <button class="tk-newpill" onClick={jump}>{unseen} new</button> : null}
       {h && h.send.ok ? (

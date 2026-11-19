@@ -648,6 +648,11 @@ main suite is `tests/queue_test.py`.
 | Q006 | `halt --force` kills only a pid it trusts (its file beats, or /proc names `ticket_queue.py`); a stale run.json / run-I.json naming another process is refused with exit 1 within about 10 s |
 | Q007 | A `state.json` that is JSON but not an object is skipped like an unparsable one: `list`, `status --json`, `stats` and `run` go on, `remove` works |
 | Q008 | A full disk or an unwritable state folder is one `[queue] could not write the queue's files` line and exit 1, not a traceback; `list`/`status` still read a read-only folder |
-| Q009 | A disk that fills mid-run leaves the ticket `running` with `run.lock` freed and run.json removed; the next run finishes it |
+| Q009 | A disk that fills mid-run ends the run with exit 1 and the full-disk line (not exit 0), leaving the ticket `running` with `run.lock` freed and run.json removed; the next run finishes it |
 | Q010 | A second `run` is refused while one holds `run.lock`; a run after a restart gets past the stale run.json, lock and agent record the dead run left |
 | Q011 | Project shapes: a `trunk` default branch, a path with spaces and unicode, a symlinked folder, a named second remote, and a base branch deleted since the add (blocked with the reason) |
+| Q012 | SIGKILL inside `make_clone` (in `git clone`, or after `refs/harness-queue-ref/KEY` was made in the project): the next run clones again and finishes; the ref is gone; nothing recorded as failed |
+| Q013 | An upstream that refuses the key (401 on every call): one try per call, waited out as an outage whose reason names the key and `harness unlock`; a launch dying at once meanwhile is not counted against the ticket |
+| Q014 | Wall-clock jumps forward/back under a live run: the beat reads stale until the next one (3 s), a second `run` is still refused (run.lock) |
+| Q015 | Project variants: not a repository and no commits refused cleanly (nothing queued); a detached HEAD, a git worktree, a repository inside another, a folder below the top and a symlink to it run to done; a project folder gone after add blocks with the reason |
+| Q016 | Signals and errors: SIGHUP keeps a file/pipe stdout (the end line is kept); a second SIGTERM 60 s after the first ends a hung put-back; an EACCES outside the state folder names its path; without /proc, `halt --force` trusts `ps` |

@@ -132,7 +132,7 @@ test('Poller cadence: busy 1 s, focused 3 s, blurred 5 s, hidden 15 s', async ()
     update: () => {}, health: () => {} });
   p.set('o', ['queue']); p.start(); await clock.advance(0);
   assert.equal(p.interval(), 1000);
-  p.setVisibility('blurred'); assert.equal(p.interval(), 5000);
+  p.setVisibility('blurred'); assert.equal(p.interval(), 2000, 'busy stays fast while blurred (L13)');
   p.setVisibility('hidden'); assert.equal(p.interval(), 15000);
   p.stop();
   assert.match(pollPath([{ topic: 'queue', sig: 'x' }, { topic: 'ticket:A-1', sig: '' }]), /^\/api\/v1\/poll\?t=queue~x&t=ticket(:|%3A)A-1~$/);

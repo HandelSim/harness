@@ -13,6 +13,7 @@
 #   - _config_get: masks secret keys, prints plain values otherwise
 #   - _config_set PROXY_API_URL: writes the key and leaves the allowlist alone
 #     (the proxy's firewall allows upstream hosts from .env itself)
+#   - _config_set KEY --stdin: value from stdin (secrets stay off argv)
 #   - cmd_config (no args): prints the subcommand usage so the user learns how to
 #     drive it, then the current values (no-tty branch of the picker)
 #   - cmd_uninstall: cancels on a non-"yes" answer (leaves files), tears down on
@@ -266,6 +267,24 @@ grep -q '^FINDINGS_MODEL|' < <(_config_editable_keys) || fail "T17: FINDINGS_MOD
 _config_set FINDINGS_MODEL gemini-2.5-pro >/dev/null || fail "T17: set refused"
 [[ "$(_config_read_key FINDINGS_MODEL)" == gemini-2.5-pro ]] || fail "T17: not written"
 ok "T17: FINDINGS_MODEL is in .env.example, listed, and saved"
+
+# --- T18: `config set KEY --stdin` reads the value from stdin (M8) ---------
+# A secret must be settable without appearing on argv. One line, trailing
+# newline / CRLF dropped; a multi-line value is refused and leaves the key.
+printf 'sk-from stdin;x\n' | _config_set PROXY_API_KEY --stdin >/dev/null || fail "T18: stdin set refused"
+[[ "$(_config_read_key PROXY_API_KEY)" == 'sk-from stdin;x' ]] || fail "T18: stdin value not written"
+printf 'crlf-val\r\n' | _config_set PROXY_API_KEY --stdin >/dev/null || fail "T18: CRLF refused"
+[[ "$(_config_read_key PROXY_API_KEY)" == crlf-val ]] || fail "T18: CR not stripped"
+printf 'a\nb\n' | _config_set PROXY_API_KEY --stdin >/dev/null 2>&1 && fail "T18: multi-line taken"
+[[ "$(_config_read_key PROXY_API_KEY)" == crlf-val ]] || fail "T18: refused value changed it"
+: | _config_set PROXY_API_KEY --stdin >/dev/null || fail "T18: empty stdin refused"
+[[ -z "$(_config_read_key PROXY_API_KEY)" ]] || fail "T18: empty stdin did not clear"
+printf '5\n' | _config_set QUEUE_PARALLEL --stdin >/dev/null || fail "T18: validated key via stdin"
+printf '0\n' | _config_set QUEUE_PARALLEL --stdin >/dev/null 2>&1 && fail "T18: stdin skips validation"
+# The argv form still treats a literal value normally, including a two-word one.
+_config_set DEFAULT_MODEL_NAME two words >/dev/null || fail "T18: argv form broke"
+[[ "$(_config_read_key DEFAULT_MODEL_NAME)" == 'two words' ]] || fail "T18: argv value"
+ok "T18: config set KEY --stdin writes one line from stdin, argv form unchanged"
 
 echo
 echo "CONFIG TEST PASSED"

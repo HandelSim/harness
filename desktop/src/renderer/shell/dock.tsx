@@ -7,6 +7,8 @@ import { signal, type Signal, effect } from '@preact/signals';
 import { panelId, parsePanelId, validateParams, isKeyed, ReopenStack, SnapshotStack, VIEW_TITLES, VIEW_WEB, uid,
   type PanelKind, type ViewId } from './panels';
 import { appState, patchState } from '../core/app';
+import { bridge } from '../core/bridge';
+import { unclaimedPtys } from '../views/terminal/model';
 
 export type TabState = 'idle' | 'starting' | 'running' | 'working' | 'error' | 'ended' | 'attention';
 export interface PanelCtx {
@@ -23,6 +25,12 @@ export interface PanelCtx {
   beforeClose(fn: () => boolean | Promise<boolean>): void;
   onShow(fn: () => void): void;
   onHide(fn: () => void): void;
+  /**
+   * Runs once the panel is really gone: after any dispose that is not a move (close, layout undo/reset, restore
+   * failure), deferred until the current layout operation has finished, so a panel that the same operation recreates
+   * (undo) can be checked with `paramClaimed` (H3).
+   */
+  onDispose(fn: () => void): void;
 }
 export type PanelComponent = ComponentType<{ ctx: PanelCtx }>;
 
@@ -37,11 +45,12 @@ export function tabState(id: string): Signal<TabState> {
   if (!s) { s = signal<TabState>('idle'); tabStates.set(id, s); }
   return s;
 }
-interface Hooks { beforeClose: (() => boolean | Promise<boolean>)[]; show: (() => void)[]; hide: (() => void)[] }
+interface Hooks { beforeClose: (() => boolean | Promise<boolean>)[]; show: (() => void)[]; hide: (() => void)[]; dispose: (() => void)[] }
 const hooks = new Map<string, Hooks>();
 const ctxs = new Map<string, PanelCtx>();
 
 let api: DockviewApi | null = null;
+let dockEl: HTMLElement | null = null;
 export const dockReady = signal(false);
 export const activePanelId = signal<string | null>(null);
 export const panelsVersion = signal(0);
@@ -60,7 +69,7 @@ class Content implements IContentRenderer {
     this.element.dataset.testid = `panel-${this.id}`;
     if (ref?.kind === 'view') this.element.dataset.view = ref.key;
     if (!ref || !params) { this.element.textContent = ''; setTimeout(() => api?.getPanel(this.id)?.api.close(), 0); return; }
-    const h: Hooks = { beforeClose: [], show: [], hide: [] };
+    const h: Hooks = { beforeClose: [], show: [], hide: [], dispose: [] };
     hooks.set(this.id, h);
     const ctx: PanelCtx = {
       id: this.id, kind: ref.kind, key: ref.key,
@@ -70,6 +79,7 @@ class Content implements IContentRenderer {
       update: (x) => { ctx.params.value = { ...ctx.params.value, ...x }; p.api.updateParameters(ctx.params.value); scheduleSave(); },
       close: () => { void requestClose(this.id); },
       beforeClose: (fn) => h.beforeClose.push(fn), onShow: (fn) => h.show.push(fn), onHide: (fn) => h.hide.push(fn),
+      onDispose: (fn) => h.dispose.push(fn),
     };
     this.ctx = ctx;
     ctxs.set(this.id, ctx);
@@ -83,9 +93,13 @@ class Content implements IContentRenderer {
       (err) => { this.element.textContent = `Could not load panel: ${String(err?.message || err)}`; });
   }
   dispose(): void {
+    const fns = hooks.get(this.id)?.dispose ?? [];
     render(null, this.element);
     hooks.delete(this.id); ctxs.delete(this.id); tabStates.delete(this.id);
     this.ctx = null;
+    // Moves keep the content (dockview skipDispose), so this is a real removal. Deferred past fromJSON/clear; skipped
+    // when the whole dock is being torn down (its element left the document), so a reload keeps ptys to re-attach.
+    if (fns.length) setTimeout(() => { if (dockEl?.isConnected) for (const f of fns) { try { f(); } catch { /* ignore */ } } }, 0);
   }
 }
 
@@ -143,6 +157,7 @@ export const harnessTheme: DockviewTheme = {
 };
 
 export function mountDock(el: HTMLElement): DockviewApi {
+  dockEl = el;
   api = createDockview(el, {
     theme: harnessTheme,
     createComponent: (o) => new Content(o.name, o.id),
@@ -163,7 +178,16 @@ export function mountDock(el: HTMLElement): DockviewApi {
   restoring = false;
   if (!api.panels.length) openView('home');
   dockReady.value = true;
+  if (appState.value) void reapPtys();     // only when the saved layout was actually loaded (startApp may time out)
   return api;
+}
+
+/** Kill ptys left from an earlier page (crash, lost layout) that no restored panel re-attaches to (H3). */
+async function reapPtys(): Promise<void> {
+  const bootAt = performance.timeOrigin;
+  const list = await bridge.pty.list().catch(() => []);
+  if (!Array.isArray(list) || !api) return;
+  for (const id of unclaimedPtys(list, paramValues('ptyId'), bootAt)) bridge.pty.kill(id);
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -283,6 +307,14 @@ export function splitActive(dir: 'right' | 'down'): void {
 }
 export function floatActive(): void { const p = api?.activePanel; if (p && api) api.addFloatingGroup(p); }
 export function panelCtx(id: string): PanelCtx | undefined { return ctxs.get(id); }
+/** Whether a live panel has params[key] === value (e.g. a terminal's ptyId after a layout undo recreated it). */
+export function paramClaimed(key: string, value: unknown): boolean {
+  return !!api?.panels.some((p) => (p.params as Record<string, unknown> | undefined)?.[key] === value);
+}
+/** Values of params[key] over all live panels (e.g. the ptys the layout claims). */
+export function paramValues(key: string): unknown[] {
+  return (api?.panels ?? []).map((p) => (p.params as Record<string, unknown> | undefined)?.[key]).filter((v) => v !== undefined);
+}
 export function listPanels(): { id: string; title: string; group: string }[] {
   return (api?.panels ?? []).map((p) => ({ id: p.id, title: p.title ?? p.id, group: p.group.id }));
 }

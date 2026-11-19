@@ -45,12 +45,12 @@ MSG_LIMIT = 200                 # messages one /messages call returns by default
 MSG_LIMIT_MAX = 1000
 SESSIONS_MAX = 2000
 TEXT_MAX = 1024 * 1024          # bytes of a vault file /vault/file returns as text
-NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 JSON_TYPE = "application/json; charset=utf-8"
 MOVES = runs_view.MOVES
 
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
+_REFRESHING = set()   # cache keys a thread is getting the next value of
 
 
 class ApiError(Exception):
@@ -60,18 +60,39 @@ class ApiError(Exception):
 
 
 def _cached(key, ttl, fn):
-    """fn()'s value, kept ttl seconds (proxy health, git version: /status at 1 Hz)."""
+    """fn()'s value, kept ttl seconds (proxy health, git version: /status at 1 Hz). Only
+    the first call waits for fn; after that an expired value is served while one thread
+    gets the next, so a slow proxy probe (2 s) never holds a poll (review A-6)."""
     now = time.monotonic()
     with _CACHE_LOCK:
         hit = _CACHE.get(key)
         if hit and now - hit[0] < ttl:
             return hit[1]
+        if hit:
+            if key not in _REFRESHING:
+                _REFRESHING.add(key)
+                threading.Thread(target=_refresh, args=(key, fn), daemon=True).start()
+            return hit[1]
     val = fn()
+    _store(key, val)
+    return val
+
+
+def _store(key, val):
     with _CACHE_LOCK:
         if len(_CACHE) > 200:
             _CACHE.clear()
         _CACHE[key] = (time.monotonic(), val)
-    return val
+
+
+def _refresh(key, fn):
+    try:
+        _store(key, fn())
+    except Exception:   # the old value stays; the next expired read tries again
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        with _CACHE_LOCK:
+            _REFRESHING.discard(key)
 
 
 def sig_of(data):
@@ -767,15 +788,10 @@ def read_vault(ctx, arg=None):
 
 
 def _vault_path(vault, rel):
-    """rel inside the vault (no .git, no escape), or None."""
-    rel = (rel or "").strip("/")
-    if any(p in ("..", ".git") or p.startswith(".git") for p in rel.split("/") if p) or "\x00" in rel:
-        return None
-    top = os.path.realpath(vault)
-    path = os.path.realpath(os.path.join(top, rel))
-    if path != top and not path.startswith(top + os.sep):
-        return None
-    return path
+    """rel inside the vault (no .git, no escape), or None: the HTML side's own check
+    (vault_view.resolve, which also reads a backslash as a separator, as Windows does)."""
+    got = vault_view.resolve(vault, rel or "")
+    return got[0] if got else None
 
 
 def read_vault_tree(ctx, arg=None):
@@ -790,7 +806,7 @@ def read_vault_tree(ctx, arg=None):
     except OSError:
         names = []
     for n in names[:2000]:
-        if n.startswith(".git"):
+        if n == ".git":   # only git's own folder: .gitignore, .github are the vault's files
             continue
         p = os.path.join(path, n)
         try:
@@ -1220,7 +1236,7 @@ def _poll(ctx):
             out[topic] = {"error": {"code": e.code, "message": e.message}}
         except Exception as e:   # one failing topic never fails the others
             traceback.print_exc(file=sys.stderr)
-            out[topic] = {"error": {"code": "internal", "message": f"{type(e).__name__}: {e}"}}
+            out[topic] = {"error": {"code": "internal", "message": f"{type(e).__name__} (details in serve's log)"}}
     return {"ok": True, "now": int(time.time()), "stale": bool(ctx.cfg.code_changed()), "topics": out}
 
 
@@ -1286,4 +1302,4 @@ def handle(h, cfg, helpers, method, path, query, user, head=False):
         _err(h, cfg, e.status, e.code, e.message, head)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
-        _err(h, cfg, 500, "internal", f"{type(e).__name__}: {e}", head)
+        _err(h, cfg, 500, "internal", f"{type(e).__name__} (details in serve's log)", head)   # no paths out

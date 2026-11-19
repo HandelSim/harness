@@ -1,11 +1,12 @@
 // Key vault (D11): metadata + (optionally) encrypted secrets in userData/keys.json (mode 600); the active key per
 // kind is written to .env with `harness config set`. Secrets never leave main after entry.
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import type { SafeStorage } from 'electron';
 import type { KeyKind, KeyMeta, KeyOpResult, KeyProbe, KeyVaultState } from '../../shared/ipc';
 import type { ConfigRow } from '../../shared/api';
 import { loadJson, saveJson, isObj } from '../store';
-import { runHarness, parseConfigTsv, maskedChars } from '../cli';
+import { runHarness, parseConfigTsv, maskedChars, cliEnv, type RunResult } from '../cli';
 import { locksAt } from './lifecycle';
 import { classifyUnlock, probeDirect } from './probe';
 import { log } from '../log';
@@ -16,20 +17,52 @@ interface Entry extends Omit<KeyMeta, 'locksAt'> { enc: string | null }
 interface File { version: 1; storeInactive: boolean; keys: Entry[] }
 
 export interface VaultDeps { file: string; safe: SafeStorage; root: () => string | null; emit: (s: KeyVaultState) => void;
-  run?: typeof runHarness; probe?: typeof probeDirect }
+  run?: typeof runHarness; runStdin?: typeof runHarnessStdin; probe?: typeof probeDirect }
+
+/** M8: `harness <args>` with `input` written to its stdin, so a secret never sits on argv (`ps`, /proc/<pid>/cmdline). */
+export function runHarnessStdin(root: string, args: string[], input: string, o: { timeoutMs?: number } = {}): Promise<RunResult> {
+  return new Promise((resolve) => {
+    let out = ''; let err = ''; let timedOut = false;
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn('bash', [`${root}/harness`, ...args], { cwd: root, env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) { resolve({ code: 127, stdout: '', stderr: String(e), timedOut: false }); return; }
+    child.stdout!.on('data', (c: Buffer) => { if (out.length < 200_000) out += c.toString('utf8'); });
+    child.stderr!.on('data', (c: Buffer) => { if (err.length < 200_000) err += c.toString('utf8'); });
+    child.stdin!.on('error', () => { /* EPIPE: the CLI exited early; its exit code says why */ });
+    child.stdin!.end(input + '\n');
+    const t = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 2000).unref(); }, o.timeoutMs ?? 60000);
+    child.on('error', (e) => { err += String(e); });
+    child.on('close', (code, sig) => { clearTimeout(t); resolve({ code: code ?? (sig ? 128 : 1), stdout: out, stderr: err, timedOut }); });
+  });
+}
+
+/** L10: the last 4 chars are shown only for long secrets; a short one (e.g. an access code) would give away too much. */
+export const LAST4_MIN = 16;
+export function last4Of(secret: string): string { return secret.length >= LAST4_MIN ? secret.slice(-4) : ''; }
 
 export class KeyVault {
   private f: File;
   private env: KeyVaultState['env'] = {};
   private rows: ConfigRow[] = [];
   private mem = new Map<string, string>();      // secrets held only for this run (insecure backend)
-  private run: typeof runHarness; private probeD: typeof probeDirect;
+  private run: typeof runHarness; private runIn: typeof runHarnessStdin; private probeD: typeof probeDirect;
   constructor(private d: VaultDeps) {
     const r = loadJson<File>(d.file, () => ({ version: 1, storeInactive: false, keys: [] }), (raw) =>
       isObj(raw) && raw.version === 1 && Array.isArray(raw.keys) ? (raw as unknown as File) : null);
     this.f = r.value;
     if (r.recovered) log('warn', `keys.json unreadable, moved to ${r.recovered}`);
-    this.run = d.run || runHarness; this.probeD = d.probe || probeDirect;
+    this.run = d.run || runHarness; this.runIn = d.runStdin || runHarnessStdin; this.probeD = d.probe || probeDirect;
+    // L10 migration: entries written before `chars` existed showed last4 of any secret; keep it only when provably long
+    let fixed = false;
+    for (const e of this.f.keys) {
+      if (typeof e.chars === 'number') continue;
+      const sec = this.secretOf(e);
+      e.chars = sec ? sec.length : undefined;
+      const l4 = sec ? last4Of(sec) : '';
+      if (e.last4 !== l4) { e.last4 = l4; fixed = true; }
+    }
+    if (fixed) { try { saveJson(d.file, this.f, 0o600); } catch (e) { log('warn', `keys.json migrate: ${e}`); } }
   }
 
   storageInfo(): { secure: boolean; backend: string } {
@@ -92,7 +125,7 @@ export class KeyVault {
     const store = this.storageInfo().secure || this.f.storeInactive;
     const enc = store ? this.encrypt(secret) : null;
     if (!enc) this.mem.set(id, secret);
-    return { id, kind, label: label.slice(0, 80) || kind, last4: secret.slice(-4), active: o.active, superseded: false, team: !!o.team,
+    return { id, kind, label: label.slice(0, 80) || kind, last4: last4Of(secret), chars: secret.length, active: o.active, superseded: false, team: !!o.team,
       addedAt: Date.now(), createdAt: o.createdAt ?? Date.now(), expiresAt: o.expiresAt ?? null, lastUnlockAt: null, probe: null, enc };
   }
 
@@ -101,7 +134,7 @@ export class KeyVault {
   private async writeEnv(kind: KeyKind, secret: string): Promise<{ ok: boolean; msg: string }> {
     const root = this.d.root();
     if (!root) return { ok: false, msg: 'no harness install' };
-    const r = await this.run(root, ['config', 'set', kind, secret], { timeoutMs: 30000 });
+    const r = await this.runIn(root, ['config', 'set', kind, '--stdin'], secret, { timeoutMs: 30000 });
     // never echo the CLI output verbatim: it could contain the value
     return { ok: r.code === 0, msg: r.code === 0 ? `${kind} written to .env` : 'harness config set failed' };
   }
@@ -136,6 +169,19 @@ export class KeyVault {
     this.mem.delete(id);
     this.save();
     return { ok: true, state: this.state(), msg: 'key removed' };
+  }
+
+  /** M9: keep inactive keys without an OS keyring (safeStorage's obfuscated `basic_text` store). Turning it off
+   *  drops the stored secrets of every key from disk (held in memory for this run only), as if they had been added with it off. */
+  setStoreInactive(on: boolean): KeyOpResult {
+    this.f.storeInactive = on;
+    const secure = this.storageInfo().secure;
+    for (const e of this.f.keys) {
+      if (on && !e.enc && this.mem.has(e.id)) { const enc = this.encrypt(this.mem.get(e.id)!); if (enc) { e.enc = enc; this.mem.delete(e.id); } }
+      if (!on && !secure && e.enc) { const sec = this.secretOf(e); if (sec) this.mem.set(e.id, sec); e.enc = null; }
+    }
+    this.save();
+    return { ok: true, state: this.state(), msg: on ? 'inactive keys are kept (obfuscated, not encrypted by an OS keyring)' : 'inactive keys are no longer stored on disk' };
   }
 
   /** W12: candidate probe, config set, canonical probe, automatic revert. */
@@ -244,5 +290,7 @@ export class KeyVault {
     handle('keys:probe', (p) => { const o = v.obj(p); return 'active' in o ? { active: kind(o.active) } : { id: v.str(o.id, 'id', 64) }; },
       (t) => this.probe(t), (message) => ({ state: 'unknown', at: Date.now(), message }));
     handle('keys:clear-active', (p) => kind(v.obj(p).kind), (k) => this.clearActive(k), err);
+    handle('keys:set-store-inactive', (p) => { const on = v.obj(p).on; if (typeof on !== 'boolean') throw new Error('on must be a boolean'); return on; },
+      (on) => this.setStoreInactive(on), err);
   }
 }

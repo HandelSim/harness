@@ -55,3 +55,23 @@ test('completions from recents and the parent folder', () => {
   assert.deepEqual(completions('/home/u/', ['a'], ['/home/u/x']), ['/home/u/x', '/home/u/a']);
   assert.deepEqual(completions('', [], ['/r1', '/r2']), ['/r1', '/r2']);
 });
+
+test('gitCase: each folder case is named (F1)', async () => {
+  const { gitCase, ticketBranch } = await import('./model');
+  const base = { exists: true, dir: true, git: null };
+  const repo = (o: Record<string, unknown>) => ({ ...base, repo: { isRepo: true, root: '/r', branch: 'main', detached: false, hasCommits: true, inSubfolder: false, ...o } });
+  assert.equal(gitCase(repo({})).text, 'git repo · main');
+  assert.equal(gitCase(repo({})).tone, 'ok');
+  assert.match(gitCase(repo({ hasCommits: false })).text, /no commits yet on main/);
+  const det = gitCase(repo({ detached: true, branch: '' }));
+  assert.match(det.text, /detached HEAD/); assert.equal(det.tone, 'warn');
+  const sub = gitCase(repo({ inSubfolder: true }));
+  assert.equal(sub.root, '/r'); assert.match(sub.text, /inside the git repo at \/r/);
+  assert.equal(gitCase({ ...base, repo: { isRepo: false, root: '', branch: '', detached: false, hasCommits: false, inSubfolder: false, error: 'dubious ownership' } }).text, 'not a git repo (dubious ownership)');
+  // legacy shape (main without the repo probe)
+  assert.equal(gitCase({ exists: true, dir: true, git: { branch: 'dev' } }).text, 'git repo · dev');
+  assert.equal(gitCase(base).repo, false);
+  assert.equal(ticketBranch('ABC-1', ['main', 'ABC-1'], []), 'ABC-1');
+  assert.equal(ticketBranch('ABC-1', ['main'], ['origin/ABC-1', 'origin/main']), 'origin/ABC-1');
+  assert.equal(ticketBranch('ABC-1', ['main'], ['origin/ABC-12']), '');
+});

@@ -10,7 +10,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import type { PtySpec } from '../../../shared/ipc';
 import type { PanelCtx } from '../../shell/dock';
-import { openPanel } from '../../shell/dock';
+import { openPanel, paramClaimed } from '../../shell/dock';
 import { findRequest, dialog } from '../../shell/ui';
 import { commandsFor } from '../../shell/commands';
 import { settings } from '../../core/app';
@@ -285,6 +285,9 @@ export default function TerminalPanel({ ctx }: { ctx: PanelCtx }) {
       alive = false;
       return true;
     });
+    // Disposed without beforeClose (layout undo/reset, restore failure): kill the pty unless the same operation
+    // recreated a panel that re-attaches to it; otherwise it would pause at the unacked cap and block the agent (H3).
+    ctx.onDispose(() => { if (id && alive && !paramClaimed('ptyId', id)) { bridge.pty.kill(id); alive = false; } });
 
     api.current = {
       restart,

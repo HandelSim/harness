@@ -803,6 +803,61 @@ class ReadsSmokeTest(ApiTest):
             self.assertNotEqual(v.get("error", {}).get("code"), "internal", (t, v))
 
 
+class VaultPathTest(ApiTest):
+    """Only git's own folder is hidden; a backslash is a separator (Windows), so it cannot
+    walk into .git (review A-5, L14)."""
+
+    def test_only_dot_git_is_hidden(self):
+        v = self.fx.vault
+        os.makedirs(os.path.join(v, ".git"), exist_ok=True)
+        os.makedirs(os.path.join(v, ".github"), exist_ok=True)
+        for name, text in ((".git/config", "[remote]\n"), (".gitignore", "x\n"), (".github/notes.md", "n\n")):
+            with open(os.path.join(v, name), "w") as f:
+                f.write(text)
+        names = [e["name"] for e in self.ok("/vault/tree")["entries"]]
+        self.assertNotIn(".git", names)
+        self.assertIn(".gitignore", names)
+        self.assertIn(".github", names)
+        self.assertEqual(self.ok("/vault/file?path=.gitignore")["text"], "x\n")
+        self.assertEqual(self.ok("/vault/file?path=.github/notes.md")["text"], "n\n")
+        for p in (".git/config", "wiki%5C..%5C.git%5Cconfig", ".git%5Cconfig", "wiki/../.git/config", "./wiki/index.md"):
+            r, d = self.fx.get("/vault/file?path=" + p)
+            self.assertEqual(r.status, 404, (p, d))
+        self.assertEqual(self.ok("/vault/file?path=wiki%5Cindex.md")["text"], "# Index\n")   # wiki\index.md
+
+    def test_internal_error_hides_its_text(self):
+        with mock.patch.object(api, "_git_version", side_effect=RuntimeError("/home/someone/secret path")), \
+                mock.patch.dict(api._CACHE, clear=True), mock.patch("sys.stderr"):
+            r, d = self.fx.get("/status")
+        self.assertEqual(r.status, 500)
+        self.assertNotIn("secret", d["error"]["message"])
+
+
+class CacheTest(unittest.TestCase):
+    """_cached: an expired value is served at once while one thread gets the next (A-6)."""
+
+    def test_an_expired_value_is_served_while_one_refresh_runs(self):
+        calls, gate = [], threading.Event()
+
+        def slow():
+            calls.append(1)
+            gate.wait(5)
+            return len(calls)
+        with mock.patch.dict(api._CACHE, clear=True):
+            api._CACHE[("t", 1)] = (time.monotonic() - 60, "old")
+            t0 = time.monotonic()
+            got = [api._cached(("t", 1), 5, slow) for _ in range(5)]
+            self.assertLess(time.monotonic() - t0, 1)
+            self.assertEqual(got, ["old"] * 5)
+            gate.set()
+            end = time.monotonic() + 5
+            while api._cached(("t", 1), 5, slow) == "old" and time.monotonic() < end:
+                time.sleep(0.02)
+            self.assertEqual(api._cached(("t", 1), 5, slow), 1)
+            self.assertEqual(len(calls), 1)   # one refresh, not one per caller
+            self.assertEqual(api._cached(("t", 2), 5, lambda: "first"), "first")   # the first call waits
+
+
 # --- --dump: the fixture's answers for the desktop app's mock serve --------------------------
 
 DUMP_PATHS = {

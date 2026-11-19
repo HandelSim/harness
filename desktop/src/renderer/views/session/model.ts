@@ -106,3 +106,25 @@ export function completions(typed: string, parentEntries: string[], recents: str
   }
   return [...new Set(out)].slice(0, max);
 }
+
+/** F1: which git case a folder is, as the New session and Add tickets dialogs say it. `root` is set when the folder is
+ *  inside a repo but not its top folder (so a dialog can offer "Use the repo's top folder"). */
+export interface GitCase { tone: 'ok' | 'info' | 'warn'; text: string; repo: boolean; branch: string; root?: string }
+export function gitCase(info: PathInfo): GitCase {
+  const r = info.repo;
+  if (!r) return info.git ? { tone: 'ok', text: `git repo · ${info.git.branch || 'detached'}`, repo: true, branch: info.git.branch }
+    : { tone: 'info', text: 'folder (not a git repo)', repo: false, branch: '' };
+  if (!r.isRepo) return { tone: 'info', text: r.error ? `not a git repo (${r.error})` : 'folder (not a git repo)', repo: false, branch: '' };
+  if (!r.hasCommits) return { tone: 'warn', text: `empty git repo: no commits yet${r.branch ? ` on ${r.branch}` : ''}`, repo: true, branch: r.branch };
+  const where = r.detached ? 'detached HEAD (no branch checked out)' : r.branch;
+  if (r.inSubfolder) return { tone: 'info', text: `inside the git repo at ${r.root} · ${where}`, repo: true, branch: r.branch, root: r.root };
+  return { tone: r.detached ? 'warn' : 'ok', text: `git repo · ${where}`, repo: true, branch: r.branch };
+}
+
+/** W5 step 3: the existing branch named after the ticket (local first, then a remote-tracking one), or ''. */
+export function ticketBranch(key: string, local: string[], remote: string[]): string {
+  const k = key.trim();
+  if (!k) return '';
+  if (local.includes(k)) return k;
+  return remote.find((r) => r.slice(r.indexOf('/') + 1) === k) || '';
+}

@@ -6,6 +6,9 @@
 .ns-path-line { min-height: 18px; display: flex; align-items: center; }
 .ns-path { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--text-12); color: var(--ok-text, var(--text-2)); }
 .ns-path--err { color: var(--err-text, var(--err-solid)); }
+.ns-path--warn { color: var(--warn-text, var(--text-2)); }
+.ns-path .ellipsis { min-width: 0; max-width: 46ch; }
+.linkish { background: none; border: 0; padding: 0 0 0 var(--sp-2); color: var(--accent-text, var(--accent)); cursor: pointer; font: inherit; text-decoration: underline; }
 .ns-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: var(--sp-1); }
 .ns-dot--wait { background: var(--text-3); animation: ns-pulse 1s ease-in-out infinite; }
 @keyframes ns-pulse { 50% { opacity: 0.35; } }

@@ -9,18 +9,22 @@ export interface PollerDeps {
   update(topic: string, sig: string, data: unknown): void;
   health(ok: boolean, failures: number, nextInMs: number): void;
   stale?(stale: boolean): void;
+  /** A topic-level error in a poll answer. Without it the error goes to update(topic, '', { error }). */
+  error?(topic: string, error: { code: string; message: string }): void;
   clock?: Clock;
 }
 export type Visibility = 'focused' | 'blurred' | 'hidden';
 
 export const BACKOFF = [1000, 2000, 5000, 15000];
 export const HIDDEN_TOPICS = new Set(['status', 'queue']);
+/** Server cap per /poll request; more topics are split over several requests. */
 export const MAX_TOPICS = 24;
 
 export class Poller {
   private sets = new Map<string, Set<string>>();   // owner -> topics
   private sigs = new Map<string, string>();
   private last = new Map<string, unknown>();
+  private errs = new Map<string, string>();         // topic -> last forwarded error (code + message)
   private timer: unknown = null;
   private inflight = false;
   private running = false;
@@ -32,19 +36,24 @@ export class Poller {
   topics(): string[] {
     const u = new Set<string>();
     for (const s of this.sets.values()) for (const t of s) u.add(t);
-    let list = [...u];
-    if (this.vis === 'hidden') list = list.filter((t) => HIDDEN_TOPICS.has(t));
-    return list.slice(0, MAX_TOPICS);
+    const list = [...u];
+    return this.vis === 'hidden' ? list.filter((t) => HIDDEN_TOPICS.has(t)) : list;
   }
 
-  /** Replace one owner's topic set. New topics are fetched right away; known ones re-emit their last data. */
+  /**
+   * Replace one owner's topic set. Topics new to the poller are fetched right away; topics new to this owner but
+   * already cached re-emit their last data once. Topics the owner already had are not re-sent (M1).
+   */
   set(owner: string, topics: string[]): void {
-    const prev = this.topics();
-    this.sets.set(owner, new Set(topics.filter((t) => /^[a-z-]+(:[A-Za-z0-9._-]+)?$/.test(t))));
+    const prev = new Set(this.topics());
+    const had = this.sets.get(owner) || new Set<string>();
+    const mine = new Set(topics.filter((t) => /^[a-z-]+(:[A-Za-z0-9._-]+)?$/.test(t)));
+    this.sets.set(owner, mine);
     const now = this.topics();
     for (const t of [...this.sigs.keys()]) if (!now.includes(t)) { this.sigs.delete(t); this.last.delete(t); }
-    for (const t of now) if (this.last.has(t)) this.d.update(t, this.sigs.get(t) || '', this.last.get(t));
-    if (this.running && now.some((t) => !prev.includes(t))) this.kick(0);
+    for (const t of [...this.errs.keys()]) if (!now.includes(t)) this.errs.delete(t);
+    for (const t of now) if (mine.has(t) && !had.has(t) && this.last.has(t)) this.d.update(t, this.sigs.get(t) || '', this.last.get(t));
+    if (this.running && now.some((t) => !prev.has(t))) this.kick(0);
   }
   drop(owner: string): void { this.sets.delete(owner); }
 
@@ -66,14 +75,17 @@ export class Poller {
   interval(): number {
     if (this.failures > 0) return BACKOFF[Math.min(this.failures - 1, BACKOFF.length - 1)];
     if (this.vis === 'hidden') return 15000;
-    if (this.vis === 'blurred') return 5000;
-    return this.busy() ? 1000 : 3000;
+    // A running queue or working session keeps the fast cadence while the window is visible but unfocused (L13).
+    if (this.busy()) return this.vis === 'blurred' ? 2000 : 1000;
+    return this.vis === 'blurred' ? 5000 : 3000;
   }
 
   start(): void { if (this.running) return; this.running = true; this.kick(0); }
   stop(): void { this.running = false; if (this.timer !== null) this.clock.clear(this.timer); this.timer = null; }
   /** Forget sigs (e.g. after reconnecting to a different serve) so everything is re-sent. */
-  reset(): void { this.sigs.clear(); this.last.clear(); this.failures = 0; }
+  reset(): void { this.sigs.clear(); this.last.clear(); this.errs.clear(); this.failures = 0; }
+  /** Poll now, skipping the current wait or backoff (e.g. on powerMonitor resume / unlock-screen). */
+  pollNow(): void { this.kick(0); }
   /** Poll as soon as possible (after an action, or on demand). */
   kick(ms = 0): void {
     if (!this.running) return;
@@ -86,8 +98,11 @@ export class Poller {
     const list = this.topics();
     if (!list.length) { this.schedule(); return; }
     this.inflight = true;
+    const q = list.map((topic) => ({ topic, sig: this.sigs.get(topic) || '' }));
+    const chunks: (typeof q)[] = [];
+    for (let i = 0; i < q.length; i += MAX_TOPICS) chunks.push(q.slice(i, i + MAX_TOPICS));
     let ans: PollAnswer;
-    try { ans = await this.d.fetch(list.map((topic) => ({ topic, sig: this.sigs.get(topic) || '' }))); }
+    try { ans = merge(await Promise.all(chunks.map((c) => this.d.fetch(c)))); }
     catch { ans = { ok: false, status: 0 }; }
     this.inflight = false;
     if (!ans.ok) {
@@ -101,9 +116,21 @@ export class Poller {
     this.d.stale?.(ans.stale);
     for (const [topic, r] of Object.entries(ans.topics)) {
       if (!list.includes(topic)) continue;
-      if (r.error) continue;
-      if (r.same) continue;
-      if (typeof r.sig === 'string' && r.sig === this.sigs.get(topic)) continue;
+      if (r.error) {
+        // Forward it once per distinct error (M6) so the renderer marks the topic stale; keep sig and last data.
+        const k = `${r.error.code}\n${r.error.message}`;
+        if (this.errs.get(topic) === k) continue;
+        this.errs.set(topic, k);
+        if (this.d.error) this.d.error(topic, r.error); else this.d.update(topic, '', { error: r.error });
+        continue;
+      }
+      const recovered = this.errs.delete(topic);
+      const unchanged = !!r.same || (typeof r.sig === 'string' && r.sig === this.sigs.get(topic));
+      if (unchanged) {
+        // Recovered with the same data: re-send it so the renderer clears the error (same sig, so no re-render).
+        if (recovered && this.last.has(topic)) this.d.update(topic, this.sigs.get(topic) || '', this.last.get(topic));
+        continue;
+      }
       this.sigs.set(topic, r.sig || '');
       this.last.set(topic, r.data);
       this.d.update(topic, r.sig || '', r.data);
@@ -113,6 +140,17 @@ export class Poller {
   }
 
   private schedule(): void { if (this.running) this.kick(this.interval()); }
+}
+
+function merge(answers: PollAnswer[]): PollAnswer {
+  const topics: Record<string, PollTopicResult> = {};
+  let stale = false;
+  for (const a of answers) {
+    if (!a.ok) return a;
+    stale = stale || a.stale;
+    Object.assign(topics, a.topics);
+  }
+  return { ok: true, stale, topics };
 }
 
 export function pollPath(q: { topic: string; sig: string }[]): string {

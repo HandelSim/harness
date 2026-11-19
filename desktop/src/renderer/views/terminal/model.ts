@@ -1,6 +1,6 @@
 // Pure terminal helpers (unit-tested): titles, paste confirmation, WebGL slot cap, exit classification,
 // the pty-event dispatcher's buffer for data that arrives before spawn() resolves.
-import type { PtySpec } from '../../../shared/ipc';
+import type { PtyInfo, PtySpec } from '../../../shared/ipc';
 
 export const KIND_LABEL: Record<PtySpec['kind'], string> = { agent: 'agent', host: 'host agent', shell: 'shell', plain: 'plain shell' };
 export const KIND_GLYPH: Record<PtySpec['kind'], string> = { agent: '◆', host: '◇', shell: '▣', plain: '›' };
@@ -68,4 +68,13 @@ export class PendingBuffer {
   take(id: string): string[] { const e = this.map.get(id); this.map.delete(id); return e ? e.chunks : []; }
   gc(now: number): void { for (const [k, v] of this.map) if (now - v.at > this.ttlMs) this.map.delete(k); }
   get ids(): string[] { return [...this.map.keys()]; }
+}
+
+/**
+ * Ptys to kill at renderer start (H3): started before this page loaded and claimed by no panel in the restored layout.
+ * Ptys started after `bootAt` belong to panels of this page that may not have saved their ptyId yet.
+ */
+export function unclaimedPtys(list: PtyInfo[], claimed: Iterable<unknown>, bootAt: number): string[] {
+  const c = new Set(claimed);
+  return list.filter((p) => !c.has(p.id) && p.startedAt < bootAt).map((p) => p.id);
 }

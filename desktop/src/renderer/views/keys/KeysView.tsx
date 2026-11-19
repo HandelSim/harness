@@ -1,5 +1,5 @@
 // Keys view (3.11): the OS key vault (bridge.keys). Secrets are write-only: the renderer sends a new secret once and only
-// ever shows label + last 4. Lock timing (locksAt) and probe state come from main; nothing is re-derived here.
+// ever shows label + last 4 (only for secrets of 16+ chars, else the length: L10). Lock timing (locksAt) and probe state come from main; nothing is re-derived here.
 import { useEffect, useState } from 'preact/hooks';
 import type { PanelCtx } from '../../shell/dock';
 import { keyState, offlineReason } from '../../core/app';
@@ -66,6 +66,8 @@ function AddKey({ kind: k0 }: { kind?: KeyKind }) {
           <label class="check"><input type="checkbox" checked={activate} onChange={(e) => setActivate((e.target as HTMLInputElement).checked)} />Make it the active key</label>
           <label class="check"><input type="checkbox" checked={team} onChange={(e) => setTeam((e.target as HTMLInputElement).checked)} />Team key</label>
         </div>
+        {!activate && kind !== 'ACCESS_CODE' && keyState.value && !keyState.value.secure && !keyState.value.storeInactive
+          ? <div class="meta small" data-testid="add-key-inactive-hint">No OS keyring: an inactive key is kept only if “Keep inactive keys” is on in Keys.</div> : null}
         {err ? <div class="notice notice--warn" role="alert" data-testid="add-key-error"><Icon name="alert" />{err}</div> : null}
       </div>
       <footer><span class="spacer" /><Button variant="ghost" onClick={closeDialog}>Cancel</Button><Button variant="primary" icon="plus" testid="add-key-submit" onClick={save}>Add key</Button></footer>
@@ -80,6 +82,12 @@ function probePill(k: KeyMeta) {
   return <span title={`${p.message || p.state} · checked ${ago(p.at)}`}><Pill tone={tone as never}>{p.state === 'ok' ? 'works' : p.state}</Pill></span>;
 }
 
+/** L10: last 4 only when main sent it (long secrets); otherwise just the length. */
+export function secretHint(k: Pick<KeyMeta, 'last4' | 'chars'>): string {
+  if (k.last4) return `••••${k.last4}`;
+  return typeof k.chars === 'number' ? `${k.chars} chars` : '••••';
+}
+
 function KeyRow({ k }: { k: KeyMeta }) {
   const d = daysUntil(k.locksAt);
   const exp = daysUntil(k.expiresAt);
@@ -88,7 +96,7 @@ function KeyRow({ k }: { k: KeyMeta }) {
       <span class={`dot ${k.active ? 'dot--ok' : ''}`} />
       <div class="col grow" style={{ minWidth: 0, gap: '2px' }}>
         <div class="row" style={{ gap: 'var(--sp-2)' }}>
-          <strong class="ellipsis">{k.label}</strong><span class="mono meta">••••{k.last4}</span>
+          <strong class="ellipsis">{k.label}</strong><span class="mono meta" data-testid={`key-hint-${k.id}`}>{secretHint(k)}</span>
           {k.active ? <Pill tone="accent">active</Pill> : null}{k.team ? <Pill tone="info">team</Pill> : null}
           {k.superseded ? <Pill tone="default">superseded</Pill> : null}{probePill(k)}
         </div>
@@ -123,7 +131,13 @@ export default function KeysView({ ctx }: { ctx: PanelCtx }) {
       <div class="view-body keys-body">
         {!st ? <div class="empty"><span class="spin" /></div> : null}
         {st && !st.secure ? <div class="notice notice--warn"><Icon name="alert" />The OS key store is not available; keys are kept with weaker protection.</div> : null}
-        {st && st.storeInactive ? <div class="notice notice--warn"><Icon name="alert" />The key store is inactive; the backend reads keys from .env.</div> : null}
+        {st && !st.secure ? (
+          <label class="check" data-testid="keys-store-inactive" title="Without an OS keyring only the active key (in .env) is kept unless you opt in.">
+            <input type="checkbox" checked={st.storeInactive}
+              onChange={(e) => { const on = (e.target as HTMLInputElement).checked; void run(bridge.keys.setStoreInactive(on)); }} />
+            Keep inactive keys on this computer (obfuscated, not encrypted)
+          </label>
+        ) : null}
         {st && st.keys.length === 0 ? <EmptyState icon="keys" text="No keys in the vault yet." action={<Button variant="primary" icon="plus" onClick={() => openDialog(<AddKey />)}>Add key</Button>} /> : null}
         {st ? groups.filter((g) => g.keys.length || st.env[g.kind]?.set).map((g) => (
           <section key={g.kind} class="keys-group">

@@ -10,7 +10,7 @@ import { fail } from '../../core/toast';
 import { Button, Seg } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
 import { specTitle, baseName } from '../terminal/model';
-import { KINDS, isAgent, defaultForm, formFromSpec, buildSpec, validate, pushRecentProject, completions, dirName, normalizePath, type SessionForm, type OpenIn, type Kind } from './model';
+import { KINDS, isAgent, defaultForm, formFromSpec, buildSpec, validate, pushRecentProject, completions, dirName, normalizePath, gitCase, type SessionForm, type OpenIn, type Kind } from './model';
 
 const LAST_KEY = 'session.last';
 let last: { spec: PtySpec; openIn: OpenIn } | null = null;
@@ -132,12 +132,16 @@ function NewSessionDialog({ initial, openIn }: { initial: PtySpec | null; openIn
   const folderMsg = (() => {
     if (checking) return <span class="ns-path faint"><span class="ns-dot ns-dot--wait" />Checking…</span>;
     if (errors.cwd && (touched || form.cwd)) return <span class="ns-path ns-path--err" data-testid="ns-folder-error"><Icon name="alert" size={12} />{errors.cwd}</span>;
-    if (info?.dir) return (
-      <span class="ns-path" data-testid="ns-folder-ok">
-        <Icon name="check" size={12} />
-        {info.git ? <>git repo · <span class="mono">{info.git.branch || 'detached'}</span></> : 'folder (not a git repo)'}
-      </span>
-    );
+    if (info?.dir) {
+      const g = gitCase(info);
+      return (
+        <span class={`ns-path${g.tone === 'warn' ? ' ns-path--warn' : ''}`} data-testid="ns-folder-ok" data-git={g.repo ? 'repo' : 'none'} title={g.text}>
+          <Icon name={g.tone === 'warn' ? 'alert' : 'check'} size={12} />
+          <span class="ellipsis">{g.text}</span>
+          {g.root ? <button type="button" class="linkish" data-testid="ns-use-root" onClick={() => set('cwd', g.root!)}>use the repo's top folder</button> : null}
+        </span>
+      );
+    }
     return null;
   })();
 

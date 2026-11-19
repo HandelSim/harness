@@ -4,10 +4,22 @@ import type { Message, MessagesPage, Part, SessionRow } from '../../../shared/ap
 /** Merge a page into the list: messages at index >= page.from are replaced (the last one may still be streaming). */
 export function mergePage(list: Message[], page: MessagesPage): Message[] {
   const keep = list.filter((m) => m.index < page.from);
-  const out = [...keep, ...page.messages.filter((m) => m && typeof m.index === 'number')];
+  // A re-read message whose content did not change keeps its old object, so memoised views skip it (M7).
+  const old = new Map(list.filter((m) => m.index >= page.from).map((m) => [m.index, m]));
+  const fresh = page.messages.filter((m) => m && typeof m.index === 'number').map((m) => {
+    const o = old.get(m.index);
+    return o && o.id === m.id && JSON.stringify(o) === JSON.stringify(m) ? o : m;
+  });
+  const out = [...keep, ...fresh];
   out.sort((a, b) => a.index - b.index);
-  return out.length > page.count ? out.slice(0, page.count) : out;
+  const res = out.length > page.count ? out.slice(0, page.count) : out;
+  // Nothing changed: hand back the same array so the caller can skip the render.
+  return res.length === list.length && res.every((m, i) => m === list[i]) ? list : res;
 }
+
+/** Messages rendered at first: the newest TAIL; "Show earlier" adds TAIL more (M7). */
+export const TAIL = 200;
+export function tailStart(count: number, shown: number): number { return Math.max(0, count - Math.max(shown, 0)); }
 /** Where the next poll starts: re-read the last message (it may still be growing). */
 export function nextFrom(list: Message[]): number { return list.length ? Math.max(0, list[list.length - 1].index) : 0; }
 

@@ -1,4 +1,5 @@
 // Queue view (W5, 3.4): toolbar, runner card, ticket list (keyboard + drag reorder), embedded ticket detail.
+import { Component } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import type { PanelCtx } from '../../shell/dock';
@@ -12,6 +13,7 @@ import { ago } from '../../core/format';
 import { openDialog, closeDialog } from '../../shell/ui';
 import { hooks } from '../../shell/commands';
 import { isTyping } from '../../core/keymap';
+import { VirtualList } from './virtual';
 import { rowPill, runnerCard, counts, filterTickets, orderTickets, reconcile, moveLocal, neighbourBefore, keepSelection, slotStage, startModes, type PendingMove } from './model';
 
 type Mode = 'container' | 'host' | 'single';
@@ -94,19 +96,29 @@ function StartSplit({ gate }: { gate: Gate | undefined }) {
   );
 }
 
-function Row({ t, q, selected, onSelect, onOpen, onDragStart, onDrop }: {
-  t: TicketSummary; q: Queue; selected: boolean; onSelect: () => void; onOpen: () => void;
-  onDragStart: (e: DragEvent) => void; onDrop: (e: DragEvent) => void;
-}) {
-  const p = rowPill(t, q.runner);
-  const stage = p.live ? slotStage(q.runner, t.key) || t.stage : t.stage;
+const ROW_H = 32;   // .qrow height in queue.css
+interface RowActions { select(k: string): void; open(k: string): void; move(k: string, before: string): void }
+type RowProps = { t: TicketSummary; runner: Queue['runner']; selected: boolean; acts: { current: RowActions } };
+const same = (a: unknown, b: unknown) => a === b || JSON.stringify(a) === JSON.stringify(b);
+/** Memoised: a poll that changes one ticket re-renders that row only (IPC hands every ticket a new identity). */
+class Row extends Component<RowProps> {
+  shouldComponentUpdate(n: RowProps): boolean {
+    const p = this.props;
+    return n.selected !== p.selected || !same(n.t, p.t) || !same(n.runner, p.runner);
+  }
+  render() { return <RowView {...this.props} />; }
+}
+function RowView({ t, runner, selected, acts }: RowProps) {
+  const p = rowPill(t, runner);
+  const stage = p.live ? slotStage(runner, t.key) || t.stage : t.stage;
   const movable = t.actions?.move?.ok;
   return (
-    <div class="qrow list-row" role="option" aria-selected={selected} data-testid={`ticket-row-${t.key}`} data-live={p.live ? '1' : undefined}
-      onClick={onSelect} onDblClick={onOpen} draggable={!!movable} onDragStart={onDragStart}
+    <div class="qrow list-row" role="option" id={`qrow-${t.key}`} aria-selected={selected} data-testid={`ticket-row-${t.key}`} data-live={p.live ? '1' : undefined}
+      onClick={() => acts.current.select(t.key)} onDblClick={() => acts.current.open(t.key)} draggable={!!movable}
+      onDragStart={(ev) => { ev.dataTransfer?.setData('text/x-ticket', t.key); }}
       onDragOver={(e) => { if (movable) { e.preventDefault(); (e.currentTarget as HTMLElement).dataset.over = '1'; } }}
       onDragLeave={(e) => { delete (e.currentTarget as HTMLElement).dataset.over; }}
-      onDrop={(e) => { delete (e.currentTarget as HTMLElement).dataset.over; onDrop(e); }}>
+      onDrop={(e) => { delete (e.currentTarget as HTMLElement).dataset.over; const k = e.dataTransfer?.getData('text/x-ticket'); if (k && k !== t.key) acts.current.move(k, t.key); }}>
       <span class="qrow-grip" aria-hidden="true">{movable ? <Icon name="grip" size={14} /> : null}</span>
       <span class="qrow-pill" title={p.hint || undefined}><Pill tone={p.tone} dot={p.dot ?? undefined}>{p.label}</Pill></span>
       <span class="qrow-key mono">{t.key}</span>
@@ -167,6 +179,8 @@ export default function QueueView({ ctx }: { ctx: PanelCtx }) {
   };
   const select = (k: string | null) => { setSel(k); const i = list.findIndex((t) => t.key === k); if (i >= 0) selIndex.current = i; };
   const openTicket = (k: string) => openPanel('ticket', k, { title: k, params: { key: k } });
+  const acts = useRef<RowActions>({ select, open: openTicket, move: (k, b) => void move(k, b) });
+  acts.current = { select, open: openTicket, move: (k, b) => void move(k, b) };
 
   const onKey = (ev: KeyboardEvent) => {
     if (isTyping(ev.target) || ev.ctrlKey || ev.metaKey) return;
@@ -240,13 +254,9 @@ export default function QueueView({ ctx }: { ctx: PanelCtx }) {
                   : archived ? <EmptyState icon="archive" text="No archived tickets." />
                   : <EmptyState icon="queue" text="No tickets queued." action={<Button variant="primary" icon="plus" onClick={() => hooks.addTickets()}>Add tickets</Button>} />
               ) : (
-                <div class="qlist" role="listbox" aria-label="Tickets" tabIndex={0} aria-activedescendant={selected ? `qrow-${selected}` : undefined}>
-                  {list.map((t) => (
-                    <Row key={t.key} t={t} q={qd} selected={t.key === selected} onSelect={() => select(t.key)} onOpen={() => openTicket(t.key)}
-                      onDragStart={(ev) => { ev.dataTransfer?.setData('text/x-ticket', t.key); }}
-                      onDrop={(ev) => { const k = ev.dataTransfer?.getData('text/x-ticket'); if (k && k !== t.key) void move(k, t.key); }} />
-                  ))}
-                </div>
+                <VirtualList class="qlist" role="listbox" aria-label="Tickets" tabIndex={0} aria-activedescendant={selected ? `qrow-${selected}` : undefined}
+                  items={list} rowHeight={ROW_H} focusIndex={selected ? list.findIndex((t) => t.key === selected) : -1}
+                  row={(t: TicketSummary) => <Row key={t.key} t={t} runner={qd.runner} selected={t.key === selected} acts={acts} />} />
               )}
             </div>
             <div class="queue-right">

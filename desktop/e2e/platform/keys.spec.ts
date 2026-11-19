@@ -17,7 +17,9 @@ test('add and activate an upstream key; the renderer only ever sees metadata', a
   expect(k.locksAt).toBeGreaterThan(Date.now());
   const fs = fakeState(root!);
   expect(fs.config.PROXY_API_KEY).toBe(secret);
-  expect(fs.calls.map((c) => c.join(' '))).toContain(`config set PROXY_API_KEY <${secret.length} chars>`);
+  // M8: the secret goes on stdin, never on argv
+  expect(fs.calls.map((c) => c.join(' '))).toContain('config set PROXY_API_KEY --stdin');
+  expect(JSON.stringify(fs.calls)).not.toContain(secret);
   const p = await win.evaluate((id) => window.harness.keys.probe({ id }), k.id);
   expect(p.state).toBe('ok');
   // an active key cannot be removed
@@ -35,5 +37,13 @@ test('a rejected key is reported, and an inactive key is refused without a keyri
     const i = await win.evaluate(() => window.harness.keys.add({ kind: 'OAI_API_KEY', label: 'spare', secret: 'sk-spare-1' }));
     expect(i.ok).toBe(false);
     expect(!i.ok && i.error.code).toBe('insecure');
+    // M9: opting in to obfuscated storage makes "Save (stored inactive)" work
+    const on = await win.evaluate(() => window.harness.keys.setStoreInactive(true));
+    expect(on.ok && on.state.storeInactive).toBe(true);
+    const j = await win.evaluate(() => window.harness.keys.add({ kind: 'OAI_API_KEY', label: 'spare', secret: 'sk-spare-1' }));
+    expect(j.ok, JSON.stringify(j)).toBe(true);
+    const spare = j.state.keys.find((x) => x.label === 'spare')!;
+    expect(spare.last4).toBe('');   // L10: short secret, length only
+    expect(spare.chars).toBe(10);
   }
 });

@@ -1,7 +1,7 @@
 // Topic store (PLAN 3.2, 4.5): ref-counted subscriptions to live topics. Pure: IO is injected, so it is
 // unit-tested in node. Main's poller pushes 'live:update' only on change; the store keeps the last data
 // forever (stale marking instead of clearing), so a view switch renders cached data immediately.
-import { signal, type Signal } from '@preact/signals-core';
+import { batch, signal, type Signal } from '@preact/signals-core';
 import type { ApiError, ReadResult, Topic, TopicData } from '../../shared/api';
 
 export interface TopicEntry<T = unknown> {
@@ -96,20 +96,29 @@ export class TopicStore {
   /** A 'live:update' push, or a fetch result. */
   apply(t: Topic, sig: string, data: unknown): void {
     const e = this.entry(t);
+    if (sig && sig === e.sig && e.at.value) {
+      // Same content (a re-send, or a recovery after a topic error): clear the marks, keep the data identity so
+      // subscribers do not re-render (M1).
+      batch(() => { e.error.value = null; e.unavailable.value = false; e.stale.value = false; });
+      return;
+    }
     e.sig = sig;
-    e.error.value = null;
-    e.unavailable.value = false;
-    e.stale.value = false;
-    const gone = !!data && typeof data === 'object' && (data as { gone?: unknown }).gone === true;
-    e.gone.value = gone;
-    if (!gone) e.data.value = data as never;
-    e.at.value = this.io.now();
+    batch(() => {                     // one render per change, not one per field
+      e.error.value = null;
+      e.unavailable.value = false;
+      e.stale.value = false;
+      const gone = !!data && typeof data === 'object' && (data as { gone?: unknown }).gone === true;
+      e.gone.value = gone;
+      if (!gone) e.data.value = data as never;
+      e.at.value = this.io.now();
+    });
   }
 
   /** A topic-level error inside a /poll answer. */
   fail(t: Topic, error: ApiError['error'], status = 0): void {
     const e = this.entry(t);
-    e.error.value = error;
+    const cur = e.error.value;
+    if (!cur || cur.code !== error.code || cur.message !== error.message) e.error.value = error;
     if (status === 404 || status === 501 || error.code === 'unavailable' || error.code === 'not-found') e.unavailable.value = true;
     if (e.at.value) e.stale.value = true;
   }
