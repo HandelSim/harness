@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Jobs, runHarness } from './cli';
+import { Jobs, runHarness, startJob } from './cli';
 
 test('M3: one running job per kind; a second request re-attaches; the ring keeps the output tail', async () => {
   const exits: ((c: number) => void)[] = [];
@@ -44,5 +44,34 @@ test('L9: a runHarness timeout kills the whole group and resolves even if a gran
     const gc = Number(readFileSync(join(root, 'gc.pid'), 'utf8'));
     await new Promise((res) => setTimeout(res, 200));
     assert.throws(() => process.kill(gc, 0), 'grandchild is gone');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('J1: a hung job is stopped by its timeout (whole group), frees its kind, and stopAll ends the rest', { timeout: 20000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w3d-jobs-'));
+  try {
+    writeFileSync(join(root, 'harness'), `#!/usr/bin/env bash\n(echo $BASHPID > "${root}/gc.$1"; exec sleep 30) &\nwait\n`, { mode: 0o755 });
+    const exits: [string, number][] = [];
+    const j = new Jobs({ start: (r, a, c, e) => startJob(r, a, c, e), emit: (ch, p) => { if (ch === 'job:exit') exits.push([(p as { id: string }).id, (p as { code: number }).code]); },
+      timeoutMs: { doctor: 400, upgrade: 60000 }, graceMs: 500 });
+    const a = j.run('doctor', root);
+    const t0 = Date.now();
+    while (!exits.some(([id]) => id === a.id) && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 50));
+    assert.ok(exits.some(([id]) => id === a.id), 'the hung job never ended');
+    assert.match(j.list().find((x) => x.id === a.id)!.output, /stopping doctor/);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.throws(() => process.kill(Number(readFileSync(join(root, 'gc.doctor'), 'utf8')), 0), 'grandchild survived the timeout');
+    const b = j.run('doctor', root);
+    assert.notEqual(b.id, a.id, 'the kind is free again');
+    const up = j.run('upgrade', root);
+    const chk = j.run('check-updates', root);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(j.list().find((x) => x.id === chk.id)?.running, false, 'check-updates refused while an upgrade runs');
+    assert.match(j.list().find((x) => x.id === chk.id)!.output, /an upgrade is running/);
+    await j.stopAll();
+    assert.deepEqual(j.running(), []);
+    assert.ok(exits.some(([id]) => id === up.id));
+    await new Promise((r) => setTimeout(r, 200));
+    assert.throws(() => process.kill(Number(readFileSync(join(root, 'gc.upgrade'), 'utf8')), 0), 'upgrade grandchild survived quit');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

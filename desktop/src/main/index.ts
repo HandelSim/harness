@@ -183,7 +183,7 @@ handle('harness:config-set', (p) => {
 }, (m) => ({ ok: false, msg: m }));
 let harnessUpdate = { branch: '', local: '', available: null as boolean | null, text: '', checkedAt: null as number | null };
 // M3: one running job per kind (a second request re-attaches to it), recent jobs kept with an output tail
-const jobs = new Jobs({ start: (root, args, onChunk, onExit) => { startJob(root, args, onChunk, onExit); }, emit,
+const jobs = new Jobs({ start: (root, args, onChunk, onExit) => startJob(root, args, onChunk, onExit), emit,
   done: (job, all, code) => { if (job === 'check-updates') harnessUpdate = parseCheckUpdates(all, code, Date.now()); } });
 handle('harness:job', (p) => v.oneOf(obj(p).job, 'job', ['doctor', 'check-updates', 'upgrade', 'serve-stop'] as const),
   (job) => jobs.run(job, backend.st.root), () => ({ id: '' }));
@@ -281,11 +281,16 @@ handle('notify:show', (p) => {
   const o = obj(p);
   return { id: v.str(o.id, 'id', 200), title: v.str(o.title, 'title', 300), body: v.str(o.body, 'body', 2000), route: v.str(o.route, 'route', 500) };
 }, (n) => {
-  if (env.e2e || !Notification.isSupported()) { e2eRecord.notifications.push(n); return; }
+  if (env.e2e || !Notification.isSupported()) { e2eRecord.notifications.push(n); e2eRecord.notifications.splice(0, e2eRecord.notifications.length - 200); return; }
+  // N2: hold a reference until click/close (a collected Notification loses its click handler); at most 20
   const note = new Notification({ title: n.title, body: n.body });
-  note.on('click', () => { win?.show(); win?.focus(); emit('notify:click', { route: n.route }); });
+  liveNotes.add(note);
+  if (liveNotes.size > 20) liveNotes.delete(liveNotes.values().next().value!);
+  note.on('click', () => { liveNotes.delete(note); win?.show(); win?.focus(); emit('notify:click', { route: n.route }); });
+  note.on('close', () => { liveNotes.delete(note); });
   note.show();
 }, () => undefined);
+const liveNotes = new Set<Notification>();
 
 listen('log:write', (p) => { const o = obj(p); return { level: v.oneOf(o.level, 'level', ['info', 'warn', 'error'] as const), msg: v.str(o.msg, 'msg', 20000) }; },
   ({ level, msg }) => log(level, `renderer: ${msg}`));
@@ -307,7 +312,7 @@ function shutdown(): Promise<void> {
   if (shutdownP) return shutdownP;
   quitting = true;
   flushState(); flushSettings();
-  shutdownP = Promise.race([Promise.all([backend.onQuit(), pty.shutdown()]).then(() => undefined),
+  shutdownP = Promise.race([Promise.all([backend.onQuit(), pty.shutdown(), jobs.stopAll()]).then(() => undefined),
     new Promise<void>((r) => setTimeout(r, 8000))]).catch((e) => log('error', `shutdown: ${e}`));
   return shutdownP;
 }

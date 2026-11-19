@@ -34,6 +34,8 @@ const READY_MS = 120000;
 const RESPAWN = [1000, 5000, 15000];
 const LOG_ROTATE = 5 * 1024 * 1024;
 const STOP_CLI_MS = 5000;
+const WAIT_DOWN_MS = 12000;
+const LIMITED_MSG = 'too many failed sign-ins from this machine: serve blocks sign-in for up to 10 minutes, try again later';
 
 export class BackendManager {
   st: BackendState = { phase: 'locating', root: null, url: null, port: null, owned: false, pid: null, stale: false,
@@ -57,6 +59,9 @@ export class BackendManager {
   private stopping = false;
   private respawnTimer: NodeJS.Timeout | null = null;
   private lastQueue: Queue | null = null;
+  private reloginP: Promise<boolean> | null = null;   // A1: one /login post at a time, shared by polls and GETs
+  private failedCode: string | null = null;            // A1: a code serve refused is never posted again by itself
+  private ownedPort = 0;                               // A3: the port of the serve this app spawned (survives a respawn-attach)
 
   constructor(private d: ManagerDeps) {
     this.poller = new Poller({
@@ -71,6 +76,7 @@ export class BackendManager {
 
   private set(p: Partial<BackendState>): void {
     if (p.phase && p.phase !== this.st.phase) p.since = Date.now();
+    if (p.owned === false) this.ownedPort = 0;   // A3: whatever cleared ownership also forgets the owned port
     this.st = { ...this.st, ...p, hostConsent: this.d.settings().backend.hostConsent };
     this.d.emit(this.get());
   }
@@ -88,6 +94,7 @@ export class BackendManager {
   /** Cancel an in-flight start (its async steps drop out on the gen check), wait for it, then start again. */
   private async fresh(): Promise<void> {
     this.gen++;
+    this.skipProbe = false;          // A5: a restart re-checks the key (a fixed key must not stay "skipped")
     if (this.inflight) await this.inflight.catch(() => undefined);
     await this.start();
   }
@@ -170,15 +177,10 @@ export class BackendManager {
       this.poller.reset();
     }
     this.set({ phase: owned ? 'starting' : this.st.phase === 'reconnecting' ? 'reconnecting' : 'starting', url, port, owned });
-    let s = await this.client.get<Status>('/api/v1/status', undefined, undefined, 5000);
+    const s = await this.client.get<Status>('/api/v1/status', undefined, undefined, 5000);
     if (g !== this.gen) return false;
-    if (!s.ok && s.error.code === 'auth') {
-      const ok = await this.relogin();
-      if (g !== this.gen) return false;
-      if (!ok) { this.set({ phase: 'needs-login', problem: { code: 'auth', message: 'This backend asks for an access code' } }); return false; }
-      s = await this.client.get<Status>('/api/v1/status', undefined, undefined, 5000);
-      if (g !== this.gen) return false;
-    }
+    // client.get already re-logged in once (single-flight, never with a code that failed): a 401 here is final.
+    if (!s.ok && s.error.code === 'auth') { this.needsLogin(); return false; }
     if (!s.ok) {
       if (s.status === 404) { this.set({ phase: 'incompatible', problem: { code: 'old-serve', message: 'the running harness serve predates the app API: restart the backend' } }); return false; }
       this.set({ phase: 'down', problem: { code: s.error.code, message: s.error.message } });
@@ -209,10 +211,33 @@ export class BackendManager {
     }, ms);
   }
 
-  private async relogin(): Promise<boolean> {
+  /** Re-login with the saved code (A1): single-flight, and a code serve refused is not posted again until the
+   * saved code changes, so polling can never run serve's sign-in limiter (10 failures / 10 min) into a block. */
+  private relogin(): Promise<boolean> {
+    if (this.reloginP) return this.reloginP;
+    const p = this.reloginNow().finally(() => { if (this.reloginP === p) this.reloginP = null; });
+    this.reloginP = p;
+    return p;
+  }
+
+  private async reloginNow(): Promise<boolean> {
     const code = this.d.accessCode();
-    if (!code || !this.client) return false;
-    try { return await this.client.login(code); } catch { return false; }
+    this.limited = false;
+    if (!code || !this.client || code === this.failedCode) return false;
+    let r: 'ok' | 'bad' | 'limited';
+    try { r = await this.client.loginStatus(code); } catch { return false; }
+    if (r === 'bad') this.failedCode = code;
+    if (r === 'limited') this.limited = true;
+    return r === 'ok';
+  }
+
+  private limited = false;
+
+  private needsLogin(): void {
+    this.poller.stop();
+    const message = this.limited ? LIMITED_MSG : 'This backend asks for an access code';
+    this.limited = false;
+    this.set({ phase: 'needs-login', problem: { code: 'auth', message } });
   }
 
   private onHealth(ok: boolean, failures: number): void {
@@ -224,7 +249,11 @@ export class BackendManager {
     if (!this.client || (this.st.phase !== 'up' && this.st.phase !== 'reconnecting')) return { ok: false, status: 0 };
     try {
       const r = await this.client.raw(pollPath(q), { timeoutMs: 10000 });
-      if (r.status === 401 && await this.relogin()) return { ok: false, status: 401 };
+      if (r.status === 401) {
+        // A1: a failed re-login is final: needs-login (polling stops) instead of an ordinary failed poll.
+        if (!(await this.relogin()) && (this.st.phase === 'up' || this.st.phase === 'reconnecting')) this.needsLogin();
+        return { ok: false, status: 401 };
+      }
       if (r.status !== 200) return { ok: false, status: r.status };
       const j = JSON.parse(r.body.toString('utf8'));
       if (!j || j.ok !== true || typeof j.topics !== 'object') return { ok: false, status: r.status };
@@ -234,7 +263,7 @@ export class BackendManager {
     } catch { return { ok: false, status: 0 }; }
   }
 
-  private ownsPort(port: number): boolean { return !!this.child && this.childPort === port; }
+  private ownsPort(port: number): boolean { return (!!this.child && this.childPort === port) || (this.ownedPort > 0 && this.ownedPort === port); }
 
   /** Spawn serve, or adopt the one a cancelled start already spawned (H1: never a second child, never a dead end). */
   private async spawnServe(root: string, port: number, g: number): Promise<void> {
@@ -287,6 +316,7 @@ export class BackendManager {
     } finally { if (fd >= 0) { try { closeSync(fd); } catch { /* ignore */ } } }
     this.child = child;
     this.childPort = port;
+    this.ownedPort = port;
     this.children.add(child);
     this.set({ pid: child.pid ?? null });
     let done = false;
@@ -381,14 +411,14 @@ export class BackendManager {
     switch (a.action) {
       case 'start': case 'retry': this.respawns = []; await this.start(); break;
       case 'restart':
-        await this.stopServe(true);
+        await this.waitDown(this.st.url, await this.stopServe(true));
         this.respawns = [];
         await this.fresh();
         break;
       case 'stop': await this.stopServe(true); this.set({ phase: 'down', problem: { code: 'stopped', message: 'backend stopped' } }); break;
       case 'set-root':
         if (!validRoot(a.root)) { this.set({ problem: { code: 'bad-root', message: `${a.root} is not a harness install` } }); break; }
-        await this.stopServe(true);              // the old install's serve must not keep running under the new root
+        await this.waitDown(this.st.url, await this.stopServe(true));   // the old install's serve must not keep running under the new root
         this.d.patchSettings({ backend: { installRoot: a.root } });
         await this.fresh();
         break;
@@ -404,9 +434,10 @@ export class BackendManager {
         this.d.patchSettings({ backend: { hostConsent: true } }); this.set({}); break;
       case 'login': {
         if (!this.client) break;
-        const ok = await this.client.login(a.code).catch(() => false);
-        if (ok) { this.d.saveAccessCode(a.code); await this.attach(this.client.base, this.st.owned, this.gen); }
-        else this.set({ phase: 'needs-login', problem: { code: 'auth', message: 'that access code was not accepted' } });
+        const r = await this.client.loginStatus(a.code).catch(() => 'offline' as const);
+        if (r === 'ok') { this.failedCode = null; this.d.saveAccessCode(a.code); await this.attach(this.client.base, this.st.owned, this.gen); }
+        else this.set({ phase: 'needs-login', problem: { code: 'auth', message: r === 'limited' ? LIMITED_MSG
+          : r === 'offline' ? 'could not reach the backend to sign in' : 'that access code was not accepted' } });
         break;
       }
       case 'create-code': {
@@ -414,9 +445,9 @@ export class BackendManager {
         const r = await runHarness(root, ['serve', 'code', 'add', `desktop-${hostname().replace(/[^A-Za-z0-9._-]/g, '-')}`], { timeoutMs: 30000 });
         const code = r.stdout.trim().split('\n').pop()?.trim() || '';
         if (r.code !== 0 || !code) { this.set({ problem: { code: 'create-code', message: (r.stderr || 'could not create a code').trim().slice(-300) } }); break; }
-        const ok = await this.client.login(code).catch(() => false);
-        if (ok) { this.d.saveAccessCode(code); await this.attach(this.client.base, this.st.owned, this.gen); }
-        else this.set({ phase: 'needs-login', problem: { code: 'auth', message: 'the new code was not accepted' } });
+        const lr = await this.client.loginStatus(code).catch(() => 'offline' as const);
+        if (lr === 'ok') { this.failedCode = null; this.d.saveAccessCode(code); await this.attach(this.client.base, this.st.owned, this.gen); }
+        else this.set({ phase: 'needs-login', problem: { code: 'auth', message: lr === 'limited' ? LIMITED_MSG : 'the new code was not accepted' } });
         break;
       }
     }
@@ -425,18 +456,32 @@ export class BackendManager {
 
   /** Stop an owned serve: SIGTERM every spawned serve's process group first, then `harness serve stop` (capped,
    * L1) for a serve that re-exec'd or was respawned. An attached serve (not ours) is never stopped. */
-  async stopServe(_force: boolean): Promise<void> {
+  async stopServe(_force: boolean): Promise<boolean> {
     this.gen++;
     this.stopping = true;
     this.poller.stop();
     if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
     if (this.reprobeTimer) { clearTimeout(this.reprobeTimer); this.reprobeTimer = null; }
     const kids = [...this.children];
-    if (!this.st.owned && !kids.length) return;
+    if (!this.st.owned && !kids.length) return false;
     for (const c of kids) if (c.pid) { try { process.kill(-c.pid, 'SIGTERM'); } catch { /* gone */ } }
     this.child = null;
     if (this.st.root) await runHarness(this.st.root, ['serve', 'stop'], { timeoutMs: STOP_CLI_MS }).catch(() => null);
     this.set({ owned: false, pid: null });
+    return true;
+  }
+
+  /** A4: after stopping our serve, wait (bounded) until its port stops answering, so the start that follows does not
+   * attach to the old serve as `owned: false` (`harness serve stop` itself waits up to 10 s, longer than STOP_CLI_MS). */
+  private async waitDown(url: string | null, stopped: boolean, ms = WAIT_DOWN_MS): Promise<void> {
+    if (!stopped || !url) return;
+    const c = new ServeClient(url);
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      try { await c.raw('/healthz', { timeoutMs: 1000, maxBytes: 64 * 1024 }); } catch { return; }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    log('warn', `serve at ${url} still answers ${ms} ms after stop`);
   }
 
   /** Spawned serves still alive (tests, diagnostics). */
@@ -466,7 +511,7 @@ export class BackendManager {
 export async function healthz(url: string): Promise<{ state: string; pid: number; stale: boolean } | null> {
   const c = new ServeClient(url);
   try {
-    const r = await c.raw('/healthz', { timeoutMs: 2000 });
+    const r = await c.raw('/healthz', { timeoutMs: 2000, maxBytes: 64 * 1024 });
     if (r.status !== 200) return null;
     return { state: String(r.headers['x-harness-state'] || ''), pid: Number(r.headers['x-harness-pid'] || 0), stale: r.headers['x-harness-stale'] === '1' };
   } catch { return null; }

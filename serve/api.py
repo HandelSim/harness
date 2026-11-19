@@ -95,6 +95,42 @@ def _refresh(key, fn):
             _REFRESHING.discard(key)
 
 
+_STAMPED = {}   # key -> (stamp, value, sure, computed at): see _stamped
+
+
+def _stat_stamp(paths):
+    """(stamp, sure) of paths as Runs.memo stamps them: mtime, size and inode (None for
+    a missing one); not sure when one changed within the last second (a coarse clock
+    can show a second write with the same stat, git's racy check)."""
+    stamp, newest = [], 0
+    for p in paths:
+        try:
+            fs = os.stat(p)
+            stamp.append((fs.st_mtime_ns, fs.st_size, fs.st_ino))
+            newest = max(newest, fs.st_mtime_ns)
+        except OSError:
+            stamp.append(None)
+    return tuple(stamp), newest < (time.time() - 1) * 1e9
+
+
+def _stamped(key, paths, fn, extra=(), floor=0.0):
+    """fn()'s value, kept while paths stat the same (and extra is equal): a poll topic
+    whose files did not change costs its stats, not its reads (review S1-S4). floor:
+    a changed stamp is worked out again at most every floor seconds (a log being
+    written changes its stamp on every poll). The value is shared: never change it."""
+    stamp, sure = _stat_stamp(paths)
+    stamp += tuple(extra)
+    now = time.monotonic()
+    got = _STAMPED.get(key)
+    if got is not None and ((got[0] == stamp and got[2]) or now - got[3] < floor):
+        return got[1]
+    val = fn()
+    if len(_STAMPED) > 4000:
+        _STAMPED.clear()
+    _STAMPED[key] = (stamp, val, sure, now)
+    return val
+
+
 def sig_of(data):
     """The same construction as runs._sig: sha1 of the sorted JSON."""
     return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
@@ -129,6 +165,40 @@ def deny_origin(h):
 Helpers = types.SimpleNamespace
 
 
+def _in_place_index(runs):
+    """{normalised project: [(key, launch windows)]} of the in-place tickets, in folder
+    order: what Runs._in_place_ticket finds for one row, for every row at once."""
+    idx = {}
+    for key in runs._ticket_dirs():
+        st = runs._json(os.path.join(runs.queue_dir, key, "state.json"))
+        if not isinstance(st, dict) or st.get("in_place") is not True or not isinstance(st.get("project"), str):
+            continue
+        got = st.get("launches")
+        wins = [w for w in got if isinstance(w, list) and len(w) == 2 and all(isinstance(x, int) for x in w)] \
+            if isinstance(got, list) else []
+        if wins:
+            idx.setdefault(runs_view._norm(st["project"]), []).append((key, wins))
+    return idx
+
+
+class _Indexed:
+    """runs for runs_view.ticket_agents, its ticket_of_row the request's index: Runs.
+    ticket_sessions looks up each of up to 500 project sessions of an in-place ticket
+    (review S1). Every other attribute, read or written, is runs' own."""
+
+    def __init__(self, runs, ctx):
+        object.__setattr__(self, "_runs", runs)
+        object.__setattr__(self, "ticket_of_row", ctx.ticket_of_row)
+
+    def __getattr__(self, name):
+        if name == "ticket_sessions":   # Runs' own code, with self.ticket_of_row the index's
+            return types.MethodType(type(self._runs).ticket_sessions, self)
+        return getattr(self._runs, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._runs, name, value)
+
+
 class Ctx:
     """One request: the handler, serve's Config, pub's helpers, who is signed in."""
 
@@ -136,6 +206,7 @@ class Ctx:
         self.h, self.cfg, self.helpers, self.user = h, cfg, helpers, user
         self.q = parse_qs(query or "", keep_blank_values=True)
         self._agents = None
+        self._in_place = None
 
     def arg(self, name, default=""):
         v = self.q.get(name)
@@ -172,6 +243,23 @@ class Ctx:
             except Exception:   # a broken debug or findings folder: no labels, not a failed read
                 self._agents = {}
         return self._agents
+
+    def ticket_of_row(self, row):
+        """runs.ticket_of_row with the in-place tickets indexed once per request: Runs
+        scans (stats) every ticket folder for each row, rows x tickets a read (review S1)."""
+        runs = self.runs
+        directory, created = row.get("directory") or "", runs_view._ms(row.get("time_created"))
+        if not runs.queue_dir or not directory:
+            return ""
+        d = runs_view._norm(directory)
+        if d.startswith(os.path.normcase(runs_view._norm(runs.queue_dir).rstrip("/\\") + os.sep)) or not created:
+            return runs.ticket_of(directory, created)   # a clone's folder: no scan
+        if self._in_place is None:
+            self._in_place = _in_place_index(runs)
+        for key, wins in self._in_place.get(d, ()):
+            if any(a <= created and (not b or created <= b) for a, b in wins):
+                return key
+        return ""
 
     def host(self):
         return ((self.h.headers.get("Host") or "127.0.0.1").rsplit(":", 1)[0]) or "127.0.0.1"
@@ -324,21 +412,51 @@ def gates(runs, key, st, archived):
     return g
 
 
-def _ticket_st(runs, key):
-    """ticket_state without the values that are an age (stop_wait: seconds since)."""
-    st = dict(runs.ticket_state(key))
+def _runner_sig(runs):
+    """What of runner() a running ticket's ticket_state reads (it is time-dependent)."""
+    r = runs.runner()
+    return (r.get("running"), r.get("starting"), tuple(tuple(sorted(o.items())) for o in r.get("on") or ()))
+
+
+def _state(runs, key, rs=None):
+    """runs.ticket_state(key), kept while its state.json, notes.json and stop file stat
+    the same, and for a running one while the run's tickets and steps are the same (the
+    queue topic draws every ticket on every poll: review S4). stop_wait is as of the read."""
+    d = os.path.join(runs.queue_dir, key)
+    raw = runs._json(os.path.join(d, "state.json"))
+    extra = ()
+    if isinstance(raw, dict) and raw.get("status") == "running":
+        extra = (_runner_sig(runs) if rs is None else rs,)
+    return _stamped(("st", runs.queue_dir, key),
+                    (os.path.join(d, "state.json"), os.path.join(d, "notes.json"), os.path.join(d, "stop")),
+                    lambda: runs.ticket_state(key), extra)
+
+
+def _ticket_st(runs, key, rs=None):
+    """ticket_state without the values that are an age (stop_wait: seconds since); stuck
+    when a stop has waited longer than the page allows."""
+    st = dict(_state(runs, key, rs))
     st.pop("stop_wait", None)
     if st.get("stopping"):
-        st["stuck"] = bool(runs_view._stuck(runs.ticket_state(key)))
+        try:
+            wait = time.time() - os.path.getmtime(os.path.join(runs.queue_dir, key, "stop"))
+        except OSError:
+            wait = 0
+        st["stuck"] = bool(runs_view._stuck(dict(st, stop_wait=wait)))
     return st
 
 
-def _summary(runs, key, archived):
-    st = _ticket_st(runs, key)
+def _why(st):
+    """runs._why on a _ticket_st: the wait it popped put back as stuck says (review S-L2)."""
+    return runs_view._why(dict(st, stop_wait=runs_view.STUCK_AFTER + 1) if st.get("stuck") else st)
+
+
+def _summary(runs, key, archived, rs=None):
+    st = _ticket_st(runs, key, rs)
     ses = st.get("session") or {}
     return {
         "key": key, "title": st.get("title", ""), "status": st.get("status", ""), "stage": st.get("stage", ""),
-        "step": st.get("step", ""), "reason": st.get("reason", ""), "why": runs_view._why(st),
+        "step": st.get("step", ""), "reason": st.get("reason", ""), "why": _why(st),
         "created": st.get("created", ""), "updated": st.get("updated", ""), "finished": st.get("finished", False),
         "attempt": st.get("attempt", 0), "project": st.get("project", ""), "branch": st.get("branch", ""),
         "stages": st.get("stages", []), "in_place": st.get("in_place", False),
@@ -375,8 +493,9 @@ def _start_gate(r, runs):
 def read_queue(ctx, arg=None):
     runs = ctx.queue
     r = _runner(runs)
-    return {"runner": r, "tickets": [_summary(runs, k, False) for k in runs.ticket_keys()],
-            "archived": [_summary(runs, k, True) for k in runs.archived_keys()],
+    rs = _runner_sig(runs)
+    return {"runner": r, "tickets": [_summary(runs, k, False, rs) for k in runs.ticket_keys()],
+            "archived": [_summary(runs, k, True, rs) for k in runs.archived_keys()],
             "start": _start_gate(r, runs), "modes": ["container", "host", "single"]}
 
 
@@ -421,7 +540,7 @@ def _ticket(ctx, key):
     live = runs.live()
     sessions = []
     try:
-        agents = runs_view.ticket_agents(runs, key)
+        agents = runs_view.ticket_agents(_Indexed(runs, ctx), key)
     except Exception:
         agents = []
     now = time.time()
@@ -432,7 +551,7 @@ def _ticket(ctx, key):
                          "kind": "debug" if a["stage"] == "debug" else "queue",
                          "working": a["id"] in live or now - runs_view._ms(row.get("time_updated")) / 1000
                          <= runs_view.ACTIVE, "created": runs_view._ms(row.get("time_created"))})
-    return {"key": key, "archived": archived, "state": st, "why": runs_view._why(st),
+    return {"key": key, "archived": archived, "state": st, "why": _why(st),
             "actions": gates(runs, key, st, archived), "retry_choices": choices,
             "retry_why": (why or {}).get(None) or "", "edit_lock": list(runs_view._edit_lock(st)),
             "continue_mode": runs_view._continue_mode(st), "sessions": sessions,
@@ -569,7 +688,7 @@ def _session_row(ctx, r, live, now, web):
     sid = r["id"]
     ticket = ""
     try:
-        ticket = runs.ticket_of_row(r)
+        ticket = ctx.ticket_of_row(r)
     except Exception:
         ticket = ""
     agent = ctx.agents().get(sid) or {}
@@ -773,7 +892,12 @@ def read_ingest(ctx, arg=None):
             tail = f.read().decode("utf-8", "replace")
     except (OSError, TypeError):
         tail = ""
-    return {"run": run, "summary": vault_view.ingest_summary(vault), "out_tail": tail}
+    # the vault and ingest topics both read it on each poll: kept while the manifest and
+    # the log stat the same (and 10 s, for the sources' folders it checks are there)
+    summary = _stamped(("ingest", vault), (os.path.join(vault, ".harness", "ingest.json"),
+                                           os.path.join(vault, "wiki", "log.md")),
+                       lambda: vault_view.ingest_summary(vault), (int(time.monotonic() // 10),))
+    return {"run": run, "summary": summary, "out_tail": tail}
 
 
 def read_vault(ctx, arg=None):
@@ -781,7 +905,9 @@ def read_vault(ctx, arg=None):
     found = vault_view.pages(vault)   # {rel: mtime}
     pages = [{"rel": rel, "title": os.path.splitext(os.path.basename(rel))[0], "mtime": found[rel]}
              for rel in sorted(found) if rel.lower().endswith(".md")]
-    return {"name": name, "dir": vault, "facts": vault_view.repo_facts(vault), "pages": pages,
+    # 5 git processes (status walks the tree): 10 s, an expired one served while it refreshes (S2)
+    facts = _cached(("facts", vault), 10, lambda: vault_view.repo_facts(vault))
+    return {"name": name, "dir": vault, "facts": facts, "pages": pages,
             "ingest": read_ingest(ctx), "log": [{"sha": a, "author": b, "when": c, "subject": d} for a, b, c, d in
                                                 (ctx.cfg.cache.get(("git", vault),
                                                                    lambda: ctx.helpers.vault_log(vault)) or [])]}
@@ -918,7 +1044,23 @@ def read_jira(ctx, arg=None):
 
 
 def read_debug(ctx, arg=None):
-    return runs_view.debug_reports(ctx.queue)
+    """debug_reports reads every report and launch.out: kept while the folders and each
+    run's files stat the same (review S3); a run writing its log is read again at most
+    every 2 s."""
+    runs = ctx.queue
+    top = runs_view.debug_dir(runs)
+    paths = [os.path.join(top, "runs"), os.path.join(top, "reports")]
+    try:
+        for n in sorted(os.listdir(paths[0])):
+            d = os.path.join(paths[0], n)
+            paths += [d, os.path.join(d, "report.md"), os.path.join(d, "launch.out"), os.path.join(d, "session.log")]
+    except OSError:
+        pass
+    try:
+        paths += [os.path.join(paths[1], n) for n in sorted(os.listdir(paths[1]))]
+    except OSError:
+        pass
+    return _stamped(("debug", top), paths, lambda: runs_view.debug_reports(runs), floor=2)
 
 
 def read_debug_report(ctx, kind, name):

@@ -1,7 +1,8 @@
 // OS notifications (W22, review M4): diff the `queue` topic and the app update state, and show a native
 // notification (bridge.notify.show -> Electron Notification in main) only while the window is not focused.
 // Per-kind toggles live in settings.notifications. Rate limited: at most LIMIT per WINDOW_MS, several events
-// of one kind in one poll collapse into one notification. Pure parts are exported for node tests.
+// of one kind in one poll collapse into one notification. Events over the limit are held, not dropped (N1): when
+// the window frees they are shown as one collapsed summary. Pure parts are exported for node tests.
 import { effect, type ReadonlySignal } from '@preact/signals-core';
 import type { Queue, TicketStatus } from '../../shared/api';
 import type { AppUpdateState, Settings } from '../../shared/ipc';
@@ -56,6 +57,19 @@ export class RateLimit {
     this.at.push(now);
     return true;
   }
+  /** ms until allow() can be true again (0 = now). */
+  waitMs(now: number): number {
+    this.at = this.at.filter((t) => now - t < this.windowMs);
+    return this.at.length < this.limit ? 0 : this.windowMs - (now - this.at[0]) + 1;
+  }
+}
+
+/** One notification for several held notes of different kinds (N1). */
+export function summary(ns: Note[]): Note {
+  if (ns.length === 1) return ns[0];
+  const route = ns.every((n) => n.route === ns[0].route) ? ns[0].route : 'view:queue';
+  return { kind: ns[0].kind, id: `held:${ns.map((n) => n.id).join(',')}`.slice(0, 190), title: `${ns.length} queue updates`,
+    body: ns.map((n) => n.title).join('\n').slice(0, 1500), route };
 }
 
 export interface NotifyDeps {
@@ -65,6 +79,8 @@ export interface NotifyDeps {
   focused: () => boolean;
   show: (n: { id: string; title: string; body: string; route: string }) => unknown;
   now?: () => number;
+  /** Timer for the held-notes flush (tests inject a fake). */
+  later?: (fn: () => void, ms: number) => () => void;
 }
 
 /** Wire the diffing; returns a disposer. State is diffed even while focused, so returning focus never replays old events. */
@@ -73,13 +89,31 @@ export function startNotify(d: NotifyDeps): () => void {
   const now = d.now || Date.now;
   let snap: QueueSnap | null = null;
   let lastPhase: AppUpdateState['phase'] | null = null;
+  const later = d.later || ((fn: () => void, ms: number) => { const t = setTimeout(fn, ms); return () => clearTimeout(t); });
+  const held: Note[] = [];
+  let cancel: (() => void) | null = null;
+  const show = (n: Note) => {
+    try { void Promise.resolve(d.show({ id: n.id, title: n.title, body: n.body, route: n.route })).catch(() => {}); } catch { /* bridge gone */ }
+  };
+  const arm = () => { if (!cancel && held.length) cancel = later(flush, Math.max(rl.waitMs(now()), 50)); };
+  function flush(): void {
+    cancel = null;
+    const s = d.settings.value?.notifications;
+    if (!s || d.focused()) { held.length = 0; return; }   // the owner is looking at the app (or turned them off)
+    const ns = collapse(held.filter((x) => s[x.kind]));
+    if (!ns.length) { held.length = 0; return; }
+    if (!rl.allow(now())) { arm(); return; }
+    held.length = 0;
+    show(summary(ns));
+  }
   const emit = (notes: Note[]) => {
     const s = d.settings.value?.notifications;
     if (!s || d.focused()) return;
     for (const n of collapse(notes.filter((x) => s[x.kind]))) {
-      if (!rl.allow(now())) return;
-      try { void Promise.resolve(d.show({ id: n.id, title: n.title, body: n.body, route: n.route })).catch(() => {}); } catch { /* bridge gone */ }
+      if (!held.length && rl.allow(now())) show(n);
+      else held.push(n);                                 // N1: held until the window frees, then one summary
     }
+    arm();
   };
   const offQ = effect(() => {
     const q = d.queue.value;
@@ -95,7 +129,7 @@ export function startNotify(d: NotifyDeps): () => void {
     if (u.phase === 'ready' && was !== null && was !== 'ready')
       emit([{ kind: 'update', id: `update:${u.next || ''}`, title: 'Update ready', body: `Harness Desktop ${u.next || ''} is downloaded. Restart to update.`.replace('  ', ' '), route: 'view:updates' }]);
   });
-  return () => { offQ(); offU(); };
+  return () => { offQ(); offU(); cancel?.(); cancel = null; };
 }
 
 /** notify:click route -> what to open. */

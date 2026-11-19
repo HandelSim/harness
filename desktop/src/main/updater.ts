@@ -94,6 +94,9 @@ export class Updater {
   async check(): Promise<AppUpdateState> {
     const au = this.load();
     if (!au) return this.st;
+    // N3: an update already downloaded (or downloading) stays as it is: a scheduled check must not leave `ready`
+    // (each return to `ready` is a new "Update ready" notification)
+    if (this.st.phase === 'ready' || this.st.phase === 'downloading') return this.st;
     try { this.set({ phase: 'checking', reason: '' }); await au.checkForUpdates(); }
     catch (e) { this.set({ phase: 'error', reason: String((e as Error)?.message || e).slice(0, 500) }); }
     return this.st;

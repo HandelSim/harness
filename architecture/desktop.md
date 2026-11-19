@@ -59,8 +59,8 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
 - Otherwise main spawns serve in its own process group. Failures are
   classified from the output (needs-config, key-locked, key-rejected, port in
   use, python missing). A locked key restarts serve with
-  `HARNESS_SKIP_AUTH_PROBE=1`. Respawns back off 1, 5 and 15 s, at most 3 in
-  5 minutes.
+  `HARNESS_SKIP_AUTH_PROBE=1`; a restart, set-root or create-env probes the
+  key again. Respawns back off 1, 5 and 15 s, at most 3 in 5 minutes.
 - `start()` is single-flight: a retry, restart, set-root or create-env during
   a start joins it or adopts the serve already spawned. Every spawned serve
   is tracked until it exits, so quit can stop it.
@@ -71,6 +71,14 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   next 10 ports for a serve of this install and attaches to it, then picks a
   free port.
 - `HARNESS_DESKTOP_SERVE_URL` sets attach-only mode, which never spawns serve.
+- Access codes: on a 401, polls and GETs share one re-login (single-flight).
+  A code serve refuses is never posted again until the saved code changes,
+  and the phase becomes `needs-login` (polling stops), so the app cannot run
+  serve's sign-in limiter (10 failures in 10 min, then 429) into a block. A
+  429 to a typed code says sign-in is blocked, not that the code is wrong.
+- Every request to serve has a wall-clock deadline (connect included) and a
+  64 MiB response cap (64 KiB for `/healthz`). Ownership is kept by port, so
+  a serve this app started stays owned after a respawn attaches to it.
 - Live data comes from one multiplexed conditional poll
   (`/api/v1/poll?t=topic~sig`) of the topics visible panels subscribe to.
   Cadence is 1 s when busy (2 s when busy and blurred), 3 s when focused, 5 s
@@ -84,7 +92,9 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   transcript renders the newest 200 messages, with "Show earlier".
 - Quit policy: keep-if-busy (default), stop, or keep. An attached serve that
   the app did not start is never stopped. Stop sends SIGTERM to each owned
-  serve's process group, then runs `harness serve stop` (5 s cap).
+  serve's process group, then runs `harness serve stop` (5 s cap). Restart
+  and set-root then wait (up to 12 s) until the old port stops answering, so
+  the new start does not attach to the old serve as not-owned.
 
 ## Terminals (`src/main/pty/`)
 
@@ -123,6 +133,10 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
      stdin, never on argv where `ps` shows it)
   3. check it with `harness unlock`
   4. if upstream rejects it, go back to the previous key automatically
+- Vault operations run one at a time in main (IPC handlers share one queue);
+  the Keys view disables its row buttons while one runs. The direct probe
+  always settles (deadline, and a cut-short answer is `unknown`). A harness
+  whose `config set` has no `--stdin` is refused before `.env` is touched.
 - Secrets never reach the renderer or the logs. The renderer gets `chars` (the
   length) and `last4` only for secrets of 16+ characters (a short PIN or
   access code would be mostly given away). A key locks 14 days after the
@@ -138,7 +152,9 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   - the app is a dev build
   - on Linux, the app is not an AppImage
 - `settings.updates.auto` turns both the background checks (30 s after start,
-  then every 6 h) and auto-download on or off; a manual check always works.
+  then every 6 h) and auto-download on or off; a manual check always works,
+  except that a check while an update is downloading or ready does nothing
+  (the ready update stays, and "Update ready" is not notified again).
 - Restart to update first runs the quit shutdown (state and settings flushed,
   serve per the quit policy, PTYs killed, 8 s cap) and releases the
   single-instance lock, then calls `quitAndInstall`. The AppImage starts the
@@ -148,7 +164,9 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   `harness upgrade --no-prompt`. One job of each kind runs at a time (a second
   request gets the running job's id); the last 8 jobs keep a 64 KB output tail
   (`harness:jobs`). CLI children run in their own process group, and a
-  timeout kills the whole group.
+  timeout kills the whole group. Jobs time out too (check-updates 2 min,
+  doctor 5 min, upgrade 15 min, serve-stop 1 min), are stopped on quit, and a
+  check-updates during an upgrade is refused.
 - The Updates view confirms Restart to update and Upgrade first, listing what
   they interrupt (`app:busy`: open terminals, a running queue run, running
   jobs). Opening the view re-attaches to a running upgrade / check job
@@ -161,7 +179,9 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   hidden: a ticket needs the owner (questions, plan review, blocked), a
   ticket is done, the queue run ended, an update is ready.
 - Per-kind toggles in `settings.notifications`. At most 4 per minute; several
-  events of one kind in one poll collapse into one. A click routes to the
+  events of one kind in one poll collapse into one. Events over the limit are
+  held and shown as one summary when the window frees (dropped if the window
+  gets focus first). A click routes to the
   ticket panel or the view (`notify:click`).
 
 ## Background and glass (`src/background/`, `src/renderer/core/background.ts`)
@@ -173,19 +193,37 @@ Phases: `locating -> no-install | needs-config | starting -> up`, plus
   translucent layer of `--surface-0`. Tab strips and `.view` are transparent;
   cards, inputs, menus and terminals stay opaque.
 - The alphas are computed (`views/background/surface.ts`): the lowest alpha
-  at which text-1/2/3 keep 4.5:1 over every palette ramp stop the engine can
-  draw, scaled by `appearance.seeThrough` (0 = opaque). Written to `<html>`
-  as `--panel-alpha-auto` / `--chrome-alpha-auto` on every appearance change.
+  at which every text colour used on glass (text-1/2/3, status `--*-text`,
+  `--accent-11`, `--icon`) keeps 4.5:1 over every palette ramp stop and the
+  ramp's per-channel max, scaled by `appearance.seeThrough` (0 = opaque).
+  Effects must stay inside that bound (aurora soft-knees to it in the dark
+  theme; no additive compositing). Written to `<html>` as
+  `--panel-alpha-auto` / `--chrome-alpha-auto` whenever `bindAppearance`
+  re-applies (`appearanceTick`): settings writes and OS theme /
+  reduced-motion changes alike; the engine theme follows the same tick.
   Glass off, `prefers-contrast: more` and `prefers-reduced-transparency`
-  force alpha 1.
+  force alpha 1 (the last two in `glass.css`, after `base.css`).
+- `appearance.accent` is a preset name (`ACCENT_PRESETS` in
+  `shared/ipc.ts`; `[data-accent]` in `tokens.css`). Any other stored value,
+  e.g. an old hex, loads as `iris`.
+- `background.onBattery: static` pauses the engine on battery power
+  (`power:state`); the last frame stays.
 - Low power (`src/background/gpu.ts`): `auto` turns on when the WebGL
   renderer is software (SwiftShader, llvmpipe, ...). Animated backgrounds run
   at 20 fps and half scale; tracers and grayscott draw their CSS variant. The
   per-device override (`auto` / `on` / `off`) is in localStorage
   `harness.bg.lowPower` and in the background picker.
 - The governor steps down one rung (never up) on sustained worker frame cost
-  or on main-thread jank: rAF-interval p95 > 34 ms or long tasks > 25 % of a
-  2 s window, reported by the renderer about once a second.
+  or on main-thread jank, reported by the renderer about once a second over a
+  2 s window: rAF-interval p95 above `max(34, 2 x display frame + 4)` ms
+  (display frame = lowest 10th-percentile interval seen, so 30 Hz displays
+  are not jank), or long tasks > 25 % of the window. The worker rung ignores
+  long tasks and the frames that overlap them (app work, not the scene). No
+  report counts during the first 5 s after engine start; a window resize
+  restarts the window.
+- A WebGL context loss that is not restored within 4 s (no new frame while
+  visible) marks GL broken and falls to the next rung; so does a second loss
+  within 60 s.
 
 ## Where state lives
 

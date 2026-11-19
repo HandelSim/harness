@@ -51,7 +51,11 @@ export class PtyClient {
         const t = this.terms.get(m.id);
         if (t) { t.info.exited = { code: m.code ?? 0, signal: m.signal ?? 0 }; this.reapLater(m.id, t); }
         this.d.emit('pty:exit', { id: m.id, code: m.code ?? 0, signal: m.signal ?? 0 });
-      } else if (m.t === 'spawned') { this.waits.get(m.id)?.({ ok: true, pid: m.pid ?? 0 }); this.waits.delete(m.id); }
+      } else if (m.t === 'spawned') {
+        const w = this.waits.get(m.id);
+        // P1: an answer after the 10 s wait gave up: nobody holds that pty, so it could never be killed; kill it now
+        if (w) { w({ ok: true, pid: m.pid ?? 0 }); this.waits.delete(m.id); } else if (!this.terms.has(m.id)) p.postMessage({ t: 'kill', id: m.id });
+      }
       else if (m.t === 'error') { const w = this.waits.get(m.id); if (w) { w({ ok: false, message: m.message || 'spawn failed' }); this.waits.delete(m.id); } }
       else if (m.t === 'pong') { this.pings.get(m.n!)?.({ mem: m.mem ?? 0, unacked: m.unacked ?? 0 }); this.pings.delete(m.n!); }
     });

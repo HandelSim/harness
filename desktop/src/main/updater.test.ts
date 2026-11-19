@@ -58,3 +58,16 @@ test('M10: updates.auto controls background checks and auto-download', async () 
   assert.equal(u.scheduled(), false);
   assert.equal(au.autoDownload, false);
 });
+
+test('N3: a check while an update is ready leaves it ready (no second "Update ready")', async () => {
+  const { u, au } = mk();
+  await u.check(); await u.download();
+  assert.equal(u.st.phase, 'ready');
+  const phases: string[] = [];
+  const set = (u as unknown as { set: (p: object) => void }).set.bind(u);
+  (u as unknown as { set: (p: { phase?: string }) => void }).set = (p) => { if (p.phase) phases.push(p.phase); set(p); };
+  await u.check();
+  assert.equal(u.st.phase, 'ready');
+  assert.deepEqual(phases, []);
+  assert.equal(au.calls.filter((c) => c === 'check').length, 1);
+});

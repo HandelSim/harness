@@ -833,6 +833,140 @@ class VaultPathTest(ApiTest):
         self.assertNotIn("secret", d["error"]["message"])
 
 
+def _age(*paths, by=30):
+    """Set paths' mtimes by seconds into the past: a stamp read now is a sure one."""
+    t = time.time() - by
+    for p in paths:
+        if os.path.exists(p):
+            os.utime(p, (t, t))
+
+
+class PollCostTest(ApiTest):
+    """Review 2 S1-S4: a poll of an unchanged state costs stats, not reads."""
+
+    def counting(self, obj, name):
+        orig, calls = getattr(obj, name), []
+
+        def wrap(*a, **k):
+            calls.append(a)
+            return orig(*a, **k)
+        p = mock.patch.object(obj, name, wrap)
+        p.start()
+        self.addCleanup(p.stop)
+        return calls
+
+    def st_paths(self, key):
+        d = os.path.join(self.fx.queue, key)
+        return [os.path.join(d, f) for f in ("state.json", "notes.json", "stop")] + [d, self.fx.queue]
+
+    def test_s1_sessions_never_scan_ticket_folders_per_row(self):
+        proj = os.path.join(self.fx.root, "proj")
+        self.fx.ticket("INP-1", in_place=True, project=proj, status="done", launches=[[0, 0]])
+        for i in range(20):
+            self.fx.ticket(f"PAD-{i}", status="done")
+        scans = self.counting(runs.Runs, "_in_place_ticket")
+        rows = self.ok("/sessions?all=1")
+        self.assertEqual(scans, [])   # one index per request, not a scan per row
+        by = {r["directory"]: r["ticket"] for r in rows}
+        self.assertEqual(by[proj], "INP-1")
+        self.assertEqual(by[os.path.join(self.fx.queue, "ABC-12", "repo")], "ABC-12")
+        # the same answers as Runs' own per-row lookup
+        r = self.fx.cfg.runs
+        want = [r.ticket_of_row(dict(x)) or None for x in r.sessions(roots_only=False, limit=runs.LIST_CAP)]
+        self.assertEqual([x["ticket"] for x in rows], want)
+
+    def test_s1_in_place_ticket_sessions_from_the_index(self):
+        proj = os.path.join(self.fx.root, "proj")
+        self.fx.ticket("INP-1", in_place=True, project=proj, status="done", launches=[[0, 0]])
+        r = self.fx.cfg.runs
+        want = [a["id"] for a in runs.ticket_agents(r, "INP-1")]
+        self.assertTrue(want)
+        scans = self.counting(runs.Runs, "_in_place_ticket")
+        got = self.ok("/tickets/INP-1")["sessions"]
+        self.assertEqual([s["sid"] for s in got], want)
+        self.assertEqual(scans, [])
+
+    def test_s4_queue_reads_ticket_state_only_when_its_files_change(self):
+        for i in range(5):
+            self.fx.ticket(f"Q-{i}", status="queued", stage="plan")
+        for k in ["ABC-12"] + [f"Q-{i}" for i in range(5)]:
+            _age(*self.st_paths(k))
+        calls = self.counting(runs.Runs, "ticket_state")
+        first = self.ok("/queue")
+        self.assertGreaterEqual(len(calls), 6)
+        del calls[:]
+        self.assertEqual(self.ok("/queue"), first)
+        self.assertEqual(calls, [])
+        self.fx.ticket("Q-3", status="plan-review", stage="plan", reason="the plan waits")
+        _age(*self.st_paths("Q-3"))
+        got = {t["key"]: t for t in self.ok("/queue")["tickets"]}
+        self.assertEqual((got["Q-3"]["status"], got["Q-3"]["why"]), ("plan-review", "the plan waits"))
+        self.assertEqual([c[1] for c in calls], ["Q-3"])
+
+    def test_s4_running_ticket_follows_the_run_and_a_stuck_stop_says_so(self):
+        self.fx.ticket("ABC-12", status="running", stage="implement")
+        self.fx.run_on("ABC-12", stage="implement", step="agent")
+        _age(*self.st_paths("ABC-12"))
+        t = self.ok("/queue")["tickets"][0]
+        self.assertEqual((t["status"], t["step"]), ("running", "agent"))
+        self.fx.run_on("ABC-12", stage="implement", step="verify")   # the run moved on: state.json did not change
+        t = self.ok("/queue")["tickets"][0]
+        self.assertEqual(t["step"], "verify")
+        stop = os.path.join(self.fx.queue, "ABC-12", "stop")
+        open(stop, "w").close()
+        _age(stop, by=5)
+        t = self.ok("/queue")["tickets"][0]
+        self.assertEqual((t["stopping"], t["stuck"]), (True, False))
+        self.assertTrue(t["why"].startswith("stopping:"), t["why"])
+        _age(stop, by=120)   # S-L2: the API's why says stuck, as the web page's does
+        t = self.ok("/queue")["tickets"][0]
+        self.assertEqual((t["stopping"], t["stuck"]), (True, True))
+        self.assertTrue(t["why"].startswith("still stopping"), t["why"])
+        self.assertTrue(self.ok("/tickets/ABC-12")["why"].startswith("still stopping"))
+
+    def test_s2_vault_facts_and_ingest_summary_once(self):
+        facts = self.counting(api.vault_view, "repo_facts")
+        summ = self.counting(api.vault_view, "ingest_summary")
+        _age(os.path.join(self.fx.vault, "wiki", "log.md"))
+        for _ in range(3):
+            r, d = self.fx.get("/poll?t=vault&t=ingest")
+            self.assertEqual(r.status, 200)
+            self.assertIn("data", d["topics"]["vault"], d)
+            self.assertIn("summary", d["topics"]["ingest"]["data"])
+        self.assertEqual(len(facts), 1)   # 5 git processes, at most once in 10 s
+        self.assertEqual(len(summ), 1)    # the vault and ingest topics share it
+        os.makedirs(os.path.join(self.fx.vault, ".harness"), exist_ok=True)
+        with open(os.path.join(self.fx.vault, ".harness", "ingest.json"), "w") as f:
+            json.dump({"units": {"raw:a": {"status": "ok", "page": "wiki/a.md", "at": "2026"}}}, f)
+        _age(os.path.join(self.fx.vault, ".harness", "ingest.json"))
+        got = self.ok("/vault/ingest")["summary"]
+        self.assertEqual((len(summ), got["has"]), (2, True))
+
+    def test_s3_debug_reports_read_again_only_when_a_run_changes(self):
+        top = os.path.join(self.fx.state, "debug")
+        names = [f"20261119-00000{i}-ABC-{i}" for i in range(3)]
+        for n in names:
+            os.makedirs(os.path.join(top, "runs", n))
+            with open(os.path.join(top, "runs", n, "report.md"), "w") as f:
+                f.write(f"# Report {n}\n")
+        _age(*[os.path.join(top, "runs", n, "report.md") for n in names],
+             *[os.path.join(top, "runs", n) for n in names], os.path.join(top, "runs"))
+        calls = self.counting(runs, "debug_reports")
+        first = self.ok("/debug")
+        self.assertEqual(len(first), 3)
+        self.assertEqual(self.ok("/debug"), first)
+        self.assertEqual(len(calls), 1)
+        path = os.path.join(top, "runs", names[1], "report.md")
+        with open(path, "w") as f:
+            f.write("# A new title\n")
+        _age(path)
+        key = ("debug", runs.debug_dir(self.fx.cfg.runs))
+        api._STAMPED[key] = api._STAMPED[key][:3] + (0,)   # past the 2 s floor
+        got = {r["name"]: r["title"] for r in self.ok("/debug")}
+        self.assertEqual(got[names[1]], "A new title")
+        self.assertEqual(len(calls), 2)
+
+
 class CacheTest(unittest.TestCase):
     """_cached: an expired value is served at once while one thread gets the next (A-6)."""
 

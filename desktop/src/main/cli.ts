@@ -10,7 +10,7 @@ export function cliEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
 }
 
 /** Signal a detached child's whole process group (falls back to the child alone). */
-function killGroup(child: ChildProcess, sig: NodeJS.Signals): void {
+export function killGroup(child: ChildProcess, sig: NodeJS.Signals): void {
   try { if (child.pid) { process.kill(-child.pid, sig); return; } } catch { /* not a group leader / gone */ }
   try { child.kill(sig); } catch { /* gone */ }
 }
@@ -42,16 +42,24 @@ export function runHarness(root: string, args: string[], o: { timeoutMs?: number
 export type JobKind = JobInfo['job'];
 const JOB_TAIL = 64 * 1024;
 const JOB_RING = 8;
+/** J1: a job that runs longer than this is stopped (git waiting on the network or a credential prompt). */
+export const JOB_TIMEOUT_MS: Record<JobKind, number> = { doctor: 5 * 60000, 'check-updates': 2 * 60000, upgrade: 15 * 60000, 'serve-stop': 60000 };
+/** Something that can stop a started job (startJob returns the child). */
+export interface JobHandle { kill(sig?: NodeJS.Signals): unknown }
 
 /** Harness CLI jobs (M3): one running job per kind (a second request gets the running job's id back), and a
  * small ring of recent jobs with an output tail so a reopened Updates panel can re-attach. */
 export class Jobs {
   private seq = 0;
   private ring: JobInfo[] = [];
+  private stops = new Map<string, (why: string) => void>();   // running job id -> stop it (J1)
   constructor(private d: {
-    start(root: string, args: string[], onChunk: (s: string) => void, onExit: (code: number) => void): void;
+    start(root: string, args: string[], onChunk: (s: string) => void, onExit: (code: number) => void): JobHandle | null | void;
     emit(ch: 'job:output' | 'job:exit', p: unknown): void;
     done?(job: JobKind, output: string, code: number): void;
+    timeoutMs?: Partial<Record<JobKind, number>>;
+    /** After a stop, how long to wait for the process to exit before the job is reported ended anyway. */
+    graceMs?: number;
   }) {}
 
   static args(job: JobKind): string[] {
@@ -61,6 +69,8 @@ export class Jobs {
   run(job: JobKind, root: string | null): { id: string } {
     const live = this.ring.find((j) => j.running && j.job === job);
     if (live) return { id: live.id };
+    // J1: a check while an upgrade runs would contend on the clone's git lock and read a half-updated tree
+    const blocked = job === 'check-updates' && this.ring.some((j) => j.running && j.job === 'upgrade');
     const info: JobInfo = { id: `job-${++this.seq}`, job, running: true, code: null, startedAt: Date.now(), output: '' };
     this.ring.push(info);
     while (this.ring.length > JOB_RING) { const i = this.ring.findIndex((j) => !j.running); if (i < 0) break; this.ring.splice(i, 1); }
@@ -70,29 +80,59 @@ export class Jobs {
       info.output = (info.output + c).slice(-JOB_TAIL);
       this.d.emit('job:output', { id: info.id, chunk: c });
     };
+    let timer: NodeJS.Timeout | null = null;
+    let force: NodeJS.Timeout | null = null;
     const exit = (code: number) => {
+      if (!info.running) return;                  // once: the process may still close after a forced end
       info.running = false; info.code = code;
+      if (timer) clearTimeout(timer);
+      if (force) clearTimeout(force);
+      this.stops.delete(info.id);
       try { this.d.done?.(job, all, code); } finally { this.d.emit('job:exit', { id: info.id, code }); }
     };
     // async so the caller gets the id before any output event
-    setTimeout(() => { if (!root) { chunk('no harness install\n'); exit(127); } else this.d.start(root, Jobs.args(job), chunk, exit); }, 0);
+    setTimeout(() => {
+      if (!root) { chunk('no harness install\n'); exit(127); return; }
+      if (blocked) { chunk('an upgrade is running: check for updates again when it has finished\n'); exit(1); return; }
+      const h = this.d.start(root, Jobs.args(job), chunk, exit) || null;
+      if (!info.running) return;
+      const stop = (why: string) => {
+        if (!info.running || force) return;
+        chunk(`\n[desktop] ${why}: stopping ${job}\n`);
+        try { h?.kill('SIGTERM'); } catch { /* gone */ }
+        force = setTimeout(() => { try { h?.kill('SIGKILL'); } catch { /* gone */ } exit(124); }, this.d.graceMs ?? 3000);
+        force.unref?.();
+      };
+      this.stops.set(info.id, stop);
+      const ms = this.d.timeoutMs?.[job] ?? JOB_TIMEOUT_MS[job];
+      timer = setTimeout(() => stop(`no end after ${Math.round(ms / 1000)} s`), ms);
+      timer.unref?.();
+    }, 0);
     return { id: info.id };
   }
 
   list(): JobInfo[] { return this.ring.map((j) => ({ ...j })); }
+  /** J1: stop every running job (app quit); resolves once each has ended or was given up on. */
+  async stopAll(why = 'the app is quitting'): Promise<void> {
+    const ids = [...this.stops.keys()];
+    for (const id of ids) this.stops.get(id)?.(why);
+    const t0 = Date.now();
+    while (this.ring.some((j) => j.running && ids.includes(j.id)) && Date.now() - t0 < (this.d.graceMs ?? 3000) + 500) await new Promise((r) => setTimeout(r, 50));
+  }
   running(): JobKind[] { return this.ring.filter((j) => j.running).map((j) => j.job); }
 }
 
-/** Streams a job's output; returns the child so callers can kill it. */
+/** Streams a job's output; returns a handle whose kill() signals the job's whole process group (J1: git and
+ * friends it started go too). */
 export function startJob(root: string, args: string[], onChunk: (s: string) => void, onExit: (code: number) => void,
-  env: Record<string, string> = {}): ChildProcess | null {
+  env: Record<string, string> = {}): JobHandle | null {
   try {
-    const child = spawn('bash', [`${root}/harness`, ...args], { cwd: root, env: cliEnv(env), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('bash', [`${root}/harness`, ...args], { cwd: root, env: cliEnv(env), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     const f = framer(onChunk);
     child.stdout!.on('data', f); child.stderr!.on('data', f);
     child.on('error', (e) => onChunk(`${e}\n`));
     child.on('close', (code) => { f.flush(); onExit(code ?? 1); });
-    return child;
+    return { kill: (sig: NodeJS.Signals = 'SIGTERM') => killGroup(child, sig) };
   } catch (e) { onChunk(String(e)); onExit(127); return null; }
 }
 

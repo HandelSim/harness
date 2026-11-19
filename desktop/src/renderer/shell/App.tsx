@@ -1,5 +1,5 @@
 // The shell (PLAN 3.1): title bar, rail, sidebar, dock, status bar, overlays.
-import { useEffect, useRef } from 'preact/hooks';
+import { useEffect, useRef, useLayoutEffect } from 'preact/hooks';
 import { backend, online, appState, keyState, platform, store, useTopic, liveHealth, windowState } from '../core/app';
 import { bridge } from '../core/bridge';
 import { toasts, dismiss } from '../core/toast';
@@ -179,7 +179,8 @@ function Toasts() {
 
 function DialogHost() {
   const d = dialog.value;
-  useEffect(() => {
+  // layout effect: an Escape pressed right after the dialog paints must already close it
+  useLayoutEffect(() => {
     if (!d) return;
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); closeDialog(); } };
     window.addEventListener('keydown', k);

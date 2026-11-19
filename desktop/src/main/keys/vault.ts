@@ -2,11 +2,12 @@
 // kind is written to .env with `harness config set`. Secrets never leave main after entry.
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { readFileSync, statSync } from 'node:fs';
 import type { SafeStorage } from 'electron';
 import type { KeyKind, KeyMeta, KeyOpResult, KeyProbe, KeyVaultState } from '../../shared/ipc';
 import type { ConfigRow } from '../../shared/api';
 import { loadJson, saveJson, isObj } from '../store';
-import { runHarness, parseConfigTsv, maskedChars, cliEnv, type RunResult } from '../cli';
+import { runHarness, parseConfigTsv, maskedChars, cliEnv, killGroup, type RunResult } from '../cli';
 import { locksAt } from './lifecycle';
 import { classifyUnlock, probeDirect } from './probe';
 import { log } from '../log';
@@ -17,7 +18,25 @@ interface Entry extends Omit<KeyMeta, 'locksAt'> { enc: string | null }
 interface File { version: 1; storeInactive: boolean; keys: Entry[] }
 
 export interface VaultDeps { file: string; safe: SafeStorage; root: () => string | null; emit: (s: KeyVaultState) => void;
-  run?: typeof runHarness; runStdin?: typeof runHarnessStdin; probe?: typeof probeDirect }
+  run?: typeof runHarness; runStdin?: typeof runHarnessStdin; probe?: typeof probeDirect;
+  /** K3: whether this install's `harness config set KEY --stdin` reads stdin (default: stdinSupported). */
+  stdinOk?: (root: string) => boolean }
+
+const stdinMemo = new Map<string, { mtime: number; ok: boolean }>();
+/** K3: a harness older than `config set KEY --stdin` stores the literal "--stdin" and exits 0. Its script has
+ * `_config_set()` without any `--stdin`; anything else (a newer harness, a test double) is taken as capable. */
+export function stdinSupported(root: string): boolean {
+  const f = `${root}/harness`;
+  try {
+    const mtime = statSync(f).mtimeMs;
+    const m = stdinMemo.get(f);
+    if (m && m.mtime === mtime) return m.ok;
+    const txt = readFileSync(f, 'utf8');
+    const ok = !txt.includes('_config_set()') || txt.includes('--stdin');
+    stdinMemo.set(f, { mtime, ok });
+    return ok;
+  } catch { return true; }   // unreadable: the CLI call itself reports the failure
+}
 
 /** M8: `harness <args>` with `input` written to its stdin, so a secret never sits on argv (`ps`, /proc/<pid>/cmdline). */
 export function runHarnessStdin(root: string, args: string[], input: string, o: { timeoutMs?: number } = {}): Promise<RunResult> {
@@ -25,13 +44,14 @@ export function runHarnessStdin(root: string, args: string[], input: string, o: 
     let out = ''; let err = ''; let timedOut = false;
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn('bash', [`${root}/harness`, ...args], { cwd: root, env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+      // K7: own process group, so a timeout also ends what the CLI forked (and the pipes they hold)
+      child = spawn('bash', [`${root}/harness`, ...args], { cwd: root, env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     } catch (e) { resolve({ code: 127, stdout: '', stderr: String(e), timedOut: false }); return; }
     child.stdout!.on('data', (c: Buffer) => { if (out.length < 200_000) out += c.toString('utf8'); });
     child.stderr!.on('data', (c: Buffer) => { if (err.length < 200_000) err += c.toString('utf8'); });
     child.stdin!.on('error', () => { /* EPIPE: the CLI exited early; its exit code says why */ });
     child.stdin!.end(input + '\n');
-    const t = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 2000).unref(); }, o.timeoutMs ?? 60000);
+    const t = setTimeout(() => { timedOut = true; killGroup(child, 'SIGTERM'); setTimeout(() => killGroup(child, 'SIGKILL'), 2000).unref(); }, o.timeoutMs ?? 60000);
     child.on('error', (e) => { err += String(e); });
     child.on('close', (code, sig) => { clearTimeout(t); resolve({ code: code ?? (sig ? 128 : 1), stdout: out, stderr: err, timedOut }); });
   });
@@ -47,9 +67,13 @@ export class KeyVault {
   private rows: ConfigRow[] = [];
   private mem = new Map<string, string>();      // secrets held only for this run (insecure backend)
   private run: typeof runHarness; private runIn: typeof runHarnessStdin; private probeD: typeof probeDirect;
+  private q: Promise<unknown> = Promise.resolve();   // K2: vault operations run one at a time
   constructor(private d: VaultDeps) {
     const r = loadJson<File>(d.file, () => ({ version: 1, storeInactive: false, keys: [] }), (raw) =>
-      isObj(raw) && raw.version === 1 && Array.isArray(raw.keys) ? (raw as unknown as File) : null);
+      isObj(raw) && raw.version === 1 && Array.isArray(raw.keys)
+        // K5: a hand-edited entry that is not a key record is dropped, not allowed to throw at startup
+        ? ({ ...raw, keys: raw.keys.filter((e) => isObj(e) && typeof e.id === 'string' && typeof e.kind === 'string') } as unknown as File)
+        : null);
     this.f = r.value;
     if (r.recovered) log('warn', `keys.json unreadable, moved to ${r.recovered}`);
     this.run = d.run || runHarness; this.runIn = d.runStdin || runHarnessStdin; this.probeD = d.probe || probeDirect;
@@ -80,6 +104,13 @@ export class KeyVault {
     return { secure: s.secure, backend: s.backend, storeInactive: this.f.storeInactive,
       keys: this.f.keys.map(({ enc: _e, ...k }) => ({ ...k, locksAt: k.kind === 'ACCESS_CODE' ? null : locksAt(k.createdAt, k.lastUnlockAt) })),
       env: this.env };
+  }
+
+  /** K2: run `op` after every earlier queued operation has settled (IPC handlers go through this). */
+  serial<T>(op: () => T | Promise<T>): Promise<T> {
+    const p = this.q.then(op, op);
+    this.q = p.catch(() => undefined);
+    return p;
   }
 
   private save(): void { saveJson(this.d.file, this.f, 0o600); this.d.emit(this.state()); }
@@ -134,6 +165,8 @@ export class KeyVault {
   private async writeEnv(kind: KeyKind, secret: string): Promise<{ ok: boolean; msg: string }> {
     const root = this.d.root();
     if (!root) return { ok: false, msg: 'no harness install' };
+    if (!(this.d.stdinOk || stdinSupported)(root))
+      return { ok: false, msg: 'this harness install is too old for the app (no `harness config set KEY --stdin`): update harness first; .env was not changed' };
     const r = await this.runIn(root, ['config', 'set', kind, '--stdin'], secret, { timeoutMs: 30000 });
     // never echo the CLI output verbatim: it could contain the value
     return { ok: r.code === 0, msg: r.code === 0 ? `${kind} written to .env` : 'harness config set failed' };
@@ -178,7 +211,7 @@ export class KeyVault {
     const secure = this.storageInfo().secure;
     for (const e of this.f.keys) {
       if (on && !e.enc && this.mem.has(e.id)) { const enc = this.encrypt(this.mem.get(e.id)!); if (enc) { e.enc = enc; this.mem.delete(e.id); } }
-      if (!on && !secure && e.enc) { const sec = this.secretOf(e); if (sec) this.mem.set(e.id, sec); e.enc = null; }
+      if (!on && !secure && e.enc) { const sec = this.secretOf(e); if (sec) { this.mem.set(e.id, sec); e.enc = null; } }
     }
     this.save();
     return { ok: true, state: this.state(), msg: on ? 'inactive keys are kept (obfuscated, not encrypted by an OS keyring)' : 'inactive keys are no longer stored on disk' };
@@ -198,7 +231,7 @@ export class KeyVault {
     const prev = this.f.keys.find((x) => x.kind === e.kind && x.active && x.id !== id) || null;
     const w = await this.writeEnv(e.kind, secret);
     if (!w.ok) { this.save(); return this.fail('config-set', w.msg); }
-    const canon = await this.probeActive(e.kind);
+    const canon = await this.probeActive(e.kind, null);   // K1: recorded on the candidate below, not on `prev`
     if (canon.state === 'rejected') {
       const ps = prev ? this.secretOf(prev) : null;
       if (prev && ps) {
@@ -218,7 +251,9 @@ export class KeyVault {
     e.probe = canon.state === 'unknown' ? cand : canon;
     if (e.probe.state === 'ok' && cand.state === 'locked') e.lastUnlockAt = Date.now();
     // single-key mode: an inactive key is not kept when there is no keyring
-    if (prev && !this.storageInfo().secure && !this.f.storeInactive) { prev.enc = null; this.mem.delete(prev.id); }
+    // K6: only on a backend known to have no keyring; a keyring that is locked or not started right now keeps it
+    const si = this.storageInfo();
+    if (prev && !si.secure && (si.backend === 'basic_text' || si.backend === 'none') && !this.f.storeInactive) { prev.enc = null; this.mem.delete(prev.id); }
     await this.refreshEnv();
     this.save();
     return { ok: true, state: this.state(), msg: 'Active key changed. Revoke the old key in the upstream portal when you are ready' };
@@ -236,14 +271,15 @@ export class KeyVault {
   }
 
   /** Canonical probe of the active key (`harness unlock`); only the upstream key has one. */
-  async probeActive(kind: KeyKind): Promise<KeyProbe> {
+  async probeActive(kind: KeyKind, record?: Entry | null): Promise<KeyProbe> {
     const now = Date.now();
     const root = this.d.root();
     if (!root) return { state: 'unknown', at: now, message: 'no harness install' };
     if (kind !== 'PROXY_API_KEY') return { state: 'unknown', at: now, message: 'no check for this kind of key' };
     const r = await this.run(root, ['unlock'], { timeoutMs: 60000 });
     const p = classifyUnlock(r.code, r.stdout + '\n' + r.stderr, now);
-    const act = this.f.keys.find((k) => k.kind === kind && k.active);
+    // record: undefined = the entry flagged active; null = nobody (activate() stores the result itself)
+    const act = record === undefined ? this.f.keys.find((k) => k.kind === kind && k.active) : record;
     if (act) { if (p.state === 'ok' && act.probe?.state === 'locked') act.lastUnlockAt = now; act.probe = p; this.save(); }
     return p;
   }
@@ -279,18 +315,18 @@ export class KeyVault {
       return { kind: kind(o.kind), label: v.str(o.label ?? '', 'label', 200), secret: v.str(o.secret, 'secret', 8000),
         createdAt: date(o.createdAt, 'createdAt') ?? undefined, expiresAt: date(o.expiresAt, 'expiresAt') ?? undefined,
         team: o.team === true, activate: o.activate === true };
-    }, (k) => this.add(k), err);
+    }, (k) => this.serial(() => this.add(k)), err);
     handle('keys:update', (p) => {
       const o = v.obj(p);
       return { id: v.str(o.id, 'id', 64), label: v.optStr(o.label, 'label', 200), createdAt: date(o.createdAt, 'createdAt'),
         expiresAt: date(o.expiresAt, 'expiresAt'), team: typeof o.team === 'boolean' ? o.team : undefined };
-    }, (k) => this.update(k), err);
-    handle('keys:remove', (p) => v.str(v.obj(p).id, 'id', 64), (id) => this.remove(id), err);
-    handle('keys:activate', (p) => v.str(v.obj(p).id, 'id', 64), (id) => this.activate(id), err);
+    }, (k) => this.serial(() => this.update(k)), err);
+    handle('keys:remove', (p) => v.str(v.obj(p).id, 'id', 64), (id) => this.serial(() => this.remove(id)), err);
+    handle('keys:activate', (p) => v.str(v.obj(p).id, 'id', 64), (id) => this.serial(() => this.activate(id)), err);
     handle('keys:probe', (p) => { const o = v.obj(p); return 'active' in o ? { active: kind(o.active) } : { id: v.str(o.id, 'id', 64) }; },
-      (t) => this.probe(t), (message) => ({ state: 'unknown', at: Date.now(), message }));
-    handle('keys:clear-active', (p) => kind(v.obj(p).kind), (k) => this.clearActive(k), err);
+      (t) => this.serial(() => this.probe(t)), (message) => ({ state: 'unknown', at: Date.now(), message }));
+    handle('keys:clear-active', (p) => kind(v.obj(p).kind), (k) => this.serial(() => this.clearActive(k)), err);
     handle('keys:set-store-inactive', (p) => { const on = v.obj(p).on; if (typeof on !== 'boolean') throw new Error('on must be a boolean'); return on; },
-      (on) => this.setStoreInactive(on), err);
+      (on) => this.serial(() => this.setStoreInactive(on)), err);
   }
 }

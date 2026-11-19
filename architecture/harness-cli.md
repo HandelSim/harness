@@ -39,7 +39,7 @@ upstream calls (auth probe, model lists, doctor) hand curl the
 `Authorization` header as a config on stdin (`_curl_auth_config | curl -K
 -`), so the key does not show in `ps` (`harness config set PROXY_API_KEY
 <key>` takes it as an argument; `config set KEY --stdin` reads it from stdin
-instead, which is what the desktop app's key vault uses).
+instead, which is what the desktop app's key vault and serve's Settings page use).
 
 Independent, but not equivalent: compose's dotenv parser reads an unquoted
 value to end of line, while `source` ends the assignment at the first space or
@@ -205,7 +205,10 @@ installer. Three commands cover post-install setup:
   - Reads use `_config_read_key` (straight from `$env_file`, so they reflect
     on-disk state). Writes use `_config_write_key` — the same atomic
     temp-file + `mv` read-loop the installer uses (no `sed`, so values with
-    `/ & : @` need no escaping; appends the key if absent).
+    `/ & : @` need no escaping; appends the key if absent). The temp file is
+    created under `umask 077` and then given `.env`'s own mode (GNU `stat -c`,
+    else BSD `stat -f`), so `.env` stays 600 after `config set` whatever the
+    caller's umask (it used to land 644 until the next command's `chmod`).
   - Secret-ish keys (name matches `*KEY*|*SECRET*|*TOKEN*|*PASSWORD*` via
     `_config_is_secret`) are shown masked (`(set, N chars)`) and prompted with
     a hidden read.
@@ -1147,7 +1150,9 @@ for the same reason) and keeps `run.json` (`pid`, `started`, `beat` every 3 s,
 `host`, `single`, `model`, `watch`, `ticket`, `stage`, and `step`: cloning, the agent
 is working, the agent ended, asking the verifier, a verifier retry's wait,
 checking that the upstream answers, waiting for work), deleted on exit; a `beat` over 30 s old
-means no run. SIGTERM (a shutdown, serve's `end_process`, a kill) and SIGHUP (the
+means no run, and so does one from the future (`0 <= now - beat < 30`, in the queue
+and in serve's `runner()` and slot check alike: a machine back up with its clock
+behind the last beat is not shown running, and serve's Start and resume work). SIGTERM (a shutdown, serve's `end_process`, a kill) and SIGHUP (the
 terminal closed) end a run as Ctrl-C does (`Terminated`, a `KeyboardInterrupt`;
 a parallel parent sends it on to each slot), exit 128+N, but leave `run.json`
 with its beat already stale (`ended: "signal N"`), so serve's start runs it
@@ -2478,7 +2483,8 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   command a terminal user would type, with no terminal (stdin /dev/null, new
   session, `HARNESS_INSTALL_ROOT` = the parent of `--state-dir`), so nothing
   waits on a prompt. Model and keys: `config list --tsv`, one form, Save runs
-  `config set` for each changed value (secrets and URLs with a password are
+  `config set KEY --stdin` for each changed value, the value on stdin so it is
+  never on argv (`ps`) nor in a timeout message (secrets and URLs with a password are
   password fields: blank keeps, a typed value replaces, "clear it" empties;
   never echoed). Network allowlist: `net list`, `net allow [--git-push]`,
   `net deny`. MCP: `mcp list --available`, install/enable/disable. Access
@@ -3003,7 +3009,16 @@ serve stop` (TERM to the serve.pid shell, then the same port sweep) all run
 `_serve_end`: INT ignored while it runs, the opencode tree ended (`taskkill
 /T` on its Windows pid under Git Bash), both children signalled and polled
 for up to 5 s, then the sweep; the EXIT trap also removes serve.pid and
-reaps the jq sidecar (it replaces main's). The proxy stays up. `harness
+reaps the jq sidecar (it replaces main's). The proxy stays up.
+`serve_running` trusts the serve.pid pid only while its command line (`/proc`,
+else `ps -o command=`) is `<this harness> serve ...`: the word before `serve`
+resolved (absolute, or relative from `/proc/PID/cwd`) must be this script; a
+pid reused by another program after a reboot or kill -9, or one that merely
+names harness (the host proxy, a queue run), is no serve, so it is never sent
+USR1 or TERM. `host_proxy_pid` likewise trusts `state/host/proxy.pid` only
+while an argument of that pid is `$clone_dir/proxy/proxy.py` (taken as before
+where no command line can be read, and on Git Bash, whose pid is MSYS's for a
+native Windows python); otherwise the pid file is dropped. `harness
 upgrade` runs `harness_serve_refresh`: USR1 to a running serve, which ends
 its children and `exec`s the clone's new `harness serve` with its original
 arguments in the same terminal; the upgrade waits for the new stamp. Keys:
@@ -3030,7 +3045,9 @@ reaches the whole foreground group. A pipe, a service or a background job
 gets the old `wait -n` and the banner without the key.
 `cmd_serve` also sets `harness_git_nosign_env`, so agents opencode web
 starts commit unsigned like `harness host` ones. Logs:
-`state/serve/{pub,opencode}.log`. `tests/unit_serve_test.sh` runs
+`state/serve/{pub,opencode}.log`; pub.log leaves out the polls that went well
+(GET/HEAD 200 or 304 of `/api/v1/poll`, `/live`, `*/live`, `/healthz`), which
+every open client sends every few seconds and would grow it without bound. `tests/unit_serve_test.sh` runs
 `serve/test_pub.py` (index, Host check, sandbox header, path escape, access
 codes, `/_auth`, usage, git log, proxy status) and `serve/test_runs.py`
 (the run viewer over a fixture opencode DB: list, transcript, escaping, tail,
@@ -3108,7 +3125,15 @@ endpoint calls: `status home queue sessions findings findings-agent vault
 ingest debug ticket:<KEY> session:<sid>`; a removed ticket or session is
 `{"gone": true}`. One failing topic is an `error` entry; the rest answer.
 `/status` caches proxy health 5 s and the git version 60 s (`_cached`: only the
-first call waits; an expired value is served while one thread fetches the next). A 500
+first call waits; an expired value is served while one thread fetches the next). The
+per-poll topics are cached on stat stamps (`_stamped`: mtime, size, inode; a file
+changed within the last second is read again): `queue` keeps each ticket's
+`ticket_state` while its state.json, notes.json and stop file stat the same (a
+running one also while the run's steps are), `debug` keeps the report list while the
+debug folders and each run's files do (a run writing its log: at most every 2 s),
+`ingest`'s summary while the manifest and `wiki/log.md` do; `vault`'s `facts` (5 git
+processes) are `_cached` 10 s; `sessions` and `ticket:<K>` match in-place tickets from
+one index per request, not a scan of every ticket folder per row. A 500
 `internal` names the exception type only (the text, which can hold paths, goes to serve's log).
 
 **Reads (GET).** `/status`, `/opencode` (`{port, url, user, password}`; 404
@@ -3306,7 +3331,13 @@ users on flaky networks still get the banner; the cache is only used for the
 branch that wrote it (a legacy bare-SHA cache counts as `main`), and a branch
 origin doesn't have never caches one. Skipped entirely when
 `HARNESS_SKIP_UPDATE_CHECK=1`, when not in a git checkout, or on a detached
-HEAD. Advisory only — never gates a launch. The lookup
+HEAD, and for a queue stage's launch (`HARNESS_QUEUE_LAUNCH`: its banner
+goes to an output file nobody reads). Origin is asked at most once per
+`HARNESS_UPDATE_CHECK_TTL` seconds (default 1800): the stamp
+`state/.harness-update-asked` is touched before each lookup, reachable or not,
+so an offline launch pays the timeout once per window; inside the window the
+cache answers (a stamp from the future, a clock set back, does not hold the
+window shut). Advisory only — never gates a launch. The lookup
 (`_update_remote_head`) uses `timeout` where it exists and otherwise (macOS)
 a background `git ls-remote` killed at the deadline, with no credential
 prompt.

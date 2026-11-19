@@ -47,22 +47,30 @@ export function classifyUnlock(code: number, out: string, now: number): KeyProbe
   return { state: 'unknown', at: now, message: out.trim().split('\n').slice(-2).join(' ').slice(0, 300) || `exit ${code}` };
 }
 
-/** POST <base>/v1/chat/completions with max_tokens 1 (30 s), like _probe_upstream_auth. */
+/** POST <base>/v1/chat/completions with max_tokens 1 (30 s), like _probe_upstream_auth. Always settles (K4): one
+ * wall-clock deadline (connect included), and a response cut short resolves 'unknown'. */
 export function probeDirect(baseUrl: string, key: string, model: string, timeoutMs = 30000): Promise<KeyProbe> {
   return new Promise((resolve) => {
     const now = Date.now();
     let u: URL;
     try { u = new URL(apiBase(baseUrl) + '/v1/chat/completions'); } catch { resolve({ state: 'unknown', at: now, message: 'bad upstream URL' }); return; }
+    let done = false;
+    const settle = (p: KeyProbe) => { if (done) return; done = true; clearTimeout(timer); resolve(p); };
+    const lost = (why: string) => settle({ state: 'unknown', at: Date.now(), message: `could not reach upstream: ${why}`.slice(0, 300) });
     const body = JSON.stringify({ model: model || 'probe', max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] });
     const mod = u.protocol === 'https:' ? https : http;
     const req = mod.request(u, { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(body) } }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (c: Buffer) => { if (chunks.length < 64) chunks.push(c); });
-      res.on('end', () => resolve(classifyProbe(res.statusCode || 0, Buffer.concat(chunks).toString('utf8'), Date.now())));
+      res.on('end', () => settle(classifyProbe(res.statusCode || 0, Buffer.concat(chunks).toString('utf8'), Date.now())));
+      res.on('error', (e) => lost(e.message));
+      res.on('aborted', () => lost('the answer was cut short'));
+      res.on('close', () => lost('the answer was cut short'));
     });
-    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
-    req.on('error', (e) => resolve({ state: 'unknown', at: Date.now(), message: `could not reach upstream: ${e.message}` }));
+    const timer = setTimeout(() => { lost(`no answer in ${timeoutMs} ms`); req.destroy(); }, timeoutMs);
+    req.on('error', (e) => lost(e.message));
+    req.on('close', () => lost('connection closed'));
     req.end(body);
   });
 }

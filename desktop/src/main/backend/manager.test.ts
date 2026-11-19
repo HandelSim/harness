@@ -142,3 +142,36 @@ test('L11: create-env writes .env with mode 0600', { timeout: 30000 }, async () 
     assert.equal(statSync(join(root, '.env')).mode & 0o777, 0o600);
   } finally { await m.onQuit().catch(() => {}); rmSync(root, { recursive: true, force: true }); }
 });
+
+test('A3: ownership is kept by port, not by the child handle: a start after a respawn-attach still owns serve', { timeout: 60000 }, async () => {
+  const root = fakeRoot();
+  const port = await freePort();
+  const { m } = mk(root, port);
+  try {
+    await m.start();
+    assert.equal(m.st.phase, 'up');
+    assert.equal(m.st.owned, true);
+    const [pid] = m.spawned();
+    // What scheduleRespawn leaves behind after the child handle is gone but serve answers on our port
+    (m as unknown as { child: unknown }).child = null;
+    await m.action({ action: 'retry' });
+    assert.equal(m.st.phase, 'up');
+    assert.equal(m.st.owned, true, 'the serve this app started is still ours');
+    await m.onQuit();
+    await until(() => !alive(pid), 10000);
+  } finally { await m.onQuit().catch(() => {}); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('A5: a fresh start clears skipProbe (a fixed key is probed again)', { timeout: 60000 }, async () => {
+  const root = fakeRoot();
+  const port = await freePort();
+  const { m } = mk(root, port);
+  try {
+    await m.start();
+    assert.equal(m.st.phase, 'up');
+    (m as unknown as { skipProbe: boolean }).skipProbe = true;      // what a key-rejected spawn left behind
+    await m.action({ action: 'create-env' });                       // .env exists: only the fresh start runs
+    assert.equal((m as unknown as { skipProbe: boolean }).skipProbe, false);
+    assert.equal(m.st.phase, 'up');
+  } finally { await m.onQuit().catch(() => {}); rmSync(root, { recursive: true, force: true }); }
+});

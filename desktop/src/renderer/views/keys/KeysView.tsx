@@ -1,6 +1,7 @@
 // Keys view (3.11): the OS key vault (bridge.keys). Secrets are write-only: the renderer sends a new secret once and only
 // ever shows label + last 4 (only for secrets of 16+ chars, else the length: L10). Lock timing (locksAt) and probe state come from main; nothing is re-derived here.
 import { useEffect, useState } from 'preact/hooks';
+import { signal } from '@preact/signals';
 import type { PanelCtx } from '../../shell/dock';
 import { keyState, offlineReason } from '../../core/app';
 import { bridge } from '../../core/bridge';
@@ -20,9 +21,17 @@ const KINDS: { kind: KeyKind; label: string; hint: string }[] = [
 ];
 const kindLabel = (k: KeyKind) => KINDS.find((x) => x.kind === k)?.label ?? k;
 
-async function run(p: Promise<KeyOpResult>, okMsg?: string): Promise<boolean> {
+/** K2: key operations in flight. Main runs them one at a time; the row buttons are disabled meanwhile so a second
+ * click cannot queue a switch the user did not mean (e.g. Make active on B, then on C, while B is still probing). */
+export const keyOpsBusy = signal(0);
+export async function busyWhile<T>(p: () => Promise<T>): Promise<T> {
+  keyOpsBusy.value++;
+  try { return await p(); } finally { keyOpsBusy.value--; }
+}
+
+async function run(p: () => Promise<KeyOpResult>, okMsg?: string): Promise<boolean> {
   try {
-    const r = await p;
+    const r = await busyWhile(p);
     keyState.value = r.state;
     if (r.ok) { toast({ kind: r.reverted ? 'warn' : 'ok', title: r.msg || okMsg || 'Done' }); return true; }
     toast({ kind: 'err', title: r.error.message }); return false;
@@ -40,7 +49,7 @@ function AddKey({ kind: k0 }: { kind?: KeyKind }) {
     setErr('');
     if (!secret.trim()) { setErr('Paste the key.'); return; }
     try {
-      const r = await bridge.keys.add({ kind, label: label.trim() || kindLabel(kind), secret: secret.trim(), team, activate });
+      const r = await busyWhile(() => bridge.keys.add({ kind, label: label.trim() || kindLabel(kind), secret: secret.trim(), team, activate }));
       keyState.value = r.state;
       if (!r.ok) { setErr(r.error.message); return; }
       setSecret('');
@@ -89,6 +98,7 @@ export function secretHint(k: Pick<KeyMeta, 'last4' | 'chars'>): string {
 }
 
 function KeyRow({ k }: { k: KeyMeta }) {
+  const busy = keyOpsBusy.value > 0;
   const d = daysUntil(k.locksAt);
   const exp = daysUntil(k.expiresAt);
   return (
@@ -107,10 +117,10 @@ function KeyRow({ k }: { k: KeyMeta }) {
         </div>
       </div>
       <div class="row" style={{ gap: 'var(--sp-1)' }}>
-        <Button size="sm" variant="ghost" icon="check" onClick={() => bridge.keys.probe({ id: k.id }).then(() => bridge.keys.list()).then((s) => { keyState.value = s; })}>Test</Button>
-        {!k.active ? <Button size="sm" testid={`key-activate-${k.id}`} onClick={() => run(bridge.keys.activate(k.id), 'Key activated')}>Make active</Button> : null}
-        <Button size="sm" variant="ghost" iconOnly icon="trash" aria-label={`Remove ${k.label}`} title="Remove"
-          onClick={async () => { if (window.confirm(`Remove the key “${k.label}”?`)) await run(bridge.keys.remove(k.id), 'Key removed'); }} />
+        <Button size="sm" variant="ghost" icon="check" disabled={busy} onClick={() => busyWhile(() => bridge.keys.probe({ id: k.id }).then(() => bridge.keys.list())).then((s) => { keyState.value = s; })}>Test</Button>
+        {!k.active ? <Button size="sm" testid={`key-activate-${k.id}`} disabled={busy} onClick={() => run(() => bridge.keys.activate(k.id), 'Key activated')}>Make active</Button> : null}
+        <Button size="sm" variant="ghost" iconOnly icon="trash" aria-label={`Remove ${k.label}`} title="Remove" disabled={busy}
+          onClick={async () => { if (window.confirm(`Remove the key “${k.label}”?`)) await run(() => bridge.keys.remove(k.id), 'Key removed'); }} />
       </div>
     </div>
   );
@@ -134,7 +144,7 @@ export default function KeysView({ ctx }: { ctx: PanelCtx }) {
         {st && !st.secure ? (
           <label class="check" data-testid="keys-store-inactive" title="Without an OS keyring only the active key (in .env) is kept unless you opt in.">
             <input type="checkbox" checked={st.storeInactive}
-              onChange={(e) => { const on = (e.target as HTMLInputElement).checked; void run(bridge.keys.setStoreInactive(on)); }} />
+              onChange={(e) => { const on = (e.target as HTMLInputElement).checked; void run(() => bridge.keys.setStoreInactive(on)); }} />
             Keep inactive keys on this computer (obfuscated, not encrypted)
           </label>
         ) : null}

@@ -64,3 +64,15 @@ test('L4: replay ring keeps the last 256 KiB as chunks and flattens on attach', 
   assert.equal(r.replay.length, 256 * 1024);
   assert.ok(r.replay.endsWith('END'));
 });
+
+test('P1: a spawned answer after the wait gave up kills that pty in the host', async () => {
+  const { c, host } = mk(30);
+  const a = await c.spawn({ kind: 'plain', cwd: '/tmp' }, 80, 24);
+  assert.ok(a.ok);
+  host.emit('message', { t: 'spawned', id: 'tlate1', pid: 999 });   // no wait for it any more
+  assert.deepEqual(host.sent.at(-1), { t: 'kill', id: 'tlate1' });
+  assert.equal(c.list().length, 1, 'no record for the late one');
+  const n = host.sent.length;
+  host.emit('message', { t: 'spawned', id: a.ok ? a.id : '', pid: 1 });  // a duplicate for a live terminal is not killed
+  assert.equal(host.sent.length, n);
+});
