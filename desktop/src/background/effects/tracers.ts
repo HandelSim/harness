@@ -1,4 +1,4 @@
-// B7: particles integrated with RK4 on a 3D attractor, slow yaw, additive short trails.
+// B7: particles integrated with RK4 on a 3D attractor, slow yaw, short alpha-blended trails.
 import type { Effect, Ctx2D, EffectInit } from './types';
 import { fitCanvas } from './types';
 import { type Palette, toCss, mix } from '../palette';
@@ -69,7 +69,9 @@ export function makeTracers2d(ctx: Ctx2D, init: EffectInit): Effect {
     draw() {
       ctx.globalCompositeOperation = 'source-over';
       ctx.fillStyle = fade; ctx.fillRect(0, 0, W, H);
-      ctx.globalCompositeOperation = pal.dark ? 'lighter' : 'source-over';
+      // source-over in both themes: 'lighter' summed strokes past c3 (to white in dense cores), which breaks the
+      // surface contrast floor; alpha compositing toward the stroke colours stays inside the ramp.
+      ctx.globalCompositeOperation = 'source-over';
       ctx.lineWidth = Math.max(0.6, W / 900);
       for (let pass = 0; pass < 2; pass++) {
         ctx.strokeStyle = pass === 0 ? colA : colB;

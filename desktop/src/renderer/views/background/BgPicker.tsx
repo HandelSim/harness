@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { BgConfig, BgDescriptor } from '../../../shared/bg';
 import { bgCatalog, bgEngine, bgStats, bgError, currentBgTheme, previewBg, bgLowPower, setLowPower, lowPowerPlan, applySurfaceAlphas, type LowPowerMode } from '../../core/background';
-import { settings, patchSettings } from '../../core/app';
+import { settings, patchSettings, appearanceTick } from '../../core/app';
 import { popover } from '../../shell/ui';
 import { Button, Seg } from '../../ui/kit';
 
@@ -11,11 +11,13 @@ const GROUPS: Record<string, string> = { static: 'Static', flow: 'Flow', chaos: 
 
 function Thumb({ d }: { d: BgDescriptor }) {
   const [url, setUrl] = useState('');
+  void appearanceTick.value;   // re-render after theme or accent changes (OS theme flips too)
+  const look = `${document.documentElement.dataset.theme}|${document.documentElement.dataset.accent}`;
   useEffect(() => {
     let alive = true;
     bgEngine()?.thumbnail(d.id, 160, 100, currentBgTheme()).then((u) => { if (alive) setUrl(u); }, () => {});
     return () => { alive = false; };
-  }, [d.id, document.documentElement.dataset.theme]);
+  }, [d.id, look]);
   return <div class="bg-thumb" style={url ? { backgroundImage: `url("${url}")` } : undefined} />;
 }
 

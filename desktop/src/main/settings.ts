@@ -1,5 +1,5 @@
 // Settings defaults, validation and env (PLAN 6.4). The ONLY place defaults for paths/ports/URLs live.
-import type { Settings } from '../shared/ipc';
+import { ACCENT_PRESETS, type Settings } from '../shared/ipc';
 import type { BgConfig } from '../shared/bg';
 import { shapeMerge, isObj } from './store';
 
@@ -10,7 +10,7 @@ export const DEFAULT_BG_CONFIG: BgConfig = { id: 'mesh', seed: 1, params: {}, in
 
 export function defaultSettings(): Settings {
   return {
-    appearance: { theme: 'dark', accent: '#7c9cff', density: 'comfortable', uiScale: 1, glass: true, seeThrough: 0.5,
+    appearance: { theme: 'dark', accent: 'iris', density: 'comfortable', uiScale: 1, glass: true, seeThrough: 0.5,
       reduceMotion: 'system' },
     background: { config: { ...DEFAULT_BG_CONFIG, params: {} }, onBlur: 'dim', onBattery: 'static', rotate: 'never' },
     terminal: { fontFamily: 'JetBrains Mono Variable, monospace', fontSize: 13, lineHeight: 1.2, cursorBlink: true,
@@ -25,7 +25,7 @@ export function defaultSettings(): Settings {
 }
 
 const ENUMS: Record<string, readonly string[]> = {
-  'appearance.theme': ['dark', 'light', 'system'], 'appearance.density': ['comfortable', 'compact'],
+  'appearance.accent': ACCENT_PRESETS, 'appearance.theme': ['dark', 'light', 'system'], 'appearance.density': ['comfortable', 'compact'],
   'appearance.reduceMotion': ['system', 'on', 'off'], 'background.onBlur': ['run', 'dim', 'pause'],
   'background.onBattery': ['run', 'static'], 'background.rotate': ['never', 'daily', 'launch'],
   'sessions.restore': ['tabs', 'tabs-and-resume', 'none'], 'sessions.defaultKind': ['agent', 'host', 'shell', 'plain'],
@@ -52,7 +52,11 @@ export function validateSettings(s: Settings, fallback: Settings = defaultSettin
   };
   const o = s as unknown as Record<string, unknown>;
   const f = fallback as unknown as Record<string, unknown>;
-  for (const [p, vals] of Object.entries(ENUMS)) if (!vals.includes(get(o, p) as string)) set(o, p, get(f, p));
+  const d = defaultSettings() as unknown as Record<string, unknown>;
+  // A bad value takes the fallback's, or the default when the fallback is bad too (an old hex accent -> 'iris').
+  for (const [p, vals] of Object.entries(ENUMS)) {
+    if (!vals.includes(get(o, p) as string)) set(o, p, vals.includes(get(f, p) as string) ? get(f, p) : get(d, p));
+  }
   for (const [p, [lo, hi]] of Object.entries(RANGES)) {
     const v = get(o, p);
     if (typeof v !== 'number' || !Number.isFinite(v)) set(o, p, get(f, p));
@@ -60,7 +64,6 @@ export function validateSettings(s: Settings, fallback: Settings = defaultSettin
   }
   s.backend.port = Math.round(s.backend.port);
   if (s.backend.installRoot !== null && typeof s.backend.installRoot !== 'string') s.backend.installRoot = null;
-  if (!/^#[0-9a-fA-F]{6}$/.test(s.appearance.accent)) s.appearance.accent = fallback.appearance.accent;
   const km: Record<string, string> = {};
   for (const [k, v] of Object.entries(s.keymap || {})) if (typeof v === 'string' && k.length < 100 && v.length < 100) km[k] = v;
   s.keymap = km;

@@ -44,4 +44,5 @@ html[data-glass="on"][data-see-through="1"] .dv-groupview .view { background: tr
 :root { --tab-active-bg: rgba(255,255,255,0.06); }
 [data-theme="light"] { --tab-active-bg: rgba(0,0,40,0.05); }
 @media (prefers-reduced-transparency: reduce) { :root { --chrome-alpha: 1; --panel-alpha: 1; } }
+@media (prefers-contrast: more) { :root { --chrome-alpha: 1; --panel-alpha: 1; } }   /* after base.css, so it wins */
 html[data-glass="on"] .dockview-theme-harness .dv-tabs-overflow-container { background-color: var(--surface-1); }

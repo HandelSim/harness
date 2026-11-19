@@ -10,7 +10,11 @@ import { MainRunner } from './mainrunner';
 import { EFFECTS } from './effects/registry';
 import { renderThumb } from './thumb';
 import { probeGpu, lowPowerActive, lowPowerPlan, isLowPowerMode, LOW_POWER_REASON, type GpuInfo, type LowPowerMode } from './gpu';
-import { JankMeter, type JankSummary } from './jank';
+import { JankMeter, workerJank, type JankSummary } from './jank';
+import { RestoreWatch } from './restore';
+
+/** Jank windows that start this soon after the engine is created are app start-up, not the background. */
+export const JANK_WARMUP_MS = 5000;
 
 type Rung = 'worker' | 'main2d' | 'css';
 interface Layer { id: number; el: HTMLElement; cfg: BgConfig; kind: 'css' | 'worker' | 'main2d'; main?: MainRunner; canvas?: HTMLCanvasElement }
@@ -50,6 +54,18 @@ class Engine implements BgEngine {
   private lowMode: LowPowerMode = 'auto';
   private jankMeter: JankMeter | null = null;
   private lastReason = '';
+  private bornAt = typeof performance !== 'undefined' ? performance.now() : 0;
+  private layerFrames = 0;                 // last stats frame count of the current worker layer
+  private restore = new RestoreWatch({
+    setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+    canJudge: () => this.effState().state !== 'pause',
+    onGiveUp: (id) => {
+      const l = this.layer;
+      if (this.disposed || !l || l.id !== id) return;
+      this.gpuBroken = 'WebGL context not restored';
+      void this.apply(l.cfg, 0, true, false, this.gpuBroken);
+    },
+  });
 
   constructor(root: HTMLElement, opts: BgCreateOpts) {
     this.root = root; this.opts = opts;
@@ -81,7 +97,7 @@ class Engine implements BgEngine {
   setTheme(theme: BgTheme): void {
     if (sameJson(theme, this.theme)) return;
     this.theme = { ...theme };
-    this.thumbs.clear();
+    this.dropThumbs();
     this.post({ t: 'theme', theme: this.theme });
     const l = this.layer;
     if (l?.kind === 'css') this.paintCss(l.el, l.cfg);
@@ -136,6 +152,7 @@ class Engine implements BgEngine {
     this.ro?.disconnect();
     this.layer?.main?.dispose();
     this.worker?.terminate(); this.worker = null;
+    this.restore.clear();
     for (const p of this.thumbs.values()) p.then((u) => URL.revokeObjectURL(u), () => {});
     this.thumbs.clear();
     this.root.replaceChildren();
@@ -143,6 +160,12 @@ class Engine implements BgEngine {
   }
 
   // ---------------------------------------------------------------- internals
+  /** Theme/accent change: forget cached thumbnails and revoke their blob URLs once the picker has re-rendered. */
+  private dropThumbs(): void {
+    const old = Array.from(this.thumbs.values());
+    this.thumbs.clear();
+    if (old.length) setTimeout(() => { for (const p of old) p.then((u) => URL.revokeObjectURL(u), () => {}); }, 30_000);
+  }
   private effState(): { state: BgRunState; reduced: boolean } {
     return { state: this.hidden ? 'pause' : this.runState, reduced: this.reduced };
   }
@@ -169,7 +192,8 @@ class Engine implements BgEngine {
     const l = this.layer;
     if (!l) return;
     this.root.dataset.bgJank = `${r.p95}/${r.longMs}`;
-    if (l.kind === 'worker') this.post({ t: 'jank', id: l.id, ...r });
+    if (performance.now() - r.windowMs < this.bornAt + JANK_WARMUP_MS) return;   // window overlaps app start-up
+    if (l.kind === 'worker') this.post({ t: 'jank', id: l.id, ...workerJank(r) });
     else l.main?.jank(r);
   }
   private measure(): void {
@@ -178,6 +202,7 @@ class Engine implements BgEngine {
   }
   private onResize(): void {
     this.measure();
+    this.jankMeter?.reset();                                   // relayout on a window drag is app work, not the scene
     const l = this.layer;
     if (!l) return;
     if (l.kind === 'worker') this.post({ t: 'resize', id: l.id, w: this.size.w, h: this.size.h });
@@ -187,9 +212,9 @@ class Engine implements BgEngine {
     this.lastStats = s;
     for (const cb of this.statsCbs) { try { cb(s); } catch { /* listener errors stay local */ } }
   }
-  private post(m: ToWorker, transfer?: Transferable[]): void {
-    if (!this.worker) return;
-    try { this.worker.postMessage(m, transfer ?? []); } catch { /* worker gone */ }
+  private post(m: ToWorker, transfer?: Transferable[]): boolean {
+    if (!this.worker) return false;
+    try { this.worker.postMessage(m, transfer ?? []); return true; } catch { return false; /* worker gone */ }
   }
 
   private ensureWorker(): Worker | null {
@@ -200,6 +225,7 @@ class Engine implements BgEngine {
       const w = new Worker(this.opts.workerUrl, { type: 'module', name: 'harness-bg' });
       w.onmessage = (e) => this.onWorker(e.data);
       w.onerror = (e) => { e.preventDefault?.(); this.workerFailed(`worker error: ${e.message || 'load failed'}`); };
+      w.onmessageerror = () => { this.workerFailed('worker message could not be read'); };
       this.worker = w;
       w.postMessage({ t: 'theme', theme: this.theme } satisfies ToWorker);
       w.postMessage({ t: 'state', ...this.effState() } satisfies ToWorker);
@@ -226,6 +252,7 @@ class Engine implements BgEngine {
     if (!l || l.id !== m.id) return;
     if (m.t === 'stats') {
       this.root.dataset.bgFrames = String(m.frames);
+      this.layerFrames = m.frames; this.restore.frame(m.id, m.frames);
       if (m.reason !== this.lastReason) { this.lastReason = m.reason; if (m.downgraded) this.jankMeter?.reset(); }   // new rung: fresh jank window
       this.emit(this.lowStats({ fps: m.fps, frameMs: m.frameMs, renderer: m.renderer, tier: m.tier, downgraded: m.downgraded || !!this.gpuBroken, reason: m.reason || this.gpuBroken }));
       if (m.tier === 3) void this.apply(l.cfg, 400, true, true, m.reason);       // governor reached static
@@ -235,7 +262,8 @@ class Engine implements BgEngine {
       if (m.contextLost) {
         const now = performance.now();
         this.lossTimes = this.lossTimes.filter((t) => now - t < 60_000).concat(now);
-        if (this.lossTimes.length < 2) return;                       // the worker rebuilds on restore
+        if (this.lossTimes.length < 2) { this.restore.arm(l.id, this.layerFrames); return; }   // the worker rebuilds on restore
+        this.restore.clear();
         this.gpuBroken = 'WebGL context lost twice in 60 s';
       } else if (this.lastInitGL.get(m.id)) {
         if (/webgl2 unavailable/.test(m.reason)) this.gpuBroken = m.reason; else this.glBlocked.add(l.cfg.id);
@@ -289,7 +317,12 @@ class Engine implements BgEngine {
         const off = canvas.transferControlToOffscreen();
         const allowGL = this.glAllowed(cfg.id);
         this.lastInitGL.set(id, allowGL);
-        this.post({ t: 'init', id, canvas: off, w: this.size.w, h: this.size.h, config: cfg, allowGL, ...this.limits(cfg) }, [off]);
+        if (!this.post({ t: 'init', id, canvas: off, w: this.size.w, h: this.size.h, config: cfg, allowGL, ...this.limits(cfg) }, [off])) {
+          this.lastInitGL.delete(id);
+          this.workerBroken = 'worker init could not be sent';      // never a blank layer: next rung
+          this.worker?.terminate(); this.worker = null;
+          return this.apply(cfg, fadeMs, true, false, this.workerBroken);
+        }
       } else {
         try { layer.main = new MainRunner(canvas, cfg, this.theme, (s) => { this.root.dataset.bgFrames = String(s.frames); this.emit(this.lowStats(s.stats)); }, this.limits(cfg));
         } catch (e) { return this.apply(cfg, 0, true, true, (e as Error).message); }
@@ -303,6 +336,7 @@ class Engine implements BgEngine {
     this.layer = layer;
     this.root.dataset.bgId = cfg.id;
     this.lastReason = '';
+    this.layerFrames = 0; this.restore.clear();
     this.jankMeter?.reset();                                   // new layer: fresh jank window
     this.syncJank();
 
@@ -331,6 +365,7 @@ class Engine implements BgEngine {
   private retire(l: Layer): void {
     if (l === this.layer) return;
     if (l.kind === 'worker') this.post({ t: 'drop', id: l.id });
+    this.lastInitGL.delete(l.id);
     l.main?.dispose();
     l.el.remove();
   }

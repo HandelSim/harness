@@ -78,3 +78,49 @@ test('governor: jank walks to static and stops; never climbs back', () => {
   for (let t = 120_000; t < 130_000; t += 1000) g.jank(false, t);
   assert.equal(g.rung.static, true);
 });
+
+// review2 P1-4: the threshold follows the display's frame time; the worker rung ignores long tasks.
+test('jank: threshold is relative to the display frame time', async () => {
+  const { jankThreshold } = await import('./jank');
+  assert.equal(jankThreshold(), 34);
+  assert.equal(jankThreshold(16.7), 37.4);
+  assert.ok(Math.abs(jankThreshold(33.3) - 70.6) < 1e-9);
+  assert.equal(jankThreshold(60), 34, 'slower than any display: it is the scene, so 60 Hz rules');
+  assert.equal(jankThreshold(NaN), 34);
+  const base: JankSummary = { p95: 35, longMs: 0, windowMs: 2000, n: 60 };
+  assert.equal(isJanky(base), true, 'no estimate: 60 Hz rules');
+  assert.equal(isJanky({ ...base, vsyncMs: 33.3 }), false, '30 Hz display: 35 ms is ordinary jitter');
+  assert.equal(isJanky({ ...base, p95: 80, vsyncMs: 33.3 }), true);
+});
+test('jank: a 30 Hz display never reads as janky; its estimate survives reset()', () => {
+  const reports: JankSummary[] = [];
+  const m = new JankMeter({ raf: () => 1, caf: () => {}, now: () => 0, onReport: (s) => reports.push(s) });
+  m.start();
+  let t = 0, i = 0;
+  for (; t <= 14_000; i++) { m.frame(t); t += 1000 / 30 + (i % 7 === 0 ? 2.5 : (i % 3) * 0.4); }
+  assert.ok(reports.length > 5);
+  for (const r of reports) assert.equal(isJanky(r), false, JSON.stringify(r));
+  assert.ok(Math.abs(reports.at(-1)!.vsyncMs! - 33.3) < 1, String(reports.at(-1)!.vsyncMs));
+  m.reset(); reports.length = 0;
+  for (const end = t + 2000; t <= end; t += 1000 / 30) m.frame(t);
+  assert.ok(reports.at(-1)!.vsyncMs! < 34.5, 'estimate kept across a reset');
+});
+test('jank: worker summary drops long tasks and the frames that overlap them', async () => {
+  const { workerJank } = await import('./jank');
+  const reports: JankSummary[] = [];
+  const m = new JankMeter({ raf: () => 1, caf: () => {}, now: () => 0, onReport: (s) => reports.push(s) });
+  m.start();
+  let t = 0, i = 0;
+  // 60 Hz with a 120 ms app long task every ~300 ms (e.g. a big diff render): main-thread p95 is the long frame
+  while (t <= 4000) {
+    m.frame(t);
+    if (i % 12 === 11) { m.longTask(t + 1, 120); t += 121; } else t += 1000 / 60;
+    i++;
+  }
+  const r = reports.at(-1)!;
+  assert.equal(isJanky(r), true, 'main2d still sees it: ' + JSON.stringify(r));
+  const w = workerJank(r);
+  assert.equal(w.longMs, 0);
+  assert.ok(w.p95 < 20, JSON.stringify(w));
+  assert.equal(isJanky(w), false, 'the worker scene is not blamed for app work');
+});

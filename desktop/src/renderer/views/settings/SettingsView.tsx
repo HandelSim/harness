@@ -7,9 +7,9 @@ import { settings, patchSettings, appInfo } from '../../core/app';
 import { popover } from '../../shell/ui';
 import { Button, Seg, Field } from '../../ui/kit';
 import { Icon } from '../../ui/Icon';
-import type { Settings } from '../../../shared/ipc';
+import { ACCENT_PRESETS, type Settings } from '../../../shared/ipc';
 
-const ACCENTS = ['iris', 'blue', 'teal', 'violet', 'crimson', 'amber'] as const;
+const ACCENTS = ACCENT_PRESETS;   // the validated enum (main/settings.ts); one list, so a swatch can never store an invalid value
 const SECTIONS = ['Appearance', 'Background', 'Terminal', 'Sessions', 'Queue', 'Backend', 'Updates', 'Notifications'] as const;
 
 function Toggle({ label, value, onChange, hint, testid }: { label: string; value: boolean; onChange: (v: boolean) => void; hint?: string; testid?: string }) {
@@ -65,8 +65,7 @@ export default function SettingsView({ ctx }: { ctx: PanelCtx }) {
           <div class="card set-card">
             <Row label="Background" hint={s.background.config.id}><Button size="sm" icon="layers" onClick={() => { popover.value = 'bg'; }}>Choose…</Button></Row>
             <Row label="When the window is not focused"><Seg label="On blur" value={s.background.onBlur} onChange={(v) => set('background', { onBlur: v })} options={[{ value: 'run', label: 'Keep running' }, { value: 'dim', label: 'Dim' }, { value: 'pause', label: 'Pause' }]} /></Row>
-            <Row label="On battery"><Seg label="On battery" value={s.background.onBattery} onChange={(v) => set('background', { onBattery: v })} options={[{ value: 'run', label: 'Keep running' }, { value: 'static', label: 'Static' }]} /></Row>
-            <Row label="Rotate"><Seg label="Rotate" value={s.background.rotate} onChange={(v) => set('background', { rotate: v })} options={[{ value: 'never', label: 'Never' }, { value: 'daily', label: 'Daily' }, { value: 'launch', label: 'Each launch' }]} /></Row>
+            <Row label="On battery" hint="Static stops the animation on battery power and keeps the last frame."><Seg label="On battery" value={s.background.onBattery} onChange={(v) => set('background', { onBattery: v })} options={[{ value: 'run', label: 'Keep running' }, { value: 'static', label: 'Static' }]} /></Row>
           </div>
         ) : sec === 'Terminal' ? (
           <div class="card set-card">

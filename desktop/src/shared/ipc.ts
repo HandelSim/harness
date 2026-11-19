@@ -71,6 +71,8 @@ export interface AppBusy { terminals: number; queueRunning: boolean; ownedServe:
 /** A harness CLI job main is running or ran recently (harness:jobs). `output` is the tail kept for re-attach. */
 export interface JobInfo { id: string; job: 'doctor' | 'check-updates' | 'upgrade' | 'serve-stop'; running: boolean; code: number | null; startedAt: number; output: string }
 
+/** Accent presets (tokens.css `[data-accent=...]`). `appearance.accent` is always one of these; iris is the default. */
+export const ACCENT_PRESETS = ['iris', 'blue', 'teal', 'violet', 'crimson', 'amber'] as const;
 export interface Settings {
   appearance: { theme: 'dark' | 'light' | 'system'; accent: string; density: 'comfortable' | 'compact';
     uiScale: number; glass: boolean; seeThrough: number; reduceMotion: 'system' | 'on' | 'off' };

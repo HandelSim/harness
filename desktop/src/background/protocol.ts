@@ -12,7 +12,7 @@ export type ToWorker =
   | { t: 'state'; state: BgRunState; reduced: boolean }
   | { t: 'thumb'; req: number; config: BgConfig; w: number; h: number; theme: BgTheme }
   | { t: 'debug'; burnMs: number }
-  | { t: 'jank'; id: number; p95: number; longMs: number; windowMs: number; n: number };
+  | { t: 'jank'; id: number; p95: number; longMs: number; windowMs: number; n: number; vsyncMs?: number; p95Free?: number };
 
 export type FromWorker =
   | { t: 'ready'; id: number; renderer: RendererKind }
@@ -54,7 +54,8 @@ export function parseToWorker(v: unknown): ToWorker | null {
     case 'debug': return isNum(v.burnMs) && (v.burnMs as number) >= 0 && (v.burnMs as number) <= 100 ? (v as ToWorker) : null;
     case 'jank':
       return isInt(v.id) && inRange(v.p95, 0, 60_000) && inRange(v.longMs, 0, 600_000) && inRange(v.windowMs, 1, 600_000)
-        && isInt(v.n, 0, 100_000) ? (v as ToWorker) : null;
+        && isInt(v.n, 0, 100_000) && (v.vsyncMs === undefined || inRange(v.vsyncMs, 0, 60_000))
+        && (v.p95Free === undefined || inRange(v.p95Free, 0, 60_000)) ? (v as ToWorker) : null;
     default: return null;
   }
 }

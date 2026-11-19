@@ -20,7 +20,11 @@ export function over(fg: RGB, a: number, bg: RGB): RGB { return mix(bg, fg, a); 
  *  intensity 0.6 drew c3-bright strands). */
 export function worstPixels(theme: BgTheme): RGB[] {
   const p = derivePalette(theme);
-  return [p.c0, p.c1, p.c2, p.c3];
+  return [p.c0, p.c1, p.c2, p.c3, rampMax(p.c0, p.c1, p.c2, p.c3)];
+}
+/** Per-channel max of the ramp: the bound aurora's dark-theme soft knee draws up to (effects/aurora.ts). */
+export function rampMax(...cs: RGB[]): RGB {
+  return [0, 1, 2].map((i) => Math.max(...cs.map((c) => c[i]))) as unknown as RGB;
 }
 
 /** Smallest alpha of `surface` over every pixel that keeps every text colour >= ratio (1 if even opaque fails). */

@@ -110,12 +110,13 @@
   --text-2: #5a5e66;  /* slate-11 darkened  6.4:1 on surface-0 */
   --text-3: #5f626b;  /* custom    6.0:1 (slate-10 #80838d is only 3.7:1); dark enough that glass panels need alpha ~0.74, not 0.88 */
   --text-disabled: #b9bbc6;
-  --icon: #60646c;
+  --icon: #5d6169;
 
-  --ok-solid: #30a46c;   --ok-text: #218358;   --ok-bg: #e6f6eb;
-  --warn-solid: #ffc53d; --warn-text: #ab6400; --warn-bg: #fff7c2;
-  --err-solid: #e5484d;  --err-text: #ce2c31;  --err-bg: #feebec;
-  --info-solid: #0d74ce; --info-text: #0d74ce; --info-bg: #e6f4fe;
+  /* status/link text (and light --accent-11) >= 6:1 on surface-0, like text-3: they are in the glass floor too */
+  --ok-solid: #30a46c;   --ok-text: #1c6e4a;   --ok-bg: #e6f6eb;
+  --warn-solid: #ffc53d; --warn-text: #8d5300; --warn-bg: #fff7c2;
+  --err-solid: #e5484d;  --err-text: #b8272c;  --err-bg: #feebec;
+  --info-solid: #0d74ce; --info-text: #0b63af; --info-bg: #e6f4fe;
 
   --glass-bg:        color-mix(in srgb, var(--surface-0) calc(var(--chrome-alpha) * 100%), transparent);
   --glass-bg-strong: rgba(252,252,253,0.82);
@@ -142,12 +143,12 @@
 [data-accent="amber"]  { --accent-3:#302008; --accent-4:#3f2700; --accent-8:#8f6424; --accent-9:#ffc53d; --accent-10:#ffd60a; --accent-11:#ffca16; --accent-on:#21201c; } /* 10.3:1 */
 [data-accent="crimson"]{ --accent-3:#381525; --accent-4:#4d122f; --accent-8:#b0436e; --accent-9:#e93d82; --accent-10:#ee518a; --accent-11:#ff92ad; --accent-on:#0a0b0d; } /* 5.1:1 */
 
-[data-theme="light"][data-accent="iris"]   { --accent-3:#f0f1fe; --accent-4:#e6e7ff; --accent-8:#9b9ef0; --accent-9:#5b5bd6; --accent-10:#5151cd; --accent-11:#5753c6; --accent-on:#ffffff; }
+[data-theme="light"][data-accent="iris"]   { --accent-3:#f0f1fe; --accent-4:#e6e7ff; --accent-8:#9b9ef0; --accent-9:#5b5bd6; --accent-10:#5151cd; --accent-11:#5652c4; --accent-on:#ffffff; }
 [data-theme="light"][data-accent="violet"] { --accent-3:#f4f0fe; --accent-4:#ebe4ff; --accent-8:#aa99ec; --accent-9:#6e56cf; --accent-10:#654dc4; --accent-11:#6550b9; --accent-on:#ffffff; }
-[data-theme="light"][data-accent="blue"]   { --accent-3:#e6f4fe; --accent-4:#d5efff; --accent-8:#5eb1ef; --accent-9:#0d74ce; --accent-10:#0588f0; --accent-11:#0d74ce; --accent-on:#ffffff; } /* solid uses step 11 so white text = 4.8:1 */
-[data-theme="light"][data-accent="teal"]   { --accent-3:#e0f8f3; --accent-4:#ccf3ea; --accent-8:#53b9ab; --accent-9:#008573; --accent-10:#0d9b8a; --accent-11:#008573; --accent-on:#ffffff; } /* 4.6:1 */
-[data-theme="light"][data-accent="amber"]  { --accent-3:#fff7c2; --accent-4:#ffee9c; --accent-8:#e2a336; --accent-9:#ffc53d; --accent-10:#ffba18; --accent-11:#ab6400; --accent-on:#21201c; }
-[data-theme="light"][data-accent="crimson"]{ --accent-3:#ffe9f0; --accent-4:#fedce7; --accent-8:#e093b2; --accent-9:#cb1d63; --accent-10:#df3478; --accent-11:#cb1d63; --accent-on:#ffffff; } /* 5.4:1 */
+[data-theme="light"][data-accent="blue"]   { --accent-3:#e6f4fe; --accent-4:#d5efff; --accent-8:#5eb1ef; --accent-9:#0d74ce; --accent-10:#0588f0; --accent-11:#0b63af; --accent-on:#ffffff; } /* solid uses step 11 so white text = 4.8:1 */
+[data-theme="light"][data-accent="teal"]   { --accent-3:#e0f8f3; --accent-4:#ccf3ea; --accent-8:#53b9ab; --accent-9:#008573; --accent-10:#0d9b8a; --accent-11:#006e5f; --accent-on:#ffffff; } /* 4.6:1 */
+[data-theme="light"][data-accent="amber"]  { --accent-3:#fff7c2; --accent-4:#ffee9c; --accent-8:#e2a336; --accent-9:#ffc53d; --accent-10:#ffba18; --accent-11:#8d5300; --accent-on:#21201c; }
+[data-theme="light"][data-accent="crimson"]{ --accent-3:#ffe9f0; --accent-4:#fedce7; --accent-8:#e093b2; --accent-9:#cb1d63; --accent-10:#df3478; --accent-11:#b91a5a; --accent-on:#ffffff; } /* 5.4:1 */
 
 /* ---------- focus ring (keyboard only) ---------- */
 :where(button, a, input, textarea, select, [tabindex]):focus-visible {
@@ -162,5 +163,7 @@
   :root { --dur-fast: 0ms; --dur-base: 0ms; --dur-panel: 0ms; --dur-slow: 0ms; }
 }
 @media (prefers-contrast: more) {
-  :root { --border-subtle: rgba(255,255,255,0.16); --border: rgba(255,255,255,0.24); --chrome-alpha: 1; --panel-alpha: 1; --text-3: var(--text-2); }
+  :root { --border-subtle: rgba(255,255,255,0.16); --border: rgba(255,255,255,0.24); --text-3: var(--text-2); }
+  :root[data-theme="light"] { --border-subtle: rgba(0,0,45,0.16); --border: rgba(0,0,45,0.28); }
+  /* the opaque-surface half lives in glass.css: base.css redefines --chrome-alpha/--panel-alpha after this file */
 }

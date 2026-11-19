@@ -3,6 +3,7 @@ import { signal, computed, effect } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
 import type { ActionResult, Topic, TopicData } from '../../shared/api';
 import type { AppInfo, AppState, BackendState, Settings, DeepPartial, KeyVaultState, AppUpdateState } from '../../shared/ipc';
+import { ACCENT_PRESETS } from '../../shared/ipc';
 import { bridge, on, api } from './bridge';
 import { TopicStore, topicPath, type TopicEntry } from './store';
 import { toast } from './toast';
@@ -103,6 +104,8 @@ export async function act(path: string, body: Record<string, unknown> = {}, opts
   return r;
 }
 
+/** Bumped by bindAppearance after every write of the appearance attributes, including OS theme/motion changes. */
+export const appearanceTick = signal(0);
 /** Apply appearance settings to <html> data attributes (3.1 States). */
 export function bindAppearance(): void {
   const mq = window.matchMedia('(prefers-color-scheme: light)');
@@ -112,13 +115,14 @@ export function bindAppearance(): void {
     const h = document.documentElement;
     const theme = !a || a.theme === 'system' ? (mq.matches ? 'light' : 'dark') : a.theme;
     h.dataset.theme = theme;
-    h.dataset.accent = a?.accent || 'iris';
+    h.dataset.accent = a && (ACCENT_PRESETS as readonly string[]).includes(a.accent) ? a.accent : 'iris';
     h.dataset.density = a?.density || 'compact';
     h.dataset.glass = a?.glass === false ? 'off' : 'on';
     h.dataset.seeThrough = a && a.seeThrough > 0 ? '1' : '0';
     const reduce = a?.reduceMotion === 'on' || ((!a || a.reduceMotion === 'system') && rm.matches);
     h.dataset.reduceMotion = reduce ? '1' : '0';
     if (a?.uiScale && a.uiScale !== 1) h.style.zoom = String(a.uiScale); else h.style.zoom = '';
+    appearanceTick.value = appearanceTick.peek() + 1; // peek: no self-subscription. After the attributes: the engine theme and the contrast floor re-resolve (OS changes too)
   };
   effect(apply);
   mq.addEventListener('change', apply);

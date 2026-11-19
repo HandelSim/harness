@@ -2,12 +2,17 @@
 // the shell still runs with the plain token background.
 import { signal, effect } from '@preact/signals';
 import type { BgConfig, BgEngine, BgStats, BgTheme, BgDescriptor } from '../../shared/bg';
-import { settings, windowState, reducedMotion } from './app';
+import { settings, windowState, reducedMotion, appearanceTick, appInfo } from './app';
+import { on } from './bridge';
 import { surfaceAlphas } from '../views/background/surface';
+import { bgRunState } from '../views/background/runstate';
 
 export const bgStats = signal<BgStats | null>(null);
 export const bgCatalog = signal<BgDescriptor[]>([]);
 export const bgError = signal<string>('');
+/** Main's powerMonitor (power:state); null until the first event, then appInfo.onBattery is used. */
+const onBatteryPower = signal<boolean | null>(null);
+
 /** No-GPU policy (W2-G): 'auto' turns low power on when the GL renderer is software. Per device, so localStorage. */
 export type LowPowerMode = 'auto' | 'on' | 'off';
 export interface LowPowerState { mode: LowPowerMode; active: boolean; gpu: { renderer: string; software: boolean } | null }
@@ -29,13 +34,15 @@ export function setLowPower(mode: LowPowerMode): void {
   syncLowPower();
 }
 
+/** Every text colour drawn on glass: neutral, status, link (--accent-11) and icons. All are in the AA floor. */
+export const GLASS_TEXT_TOKENS = ['--text-1', '--text-2', '--text-3', '--ok-text', '--warn-text', '--err-text', '--info-text', '--accent-11', '--icon'] as const;
 /** Surface opacity: --chrome-alpha-auto / --panel-alpha-auto on <html> from appearance.seeThrough, floored for AA. */
 export function applySurfaceAlphas(seeThrough?: number): void {
   const s = settings.value;
   const h = document.documentElement;
   const out = surfaceAlphas({
     seeThrough: seeThrough ?? s?.appearance?.seeThrough ?? 0.5, theme: currentBgTheme(),
-    surface: cssVar('--surface-0'), texts: [cssVar('--text-1'), cssVar('--text-2'), cssVar('--text-3')],
+    surface: cssVar('--surface-0'), texts: GLASS_TEXT_TOKENS.map(cssVar).filter(Boolean),
   });
   h.style.setProperty('--chrome-alpha-auto', String(out.chrome));
   h.style.setProperty('--panel-alpha-auto', String(out.panel));
@@ -76,13 +83,14 @@ export async function startBackground(root: HTMLElement): Promise<void> {
       if (key !== last) { const first = !last; last = key; void engine?.set(cfg, { fadeMs: first ? 0 : 600 }).catch((e) => { bgError.value = String(e?.message || e); }); }
     });
     effect(() => {
-      void settings.value?.appearance; // re-resolve after theme/accent attribute changes
+      void appearanceTick.value; // bumped after bindAppearance writes the attributes (settings AND OS theme/motion changes)
       requestAnimationFrame(() => { engine?.setTheme(currentBgTheme()); engine?.setReducedMotion(reducedMotion()); });
     });
+    on('power:state', (p) => { onBatteryPower.value = !!p.onBattery; });
     effect(() => {
-      const w = windowState.value;
-      const onBlur = settings.value?.background?.onBlur ?? 'dim';
-      engine?.setRunState(!w.visible ? 'pause' : w.focused ? 'run' : onBlur);
+      const w = windowState.value, bg = settings.value?.background;
+      const battery = onBatteryPower.value ?? appInfo.value?.onBattery ?? false;
+      engine?.setRunState(bgRunState(w, bg?.onBlur ?? 'dim', battery, bg?.onBattery ?? 'static'));
     });
   } catch (e) {
     bgError.value = String((e as Error)?.message || e);
@@ -93,7 +101,7 @@ export async function startBackground(root: HTMLElement): Promise<void> {
 /** Runs even when the engine fails: the surfaces still follow seeThrough (the floor then uses the plain base). */
 function bindSurfaces(): void {
   effect(() => {
-    void settings.value?.appearance;
+    void appearanceTick.value; // settings writes and OS theme flips alike (a stale dark floor under a light surface fails AA)
     requestAnimationFrame(() => applySurfaceAlphas()); // after bindAppearance has written data-theme / data-accent
   });
 }

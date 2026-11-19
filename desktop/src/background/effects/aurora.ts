@@ -32,8 +32,15 @@ void main() {
     acc += col * a * (0.8 - fk * 0.18);
   }
   vec3 tone = 1.0 - exp(-acc * 1.6);
-  vec3 col = u_c0 + tone * clamp(u_k * 1.4, 0., 1.);
+  vec3 add = tone * clamp(u_k * 1.4, 0., 1.);
+  // Dark theme: soft-knee the light added on c0 so no pixel passes the ramp's per-channel max (surface.ts
+  // worstPixels assumes that bound for the 4.5:1 text floor). Light theme adds light to a light base: no bound needed.
+  bool dark = dot(u_c0, vec3(0.2126, 0.7152, 0.0722)) < 0.5;
+  vec3 hi = max(max(u_c0, u_c1), max(u_c2, u_c3));
+  vec3 room = max(hi - u_c0, vec3(1e-3));
+  vec3 col = u_c0 + (dark ? room * (1.0 - exp(-add / room)) : add);
   col += (hash(gl_FragCoord.xy + fract(t)) - 0.5) / 255.0;
+  if (dark) col = min(col, hi);
   o = vec4(col, 1.0);
 }`;
 
