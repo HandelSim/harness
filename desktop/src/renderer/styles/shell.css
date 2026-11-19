@@ -123,3 +123,6 @@
 .bg-item:hover { border-color: var(--border-strong); transform: translateY(-1px); }
 .bg-item[aria-pressed="true"] { border-color: var(--accent-9); box-shadow: 0 0 0 1px var(--accent-9); color: var(--text-1); }
 .bg-thumb { aspect-ratio: 16 / 10; border-radius: calc(var(--r-md) - 4px); background: var(--surface-2) center / cover no-repeat; }
+
+/* narrow windows (min 640px): the dock keeps most of the width */
+@media (max-width: 860px) { .sidebar { min-width: 160px; max-width: 200px; } }
