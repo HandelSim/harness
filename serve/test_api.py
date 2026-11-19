@@ -742,7 +742,7 @@ class ReadsSmokeTest(ApiTest):
         # these answer an error on this fixture (no git project, no Jira): an envelope, never a 500
         for p in ("/tickets/ABC-12/diff", "/tickets/ABC-12/diff?repo=nope", "/tickets/ABC-12/lines?from=x",
                   "/jira", "/queue/branches?project=/nope", "/queue/repos?project=/nope",
-                  "/findings/notes/nope/x.md", "/debug/runs/nope", "/debug/bogus/x", "/settings/doctor"):
+                  "/findings/notes/nope/x.md", "/debug/runs/nope", "/debug/bogus/x"):
             with mock.patch.object(settings_view, "read_doctor", return_value=(0, "all good")):
                 r, d = self.fx.get(p)
             self.assertNotEqual(r.status, 500, (p, d))

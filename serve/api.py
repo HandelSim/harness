@@ -337,6 +337,9 @@ def _runner(runs):
     r.setdefault("started", None)
     r.setdefault("since", None)
     r["watch"] = r.get("watch") is True
+    # the run re-beats run.json every 3 s: a live beat would change the queue's sig on
+    # every poll; "running" already carries what the beat means
+    r["beat"] = None
     return r
 
 
@@ -859,12 +862,6 @@ def read_settings(ctx, arg=None):
             "access": {"enabled": bool(cfg.codes), "names": names, "me": ctx.user}, "system": info}
 
 
-def read_doctor(ctx, arg=None):
-    """harness doctor's output (a run of up to 120 s): {rc, text}."""
-    rc, out = settings_view.read_doctor(ctx.settings_args())
-    return {"rc": rc, "text": out}
-
-
 def read_update(ctx, arg=None):
     v = _cached(("git", ROOT), 60, lambda: _git_version(ROOT))
     remote, checked = None, None
@@ -946,7 +943,7 @@ GETS = [(re.compile("^" + p + "$"), fn) for p, fn in (
     (r"/vaults", read_vaults), (r"/vault", read_vault), (r"/vault/ingest", read_ingest),
     (r"/vault/tree", read_vault_tree), (r"/vault/file", read_vault_file),
     (r"/vault/search", unavailable), (r"/vault/commit/" + SEG, unavailable),
-    (r"/settings", read_settings), (r"/settings/doctor", read_doctor), (r"/update", read_update),
+    (r"/settings", read_settings), (r"/update", read_update),
     (r"/jira", read_jira), (r"/debug", read_debug), (r"/debug/" + SEG + "/" + SEG, read_debug_report),
 )]
 

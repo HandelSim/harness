@@ -3107,7 +3107,7 @@ query), `/sessions?q=&limit=&all=1`, `/sessions/<sid>`,
 `/vault/ingest`, `/vault/tree?path=`, `/vault/file?path=` (no `..`, no
 `.git`, text up to 1 MiB, an image as its `/vault/file/` URL), `/settings`
 (a secret config value is `(set, N chars)`, never the value),
-`/settings/doctor`, `/update`, `/jira?list=&mine=1`, `/debug`,
+`/update`, `/jira?list=&mine=1`, `/debug`,
 `/debug/<runs|reports>/<name>`. A session row's `web` is the session's
 opencode-web URL with no login in it (the app answers opencode's Basic auth
 itself), host sessions only.
