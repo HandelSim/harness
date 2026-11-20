@@ -245,8 +245,17 @@ phase_1_stack_setup() {
     echo "[integration] Phase 1.5: smoke test (harness -p \"say hello\")"
     local out rc
     set +e
+    # HARNESS_NO_BUILD=1: Phase 1.0 already built harness-agent:latest. It did
+    # so via a raw `compose build`, which does NOT write the agent-image
+    # fingerprint record ensure_agent_image() consults — so without this flag
+    # the first `harness -p` sees a "missing record" mismatch and rebuilds the
+    # agent image from scratch inside this 90s window. On a cold BuildKit cache
+    # that rebuild alone exhausts the budget and the smoke test times out
+    # (exit 124) before the agent can round-trip. The pre-built image is the
+    # current code, so reuse it rather than rebuilding (matches harness_call's
+    # HARNESS_NO_BUILD=1 default and the Phase 1.0 pre-build design).
     out=$(cd "${TEST_WORKSPACE}/test-project" && agent_run 90 \
-        bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' '${TEST_INSTALL}/harness' -p \"say hello\" 2>&1 < /dev/null")
+        bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' HARNESS_NO_BUILD=1 '${TEST_INSTALL}/harness' -p \"say hello\" 2>&1 < /dev/null")
     rc=$?
     set -e
     # opencode's `run` may require interactive provider auth on some versions;
@@ -360,7 +369,7 @@ phase_2_serena() {
     # discarded; we only care about the side-file side effect.)
     set +e
     cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 60 \
-        bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' '${TEST_INSTALL}/harness' opencode -p \"say hello\" >/dev/null 2>&1 < /dev/null"
+        bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' HARNESS_NO_BUILD=1 '${TEST_INSTALL}/harness' opencode -p \"say hello\" >/dev/null 2>&1 < /dev/null"
     cd "${REPO_ROOT}"
     set -e
     local mcp_side_file="${TEST_INSTALL}/state/agent/home/.harness-mcp-servers.json"
@@ -446,7 +455,7 @@ phase_2_tui_test() {
     local out rc
     set +e
     out=$(cd "${TEST_WORKSPACE}/test-project" && agent_run 120 \
-        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
+        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" HARNESS_NO_BUILD=1 \
         "${TEST_INSTALL}/harness" -p \
         "Use serena to find the Calculator class symbol in this project" \
         2>&1 < /dev/null)
@@ -850,7 +859,7 @@ phase_5_mount() {
     ws_target=$(harness_abs_path "${TEST_WORKSPACE}/test-project")
     set +e
     out=$(cd "${TEST_WORKSPACE}/test-project" && agent_run 90 \
-        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
+        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" HARNESS_NO_BUILD=1 \
         "${TEST_INSTALL}/harness" -p \
         "Use bash to print exactly the value of pwd, then list /workspace if it exists, then exit." \
         2>&1 < /dev/null)
