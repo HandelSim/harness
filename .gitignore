@@ -58,3 +58,8 @@ desktop/out/
 desktop/dist/
 desktop/test-results/
 desktop/docs/progress/bg-shots/
+
+# harness-lite's config, written beside lite/harness-lite.ps1 when it is run
+# from the clone. Holds the API key in plaintext. The leading slash is
+# deliberate: only this path is ignored.
+/lite/harness-lite.json

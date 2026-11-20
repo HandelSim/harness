@@ -36,3 +36,7 @@ Dockerfile text eol=lf
 *.png binary
 *.jpg binary
 *.zip binary
+
+# harness-lite: the built file keeps the CRLF bytes lite/build.py writes
+# (tests/unit_lite_test.sh compares them byte for byte)
+lite/harness-lite.ps1 -text

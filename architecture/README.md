@@ -47,6 +47,7 @@ clone. User config and `state/` are gitignored. `harness update` and
 ├── agents/                     agent image (opencode/shell)
 ├── firewall/                   universal egress firewall + git-creds
 ├── mcp-registry/<name>/        vetted MCP definitions
+├── lite/                       harness-lite: `harness host` as one PowerShell file (built, committed)
 ├── vault-template/             skeleton for `harness vault new` (also an Obsidian vault)
 ├── scripts/vault_capture.py    sessions → vault .raw/sessions (after each launch)
 ├── scripts/vault_ingest.py     `harness ingest`: sources and codebases → wiki pages
@@ -97,6 +98,10 @@ Read the relevant one(s) before changing code in that area:
 - [`desktop.md`](desktop.md) — the Electron desktop app under `desktop/`:
   main/preload/renderer/background split, backend manager, key vault,
   auto-update, build and e2e. Talks to serve's JSON API (`/api/v1`).
+- [`lite.md`](lite.md) — `lite/harness-lite.ps1`: `harness host` reimplemented
+  in one PowerShell file. Sources, the build (`lite/build.py` renders the
+  proxy's prompt texts into it), and the unit test that fails when the
+  committed build is stale.
 - [`tests.md`](tests.md) — test layout and conventions. The detailed
   inventory and coverage tables live alongside the tests at
   `tests/INVENTORY.md` and `tests/COVERAGE.md`.
