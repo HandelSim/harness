@@ -131,8 +131,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/scale/rest/atm/1.0/testcase/search":
             cases = scale_cases()
             start, n = int(q.get("startAt", 0)), int(q.get("maxResults", 200))
+            n = min(n, state().get("cap", n))   # a server that caps the page size
             return self.send(200, cases[start:start + n])
         if p == "/scale/rest/atm/1.0/testcase/PROJ-T8":
+            if state().get("fail_one"):
+                return self.send(500, {})
             tc = [c for c in scale_cases() if c["key"] == "PROJ-T8"][0]
             tc["testScript"] = {"type": "STEP_BY_STEP", "steps": [{"index": 0, "description": "Alone", "expectedResult": "Fetched"}]}
             return self.send(200, tc)
@@ -147,6 +150,8 @@ class H(BaseHTTPRequestHandler):
                        "issuelinks": [{"outwardIssue": {"key": "SQ-50"}}]}}]
             return self.send(200, {"issues": issues, "total": 1, "startAt": 0})
         if p == "/squad/rest/zapi/latest/teststep/900":
+            if state().get("fail_one"):
+                return self.send(500, {})
             return self.send(200, {"stepBeanCollection": [{"orderId": 2, "step": "Second", "data": "", "result": "R2"},
                                                           {"orderId": 1, "step": "First", "data": "d", "result": "R1"}]})
         if p == "/rest/api/3/search/jql":
@@ -207,7 +212,18 @@ out=$(tp "$SV")
 [[ "$out" == *"has no cases in project PROJ"* && -f "$SV/.raw/tests/PROJ-T1.md" ]] || fail "Z1: an empty answer must keep the copy — $out"
 echo '{"scale_n": 204}' > "$TMP_ROOT/mock.state"
 tp "$SV" >/dev/null
-ok "Z1: Scale DC detected and paged; canonical case files (text, redacted, steps in order), index and guide; unchanged, deleted and empty pulls"
+# A server that answers fewer than maxResults is paged on, not taken as done
+# (or the cases after the first page would be deleted).
+echo '{"scale_n": 204, "cap": 50}' > "$TMP_ROOT/mock.state"
+out=$(tp "$SV")
+[[ "$out" == *"204 cases"*"0 removed"* && -f "$SV/.raw/tests/PROJ-T204.md" ]] || fail "Z1: a capped page size — $out"
+# A case whose steps did not come keeps the vault's copy.
+echo '{"scale_n": 204, "fail_one": 1}' > "$TMP_ROOT/mock.state"
+out=$(tp "$SV")
+[[ "$out" == *"PROJ-T8: no steps"*"the vault's copy is kept"*"0 updated, 0 removed"* ]] || fail "Z1: a failed step fetch — $out"
+grep -q '^Action: Alone$' "$SV/.raw/tests/PROJ-T8.md" || fail "Z1: a failed step fetch must keep the steps — $(cat "$SV/.raw/tests/PROJ-T8.md")"
+echo '{"scale_n": 204}' > "$TMP_ROOT/mock.state"
+ok "Z1: Scale DC detected and paged (also when the server caps the page); canonical case files (text, redacted, steps in order), index and guide; unchanged, deleted, empty and half-failed pulls"
 
 # --- Z2: Squad DC ----------------------------------------------------------
 QV="$TMP_ROOT/squad"
@@ -218,6 +234,10 @@ Q="$QV/.raw/tests/SQ-1.md"
 grep -q '^covers: SQ-50$' "$Q" && grep -q '^component: Core$' "$Q" || fail "Z2: front matter — $(cat "$Q")"
 awk '/^Action: First/{a=NR} /^Action: Second/{b=NR} END{exit !(a && a<b)}' "$Q" || fail "Z2: steps by orderId — $(cat "$Q")"
 grep -q '^Data: d$' "$Q" && grep -q '^Expected: R1$' "$Q" || fail "Z2: data and result"
+echo '{"scale_n": 204, "fail_one": 1}' > "$TMP_ROOT/mock.state"
+out=$(tp "$QV" --project SQ)
+[[ "$out" == *"SQ-1: no steps"*"0 updated"* ]] && grep -q '^Action: First$' "$Q" || fail "Z2: a failed step fetch must keep the copy — $out"
+echo '{"scale_n": 204}' > "$TMP_ROOT/mock.state"
 ok "Z2: Squad DC detected; Jira issues of type Test with ZAPI steps and linked issues"
 
 # --- Z3: Scale Cloud -------------------------------------------------------
@@ -225,6 +245,10 @@ CV="$TMP_ROOT/cloud"
 mkvault "$CV" "http://127.0.0.1:$PORT" "tests_project: 'CL'\ntests_url: 'http://127.0.0.1:$PORT/cloud/v2'\n"
 out=$(TOK="" tp "$CV") && fail "Z3: no token should fail" || true
 [[ "$out" == *"no token"* ]] || fail "Z3: no token — $out"
+JV="$TMP_ROOT/jcloud"
+mkvault "$JV" "https://example.atlassian.net" "tests_project: 'CL'\n"
+out=$(tp "$JV") && fail "Z3: Jira Cloud without ZEPHYR_TOKEN should fail" || true
+[[ "$out" == *"needs its own API token: set ZEPHYR_TOKEN"* ]] || fail "Z3: the Jira Cloud hint — $out"
 out=$(ZTOK=ztok tp "$CV") || fail "Z3: pull failed — $out"
 [[ "$out" == *"2 cases from Zephyr Scale (Jira Cloud), project CL: 2 new"* ]] || fail "Z3: status — $out"
 K="$CV/.raw/tests/CL-T1.md"

@@ -271,16 +271,26 @@ def scale_dc_cases(jira, token, project, warn):
         for tc in page:
             if not isinstance(tc, dict) or not tc.get("key"):
                 continue
+            partial = False
             if "testScript" not in tc:
                 try:
-                    tc = get(f"{base}/testcase/{urllib.parse.quote(tc['key'])}", token)
+                    one = get(f"{base}/testcase/{urllib.parse.quote(tc['key'])}", token)
+                    if isinstance(one, dict):
+                        tc = dict(tc, **one)
                 except (urllib.error.URLError, OSError, ValueError) as e:
-                    warn(f"{tc['key']}: no steps ({explain(e, 'Zephyr Scale', 'TRACKER_TOKEN')})")
-            yield scale_case(tc, tc.get("folder"), tc.get("status"), tc.get("priority"),
-                             tc.get("component"), tc.get("issueLinks") or [], tc.get("testScript"))
-        if len(page) < n:
+                    warn(f"{tc['key']}: no steps ({explain(e, 'Zephyr Scale', 'TRACKER_TOKEN')});"
+                         " the vault's copy is kept")
+                    partial = True
+            c = scale_case(tc, tc.get("folder"), tc.get("status"), tc.get("priority"),
+                           tc.get("component"), tc.get("issueLinks") or [], tc.get("testScript"))
+            c["partial"] = partial
+            yield c
+        # Until an empty page, not a short one: a server that caps maxResults
+        # below what was asked must not end the pull early (and have the
+        # cases after it deleted).
+        if not page:
             return
-        start += n
+        start += len(page)
 
 
 def scale_case(tc, folder, status, priority, component, covers, script):
@@ -356,7 +366,7 @@ def cloud_cases(base, token, project, jira, jira_token, warn):
     for tc in raw:
         if not isinstance(tc, dict) or not tc.get("key"):
             continue
-        script = {}
+        script, partial = {}, False
         link = str((tc.get("testScript") or {}).get("self") or "")
         k = urllib.parse.quote(tc["key"])
         try:
@@ -369,13 +379,16 @@ def cloud_cases(base, token, project, jira, jira_token, warn):
                     {"index": i, "inline": st.get("inline") or {},
                      "testCaseKey": (st.get("testCase") or {}).get("testCaseKey")} for i, st in enumerate(steps)]}
         except Failed as e:
-            warn(f"{tc['key']}: no steps ({e})")
+            warn(f"{tc['key']}: no steps ({e}); the vault's copy is kept")
+            partial = True
         covers = [keys.get(str(i.get("issueId")), f"id:{i.get('issueId')}")
                   for i in ((tc.get("links") or {}).get("issues") or []) if isinstance(i, dict) and i.get("issueId")]
         comp = tc.get("component")
-        yield scale_case(tc, folder_path((tc.get("folder") or {}).get("id")), ref(tc.get("status"), "status"),
-                         ref(tc.get("priority"), "priority"), (comp or {}).get("name", "") if isinstance(comp, dict) else "",
-                         covers, script)
+        c = scale_case(tc, folder_path((tc.get("folder") or {}).get("id")), ref(tc.get("status"), "status"),
+                       ref(tc.get("priority"), "priority"), (comp or {}).get("name", "") if isinstance(comp, dict) else "",
+                       covers, script)
+        c["partial"] = partial
+        yield c
 
 
 def jira_keys(jira, token, ids, warn):
@@ -420,7 +433,7 @@ def squad_dc_cases(jira, token, project, warn):
             raise Failed("Jira's search answer has no issues list")
         for iss in issues:
             f = iss.get("fields") or {}
-            steps = []
+            steps, partial = [], False
             try:
                 s = get(f"{jira}/rest/zapi/latest/teststep/{urllib.parse.quote(str(iss.get('id')))}", token)
                 rows = s.get("stepBeanCollection", []) if isinstance(s, dict) else s
@@ -429,7 +442,8 @@ def squad_dc_cases(jira, token, project, warn):
                         steps.append({"action": plain(st.get("step")), "data": plain(st.get("data")),
                                       "expected": plain(st.get("result"))})
             except (urllib.error.URLError, OSError, ValueError) as e:
-                warn(f"{iss.get('key')}: no steps ({explain(e, 'Zephyr Squad', 'TRACKER_TOKEN')})")
+                warn(f"{iss.get('key')}: no steps ({explain(e, 'Zephyr Squad', 'TRACKER_TOKEN')}); the vault's copy is kept")
+                partial = True
             covers = []
             for ln in f.get("issuelinks") or []:
                 other = ln.get("outwardIssue") or ln.get("inwardIssue") or {}
@@ -441,7 +455,8 @@ def squad_dc_cases(jira, token, project, warn):
                    "priority": one_line((f.get("priority") or {}).get("name")),
                    "component": ", ".join(one_line(c.get("name")) for c in f.get("components") or [] if c.get("name")),
                    "labels": [one_line(x) for x in f.get("labels") or []], "covers": covers,
-                   "updated": f.get("updated") or "", "script": "steps", "steps": steps, "text": ""}
+                   "updated": f.get("updated") or "", "script": "steps", "steps": steps, "text": "",
+                   "partial": partial}
         total = d.get("total")
         start += len(issues)
         if not issues or (isinstance(total, int) and start >= total):
@@ -451,6 +466,11 @@ def squad_dc_cases(jira, token, project, warn):
 def detect(jira, tracker_token, zephyr_token, project, tests_url):
     """The flavor, found by asking: (flavor, why when not found)."""
     tried = []
+    host = urllib.parse.urlparse(jira).hostname or "" if jira else ""
+    if host.endswith(".atlassian.net") and not zephyr_token:
+        # Jira Cloud: Zephyr's APIs there take only Zephyr's own token, and
+        # /rest/atm and /rest/zapi do not exist, so probing them only misleads.
+        return "", "Zephyr on Jira Cloud needs its own API token: set ZEPHYR_TOKEN (harness tests login)"
     if zephyr_token:
         for fl in ("scale-cloud", "essential-cloud"):
             base = tests_url or CLOUD_BASE[fl]
@@ -475,8 +495,6 @@ def detect(jira, tracker_token, zephyr_token, project, tests_url):
         except (urllib.error.URLError, OSError, ValueError) as e:
             tried.append(explain(e, "Zephyr Squad (/rest/zapi)", "TRACKER_TOKEN"))
     if not tried:
-        if jira and re.search(r"\.atlassian\.net/?$", jira):
-            return "", "Zephyr on Jira Cloud needs its own API token: set ZEPHYR_TOKEN (harness tests login)"
         return "", "no token: harness ticket login (Jira Data Center) or harness tests login (Jira Cloud)"
     return "", "no Zephyr answered: " + "; ".join(tried) + " (set tests_flavor in the charter to skip detection)"
 
@@ -540,9 +558,11 @@ def pull(vault, project=None, flavor=None):
     for c in cases:
         path = os.path.join(raw, f"{c['key']}.md")
         existed = os.path.exists(path)
+        seen.add(f"{c['key']}.md")
+        if c.get("partial") and existed:
+            continue   # its steps did not come: keep the copy that has them
         if write_if_changed(path, render_case(c, flavor)):
             new, changed = new + (not existed), changed + existed
-        seen.add(f"{c['key']}.md")
     removed = 0
     complete = not any(w.startswith("stopped at") for w in warnings)
     if not cases and seen != set(os.listdir(raw)):

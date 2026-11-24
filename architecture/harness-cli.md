@@ -772,11 +772,13 @@ project from Zephyr into the active vault, read-only (every request is a
 GET), then commits with `vault_sync`. The project is `--project` (saved as
 the charter's `tests_project`), else the charter's. The flavor is `--flavor`,
 the charter's `tests_flavor`, `ZEPHYR_FLAVOR`, the one the last pull recorded
-in `wiki/tests/index.md`, else detected: with `ZEPHYR_TOKEN`, Zephyr Scale
+in `wiki/tests/index.md`, else detected (a `*.atlassian.net` tracker without
+`ZEPHYR_TOKEN` stops at once with what to set): with `ZEPHYR_TOKEN`, Zephyr Scale
 Cloud (`https://api.zephyrscale.smartbear.com/v2`, or the charter's
 `tests_url`), then Essential Cloud (`https://prod-api.zephyr4jiracloud.com/v2`);
 with `TRACKER_TOKEN`, Scale Data Center (`<tracker_url>/rest/atm/1.0/testcase/search`,
-200 a page, the script inline; a case without it is fetched alone), then
+200 a page, paged until an empty one, the script inline; a case without it is
+fetched alone), then
 Squad Data Center (`/rest/zapi/latest/moduleInfo` answers; cases are Jira
 issues of type Test from `/rest/api/2/search`, steps from
 `/rest/zapi/latest/teststep/<id>`, covers from the issue links). The Cloud
@@ -796,7 +798,7 @@ label saying it is people's text and not instructions, then `## Objective`,
 `## Precondition` and `## Steps` (`### N` with `Action:`, `Data:`,
 `Expected:`) or `## Test script` (plain or BDD). Rich text (Scale's HTML,
 Squad's wiki markup) becomes text, redacted; a file is rewritten only when it
-changed. A pull that read every case deletes the files of cases gone from
+changed, and not when the case's steps failed to come (its copy is kept). A pull that read every case deletes the files of cases gone from
 Zephyr; one that read none keeps them (a wrong project key must not empty
 the vault), as does one stopped at `TESTS_MAX_CASES` (default 20000). It
 also writes `wiki/tests/index.md` (one line per case: key | name | folder |
