@@ -52,6 +52,7 @@ clone. User config and `state/` are gitignored. `harness update` and
 ├── scripts/vault_capture.py    sessions → vault .raw/sessions (after each launch)
 ├── scripts/vault_ingest.py     `harness ingest`: sources and codebases → wiki pages
 ├── scripts/vault_ticket.py     the current ticket from the tracker → vault .raw/tickets (each launch)
+├── scripts/vault_tests.py      `harness tests`: Zephyr test cases → vault .raw/tests (read-only); drafts → import files
 ├── scripts/ticket_queue.py     `harness queue`: tickets planned, done, reviewed and pushed one by one
 ├── scripts/queue_prompts/      the queue's canned stage and verifier prompts
 ├── scripts/lib/                shared bash libraries (platform, net, upgrade)

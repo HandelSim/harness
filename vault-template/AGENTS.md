@@ -9,6 +9,9 @@ below are relative to it. Read only the files your task needs:
 - **A ticket:** harness already gave you `.raw/tickets/KEY.md` (the ticket),
   `wiki/context/KEY-context.md` (the domain terms and rules it uses, when it uses any)
   and `wiki/notes/tickets/KEY-state.md` (where the work stands). Start there.
+- **Acceptance tests (Zephyr):** `wiki/tests/guide.md` says where they are
+  and how to write new ones. Grep `wiki/tests/index.md` (key | name | folder |
+  stories it covers); each case is `.raw/tests/<KEY>.md`.
 - **A word of the project's field you do not know:**
   `grep -i "<word>" wiki/domain/glossary.md`. Each line links to the domain
   document's page in `wiki/domain/`, which quotes the source.
@@ -25,6 +28,9 @@ below are relative to it. Read only the files your task needs:
 - `wiki/notes/`: your own pages, for what is worth finding next time (a
   decision and why, a fix and its cause). Start each with front matter
   `type: note` and a one-line `summary:`, and link related pages with `[[name]]`.
+- New Zephyr test cases: one file each in `wiki/notes/tests/<STORY-KEY>/`, in the
+  form `wiki/tests/guide.md` gives. harness makes the import file; nothing goes
+  to Jira or Zephyr from here.
 - The ticket's state note: when you finish a step, record what is done, what is
   next, decisions and open questions, so the next session starts where you ended.
 - Never edit a page whose front matter says `generated: harness`, or anything

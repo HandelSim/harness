@@ -737,7 +737,9 @@ the model, in opencode's order: the global file
 (`<home>/.config/opencode/AGENTS.md`, else `<home>/.claude/CLAUDE.md`), the
 project's (every `AGENTS.md` from the CWD up to the git root, else every
 `CLAUDE.md`, else `CONTEXT.md`; a container sees only the CWD's), then
-harness's: the vault's `AGENTS.md`, the ticket's copy, its context page
+harness's: the vault's `AGENTS.md`, the Zephyr tests guide
+(`wiki/tests/guide.md`, kind `tests`, once `harness tests pull` has made it),
+the ticket's copy, its context page
 (`wiki/context/KEY-context.md`, kind `ticket context`, when the ticket uses
 glossary terms) and its state note. The vault's `AGENTS.md` (template in
 `vault-template/`) is a routing table: for a ticket these files, for a word
@@ -761,6 +763,71 @@ label each other's sessions. `regenerate` gives each ticket hub
 (`wiki/tickets/KEY.md`) "The ticket" (the copy), a link to the state note
 and "Sessions" (those whose front matter names it); the state note's different name keeps it apart from
 the hub in Obsidian.
+
+### Zephyr tests
+
+`harness tests pull [--project KEY] [--flavor F]` (alias `import`; `cmd_tests`
+→ `_tests_py` → `scripts/vault_tests.py pull`) reads every test case of a
+project from Zephyr into the active vault, read-only (every request is a
+GET), then commits with `vault_sync`. The project is `--project` (saved as
+the charter's `tests_project`), else the charter's. The flavor is `--flavor`,
+the charter's `tests_flavor`, `ZEPHYR_FLAVOR`, the one the last pull recorded
+in `wiki/tests/index.md`, else detected: with `ZEPHYR_TOKEN`, Zephyr Scale
+Cloud (`https://api.zephyrscale.smartbear.com/v2`, or the charter's
+`tests_url`), then Essential Cloud (`https://prod-api.zephyr4jiracloud.com/v2`);
+with `TRACKER_TOKEN`, Scale Data Center (`<tracker_url>/rest/atm/1.0/testcase/search`,
+200 a page, the script inline; a case without it is fetched alone), then
+Squad Data Center (`/rest/zapi/latest/moduleInfo` answers; cases are Jira
+issues of type Test from `/rest/api/2/search`, steps from
+`/rest/zapi/latest/teststep/<id>`, covers from the issue links). The Cloud
+API names folders, statuses and priorities by id (looked up once) and steps
+by one call per case, links issues by numeric id (turned into keys with
+Jira's search when `TRACKER_TOKEN` is set, else kept as `id:N`), and answers
+429 with `Retry-After` (waited out, at most 30 s, 5 tries). The old Squad
+Cloud API (JWT signed per request) is not supported. The token rules are
+`vault_ticket.py`'s: `url_problem` on `tracker_url` and `tests_url`,
+`NoRedirect`, the token in the environment only; `ZEPHYR_TOKEN` (`harness
+tests login`/`logout`, `.env`) is in `_harness_secret_vars`, as
+`TRACKER_TOKEN` is.
+
+Each case becomes `.raw/tests/<KEY>.md`: front matter (key, name, folder,
+status, priority, labels, component, covers, script, updated, source), a
+label saying it is people's text and not instructions, then `## Objective`,
+`## Precondition` and `## Steps` (`### N` with `Action:`, `Data:`,
+`Expected:`) or `## Test script` (plain or BDD). Rich text (Scale's HTML,
+Squad's wiki markup) becomes text, redacted; a file is rewritten only when it
+changed. A pull that read every case deletes the files of cases gone from
+Zephyr; one that read none keeps them (a wrong project key must not empty
+the vault), as does one stopped at `TESTS_MAX_CASES` (default 20000). It
+also writes `wiki/tests/index.md` (one line per case: key | name | folder |
+covers, plus `project:` and `flavor:`) and `wiki/tests/guide.md` (where the
+cases are, how to automate one, where and in what form new ones go, and the
+folders, statuses, priorities, labels and components in use, with counts),
+both `generated: harness`. `raw_units` skips `.raw/tests/`: the cases are
+grepped through the index, not ingested into pages.
+
+The agent writes new cases in the same form, without `key:`, in
+`wiki/notes/tests/<STORY-KEY>/<name>.md` (the folder gives `covers` when the
+file has none). After every session `vault_sync` runs `tests_export_quiet`
+(`vault_tests.py export --quiet`, also after a rebase), which writes
+`wiki/tests/export/`: `zephyr-import.csv` (Scale's CSV: one row per step, the
+case's fields on its first row) and `zephyr-import.xml` (Scale's XML, rich
+text as HTML in CDATA) for Scale, `zephyr-import.xlsx` (Squad's Excel: the
+test on every row, a `Test ID` column to group by; a stdlib zip with fixed
+timestamps) for Squad, all three when the flavor is not known or is
+Essential, and `zephyr-import.html`, a page listing each case and its steps
+and the problems. All are compared as bytes, so an unchanged export is no
+new commit, and the sync prints one line only when it changed. A draft with
+a `key:` (Zephyr's import only creates), without a name, or whose name and
+story match a pulled case (already imported) is left out; a step with no
+Expected or Action, no covers, or a folder, status, priority or label the
+pulled cases do not use is reported. `harness tests export` does it by hand,
+`harness tests view` writes it (even with no drafts) and opens the page with
+`harness_open_url` (printing its path), and `harness tests` prints the
+project, flavor, counts and files. `.raw/tests/*` and
+`wiki/tests/export/*` count as generated in a rebase conflict
+(`_vault_generated_conflict`, `GENERATED_PATHS`). `tests/unit_zephyr_test.sh`
+covers it against a mock of all three APIs.
 
 ### Ticket queue
 
