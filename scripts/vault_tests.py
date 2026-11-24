@@ -456,7 +456,7 @@ def detect(jira, tracker_token, zephyr_token, project, tests_url):
             base = tests_url or CLOUD_BASE[fl]
             try:
                 get(f"{base}/testcases?projectKey={urllib.parse.quote(project)}&maxResults=1", zephyr_token,
-                    bearer_only=True, tries=1)
+                    bearer_only=True, tries=3)
                 return fl, ""
             except (urllib.error.URLError, OSError, ValueError) as e:
                 tried.append(explain(e, FLAVOR_NAME[fl], "ZEPHYR_TOKEN"))
@@ -934,20 +934,19 @@ def export(vault, quiet=False, force=False):
             os.remove(os.path.join(outdir, n))
             changed = True
     for n, data in want.items():
+        # Compared as bytes: the CSV's CRLF is part of it (read_text would hide it).
         p = os.path.join(outdir, n)
-        if isinstance(data, bytes):
-            try:
-                with open(p, "rb") as f:
-                    same = f.read() == data
-            except OSError:
-                same = False
-            if not same:
-                with open(p + ".tmp", "wb") as f:
-                    f.write(data)
-                os.replace(p + ".tmp", p)
-                changed = True
-        else:
-            changed = write_if_changed(p, data) or changed
+        data = data if isinstance(data, bytes) else data.encode("utf-8")
+        try:
+            with open(p, "rb") as f:
+                same = f.read() == data
+        except OSError:
+            same = False
+        if not same:
+            with open(p + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(p + ".tmp", p)
+            changed = True
     left = sum(1 for p in problems if p[2])
     if quiet:
         if changed and cases:

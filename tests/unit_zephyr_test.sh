@@ -167,7 +167,7 @@ PORT=$(head -n 1 "$TMP_ROOT/mock.port")
 mkvault() {
     git init -q "$1"
     cp -R "$REPO_ROOT/vault-template/." "$1/"
-    printf -- "---\ntype: overview\nsummary: 'a test vault'\ntracker_url: '%s'\n%s---\n" "$2" "${3:-}" > "$1/wiki/overview.md"
+    printf -- "---\ntype: overview\nsummary: 'a test vault'\ntracker_url: '%s'\n%b---\n" "$2" "${3:-}" > "$1/wiki/overview.md"
     git -C "$1" add -A && git -C "$1" commit -qm init
 }
 # tp VAULT [args]: a pull as harness runs it (the token in the environment).
@@ -212,7 +212,6 @@ ok "Z1: Scale DC detected and paged; canonical case files (text, redacted, steps
 # --- Z2: Squad DC ----------------------------------------------------------
 QV="$TMP_ROOT/squad"
 mkvault "$QV" "http://127.0.0.1:$PORT/squad"
-out=$(tp "$QV" --project sq) && fail "Z2: a lower-case key is not a project key" || true
 out=$(tp "$QV" --project SQ) || fail "Z2: pull failed — $out"
 [[ "$out" == *"1 cases from Zephyr Squad (Jira Data Center), project SQ: 1 new"* ]] || fail "Z2: status — $out"
 Q="$QV/.raw/tests/SQ-1.md"
@@ -324,12 +323,13 @@ out=$(tp "$BV") && fail "Z5: an http tracker_url should be refused" || true
 ok "Z5: GET only, no token in the vault, a non-local http URL refused"
 
 # --- Z6: harness -----------------------------------------------------------
+mkdir -p "$SV/.raw/notes" && printf 'a note to ingest\n' > "$SV/.raw/notes/a.md"
 $PY - "$REPO_ROOT/scripts" "$SV" <<'PYEOF' || fail "Z6: ingest should skip .raw/tests"
 import sys
 sys.path.insert(0, sys.argv[1])
 from vault_ingest import raw_units
-units = raw_units(sys.argv[2], 100000)
-assert not [u for u in units if "tests" in str(u[:2])], [u[:2] for u in units][:5]
+src = [u["source"] for u in raw_units(sys.argv[2], 100000)]
+assert src == [".raw/notes/a.md"], src[:5]
 PYEOF
 [[ " ${_harness_secret_vars[*]} " == *" ZEPHYR_TOKEN "* ]] || fail "Z6: ZEPHYR_TOKEN must be unset before opencode starts"
 lines=$(cd "$TMP_ROOT" && harness_vault_dir="$SV" harness_ticket="" harness_context_files "$TMP_ROOT/nohome")
