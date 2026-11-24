@@ -345,7 +345,7 @@ _curl_auth_config() {
 # The upstream secrets from .env. Every harness run exports .env, so a
 # host-mode opencode, and every shell its agent opens, would inherit them;
 # host_opencode_env drops them (the proxy, already started, holds its own copy).
-_harness_secret_vars=(PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING TRACKER_TOKEN)
+_harness_secret_vars=(PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING TRACKER_TOKEN ZEPHYR_TOKEN)
 
 # harness_jq — wrapper that uses host jq if available, else falls back to
 # the proxy container's jq. Same args/stdin/stdout/exit semantics as
@@ -2327,6 +2327,7 @@ CHATGPT_BASE_URL|ChatGPT backend-api base URL, used only by 'harness chatgpt'
 CHATGPT_MODEL_NAME|model id the ChatGPT backend serves (e.g. gpt-5.6-terra)
 CHATGPT_COOKIE_STRING|ChatGPT session cookie (secret; shown masked)
 TRACKER_TOKEN|Jira personal access token, or email:api-token for Jira Cloud (secret; shown masked)
+ZEPHYR_TOKEN|Zephyr API token, for harness tests pull on Jira Cloud only (secret; shown masked)
 HARNESS_HOST_CONFIRM|1 skips the y/N question before host mode (harness host / serve) starts
 QUEUE_PARALLEL|tickets one queue run works at a time (default 1); tickets in the same project folder take turns; a running queue keeps its number until it is stopped and started again
 QUEUE_WATCH|1 (default): a queue run with nothing to do keeps watching and starts tickets as they are queued, answered, approved or retried, until it is stopped; 0: it ends when nothing is left to do
@@ -2933,6 +2934,11 @@ commands:
                         the ticket this folder works on: every launch pulls
                         it from the tracker into the vault and gives the agent
                         it and its state note (see 'harness ticket --help')
+  tests [pull|export|view]
+                        Zephyr test cases: pull them (read-only) into the
+                        vault, where the agent reads them and writes new ones;
+                        after every session harness makes the import files
+                        (see 'harness tests --help')
   context [--host]      list what a launch from here gives the model: the
                         instruction files with their size, and the ticket
   unlock                probe the upstream and print the unlock URL if the
@@ -6298,7 +6304,7 @@ vault_opencode_config() {
     local dir="${harness_vault_dir:-}" what f instr=()
     [[ -n "$dir" ]] || return 0
     while IFS=$'\t' read -r what f; do
-        [[ "$what" == vault || "$what" == ticket* ]] && instr+=("$f")
+        [[ "$what" == vault || "$what" == tests || "$what" == ticket* ]] && instr+=("$f")
     done < <(harness_context_files "$HOME")
     [[ -f "$dir/AGENTS.md" || -f "$dir/CLAUDE.md" ]] \
         || err "vault at $dir has no AGENTS.md or CLAUDE.md; the agent is not told about it"
@@ -6488,6 +6494,8 @@ harness_context_files() {
             break
         fi
     done
+    f="$vault/wiki/tests/guide.md"
+    [[ -f "$f" ]] && printf 'tests\t%s\n' "$f"
     [[ -n "$key" ]] || return 0
     f="$vault/.raw/tickets/$key.md"
     [[ -f "$f" ]] && printf 'ticket\t%s\n' "$f"
@@ -6560,6 +6568,8 @@ vault_sync() {
         _vault_step "rebuilding the index"
         # shellcheck disable=SC2086
         [[ -f "$index" ]] && { $py "$index" index --vault "$wdir" >/dev/null || true; }
+        # The agent's test drafts as Zephyr import files (deterministic, no model).
+        tests_export_quiet "$dir"
     fi
     _vault_step "git add, commit"
     _vault_g -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
@@ -6588,6 +6598,7 @@ vault_sync() {
         # everything now in the vault.
         # shellcheck disable=SC2086  # $py can be 'py -3'
         [[ -n "$py" && -f "$index" ]] && { $py "$index" index --vault "${wdir:-$dir}" >/dev/null || true; }
+        [[ -n "$py" ]] && tests_export_quiet "$dir" 2>/dev/null
         _vault_g -C "$dir" add -A >/dev/null 2>&1
         _vault_g -C "$dir" diff --cached --quiet 2>/dev/null \
             || _vault_g ${copts[@]+"${copts[@]}"} -C "$dir" commit -q -m "harness: regenerate after rebase" >/dev/null 2>&1
@@ -6603,7 +6614,8 @@ vault_sync() {
 
 # A `pull --rebase` stopped on conflicts. When every conflicted file is one
 # harness generates (front matter `generated: harness`, or wiki/index.md,
-# wiki/log.md, wiki/topics/, wiki/tickets/), take the remote's copy (in a
+# wiki/log.md, wiki/topics/, wiki/tickets/, wiki/tests/export/, and the
+# Zephyr cases in .raw/tests/, which the next pull rewrites), take the remote's copy (in a
 # rebase --ours is the remote) and go on, as often as the rebase stops; the
 # caller regenerates them. Returns 1 with the rebase still stopped on any
 # other conflict (the caller aborts).
@@ -6642,7 +6654,7 @@ _vault_rebase_generated() {
 _vault_generated_conflict() {
     local dir="$1" f="$2" s text seen=0
     case "$f" in
-        wiki/index.md|wiki/log.md|wiki/topics/*|wiki/tickets/*) return 0 ;;
+        wiki/index.md|wiki/log.md|wiki/topics/*|wiki/tickets/*|wiki/tests/export/*|.raw/tests/*) return 0 ;;
     esac
     for s in 2 3; do
         _vault_g -C "$dir" cat-file -e ":$s:$f" 2>/dev/null || continue
@@ -7007,6 +7019,152 @@ HELP
             key=$(_ticket_key "$sub") || { err "'$sub' is not a ticket key like ABC-123 (see: harness ticket --help)"; return 1; }
             ticket_remember "$here" "$key"
             echo "ticket $key for $here; the next launch here pulls it"
+            ;;
+    esac
+}
+
+# Zephyr test cases in the vault (scripts/vault_tests.py): _tests_py SUB DIR
+# [ARGS...] runs it on the vault at DIR with the tokens in its environment
+# (never on a command line) and prints what it says. Returns its status.
+_tests_py() {
+    local sub="$1" dir="$2" py script wdir
+    shift 2
+    py=$(host_python_bin) || { err "python 3 is needed for harness tests"; return 1; }
+    script="$clone_dir/scripts/vault_tests.py" wdir="$dir"
+    if command -v cygpath >/dev/null 2>&1; then
+        script=$(cygpath -m "$script"); wdir=$(cygpath -m "$dir")
+    fi
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    TRACKER_TOKEN="${TRACKER_TOKEN:-}" ZEPHYR_TOKEN="${ZEPHYR_TOKEN:-}" $py "$script" "$sub" "$wdir" "$@"
+}
+
+# After a session (vault_sync): turn the agent's test drafts into the import
+# files. One line when they changed; never fails the sync.
+tests_export_quiet() {
+    local dir="$1" out
+    [[ -d "$dir/wiki/notes/tests" || -d "$dir/wiki/tests/export" ]] || return 0
+    out=$(_tests_py export "$dir" --quiet 2>&1) || true
+    [[ -z "$out" ]] || echo "[harness] $out" >&2
+    return 0
+}
+
+cmd_tests() {
+    local sub="${1:-status}" here name dir rc tok f url
+    (( $# )) && shift
+    here=$(harness_abs_path "$PWD") || { err "cannot resolve current directory: $PWD"; return 1; }
+    name=$(vault_active_name)
+    dir=""
+    [[ -n "$name" && -d "$state_root/vaults/$name/.git" ]] && dir=$(harness_abs_path "$state_root/vaults/$name")
+    case "$sub" in
+        -h|--help|help)
+            cat <<'HELP'
+usage:
+  harness tests                  where the tests are: the project, how many
+                                 cases are pulled, the drafts, the export
+  harness tests pull [--project KEY] [--flavor F]
+                                 (or: harness tests import) read every Zephyr
+                                 test case of the project into the vault and
+                                 commit it: <vault>/.raw/tests/<KEY>.md, one per
+                                 case, wiki/tests/index.md and wiki/tests/guide.md.
+                                 --project is saved in the charter (tests_project)
+  harness tests export           write the import files from the agent's drafts
+                                 now (harness does it after every session)
+  harness tests view             open the export in the browser (prints its path)
+  harness tests login            set ZEPHYR_TOKEN (Zephyr on Jira Cloud only)
+  harness tests logout           clear ZEPHYR_TOKEN
+
+Harness only reads Zephyr; nothing is ever written to Jira or Zephyr, and the
+agent has no token. Every launch gives the agent wiki/tests/guide.md: where
+the pulled cases are, the vocabulary they use, and that new cases go in
+<vault>/wiki/notes/tests/<STORY-KEY>/<name>.md, in the same form. After every
+session harness turns those drafts into <vault>/wiki/tests/export/:
+zephyr-import.csv and .xml (Zephyr Scale: Tests > Import), .xlsx (Zephyr
+Squad: Import Tests), and zephyr-import.html to read them. Import one by hand.
+Zephyr's import creates new cases only (it cannot change an existing one),
+so a draft whose name and story match a pulled case is left out.
+
+Which Zephyr is detected on the first pull; set tests_flavor in the charter
+(scale-dc, squad-dc, scale-cloud, essential-cloud) to choose. On Jira Data
+Center the Jira token is used (TRACKER_TOKEN, harness ticket login). On Jira
+Cloud Zephyr has its own API token (ZEPHYR_TOKEN, harness tests login), and
+TRACKER_TOKEN, when set, turns linked issue ids into keys; tests_url in the
+charter points at another region (e.g. https://eu.api.zephyrscale.smartbear.com/v2).
+The pulled cases are committed to the vault, like tickets, and pushed to its
+remote.
+HELP
+            ;;
+        status)
+            [[ -n "$dir" ]] || { echo "no active vault (see: harness vault)"; return 0; }
+            _tests_py status "$dir" || return 1
+            if [[ -n "${ZEPHYR_TOKEN:-}" ]]; then echo "token:   ZEPHYR_TOKEN set"
+            elif [[ -n "${TRACKER_TOKEN:-}" ]]; then echo "token:   TRACKER_TOKEN (Jira Data Center); ZEPHYR_TOKEN none (Jira Cloud: harness tests login)"
+            else echo "token:   none (harness ticket login; on Jira Cloud also harness tests login)"; fi
+            ;;
+        pull|import)
+            local project=""
+            local -a args=()
+            while (( $# )); do
+                case "$1" in
+                    --project) [[ -n "${2:-}" ]] || { err "--project needs a key"; return 1; }
+                        project="${2^^}"; args+=(--project "$project"); shift 2 ;;
+                    --flavor) [[ -n "${2:-}" ]] || { err "--flavor needs a value"; return 1; }
+                        args+=(--flavor "$2"); shift 2 ;;
+                    *) err "unknown argument '$1' (see: harness tests --help)"; return 1 ;;
+                esac
+            done
+            [[ -z "$project" || "$project" =~ ^[A-Z][A-Z0-9_]*$ ]] || { err "'$project' is not a project key like ABC"; return 1; }
+            harness_vault_dir=$(vault_prepare)
+            [[ -n "$harness_vault_dir" ]] || { err "no active vault to pull the tests into (see: harness vault)"; return 1; }
+            rc=0
+            _tests_py pull "$harness_vault_dir" ${args[@]+"${args[@]}"} || rc=$?
+            if (( rc == 0 )) && [[ -n "$project" && "$(_charter_value "$harness_vault_dir" tests_project)" != "$project" ]]; then
+                _charter_set "$harness_vault_dir" tests_project "$project" && echo "tests: saved tests_project $project in the charter"
+            fi
+            vault_sync "$harness_vault_dir" 0 "" "$here"
+            return "$rc"
+            ;;
+        export)
+            harness_vault_dir=$(vault_prepare)
+            [[ -n "$harness_vault_dir" ]] || { err "no active vault (see: harness vault)"; return 1; }
+            _tests_py export "$harness_vault_dir" || return 1
+            vault_sync "$harness_vault_dir" 0 "" "$here"
+            ;;
+        view)
+            [[ -n "$dir" ]] || { err "no active vault (see: harness vault)"; return 1; }
+            _tests_py export "$dir" --force || return 1
+            f="$dir/wiki/tests/export/zephyr-import.html"
+            [[ -f "$f" ]] || { err "no export at $f"; return 1; }
+            url="$f"
+            command -v cygpath >/dev/null 2>&1 && url=$(cygpath -m "$f")
+            [[ "$url" == /* ]] || url="/$url"
+            echo "tests: $f"
+            harness_open_url "file://$url"
+            ;;
+        login)
+            [[ -e /dev/tty ]] || { err "harness tests login needs a terminal; or set ZEPHYR_TOKEN with: harness config"; return 1; }
+            echo "Zephyr on Jira Cloud has its own API token: in Jira, Zephyr (Scale or Essential) > your" >/dev/tty
+            echo "profile picture > API keys (or Zephyr API access tokens). On Jira Data Center none is needed:" >/dev/tty
+            echo "the Jira token (harness ticket login) is used. It is not shown as you type; Enter alone keeps the saved one." >/dev/tty
+            IFS= read -r -s -p 'Zephyr token: ' tok </dev/tty 2>/dev/tty || tok=""
+            echo >/dev/tty
+            tok="${tok//[[:space:]]/}"
+            if [[ -n "$tok" ]]; then
+                _config_write_key ZEPHYR_TOKEN "$tok" || { tok=""; return 1; }
+                echo "saved ZEPHYR_TOKEN in $env_file"
+            fi
+            tok=""
+            ;;
+        logout)
+            if [[ -n "$(_config_read_key ZEPHYR_TOKEN)" ]]; then
+                _config_write_key ZEPHYR_TOKEN "" || return 1
+                echo "cleared ZEPHYR_TOKEN in $env_file"
+            else
+                echo "no ZEPHYR_TOKEN in $env_file"
+            fi
+            [[ -z "${ZEPHYR_TOKEN:-}" ]] || echo "(ZEPHYR_TOKEN is still set in your shell's environment)"
+            ;;
+        *)
+            err "unknown tests command '$sub' (see: harness tests --help)"; return 1
             ;;
     esac
 }
@@ -14289,6 +14447,7 @@ main() {
         queue)                      cmd_queue "$@" ;;
         findings)                   cmd_findings "$@" ;;
         ticket)                     cmd_ticket "$@" ;;
+        tests)                      cmd_tests "$@" ;;
         context)                    cmd_context "$@" ;;
         serve)                      cmd_serve "$@" ;;
         desktop)                    cmd_desktop "$@" ;;

@@ -511,6 +511,10 @@ def raw_units(vault, budget, warn=lambda line: None):
                 continue
             if SECRET_PATH.search(rel):
                 continue
+            # Zephyr's test cases (harness tests pull): hundreds of files the
+            # agent greps through wiki/tests/index.md, not pages to write.
+            if rel.startswith("tests/"):
+                continue
             text = doc_text(path, warn) if doc else read_text(path, MAX_FILE_BYTES * 4)
             if text is None or not text.strip():
                 continue
@@ -1511,7 +1515,8 @@ def commit_opts(vault):
     return opts
 
 
-GENERATED_PATHS = re.compile(r"wiki/(index\.md|log\.md|candidates\.md|domain/glossary\.md|topics/.*|tickets/.*|context/.*)")
+GENERATED_PATHS = re.compile(r"wiki/(index\.md|log\.md|candidates\.md|domain/glossary\.md|topics/.*|tickets/.*|context/.*"
+                             r"|tests/export/.*)|\.raw/tests/.*")
 
 
 def generated_conflict(vault, rel):
