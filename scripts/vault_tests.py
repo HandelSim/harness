@@ -234,11 +234,19 @@ def get(url, token, bearer_only=False, accept="application/json", tries=5):
                     wait = 0
                 time.sleep(min(max(wait, 2 ** attempt), 30))
                 continue
+            try:   # kept for explain(): Zephyr says why in the body (PERM_DENIED)
+                e.body = e.read(4096).decode("utf-8", "replace")
+            except (OSError, ValueError, AttributeError):
+                e.body = ""
             raise
 
 
 def explain(e, what, token_name):
     if isinstance(e, urllib.error.HTTPError):
+        if "PERM_DENIED" in (getattr(e, "body", "") or ""):
+            return (f"{what} answered PERM_DENIED (HTTP {e.code}): your Jira user may not do this in Zephyr; "
+                    "ask a Jira admin for Browse Projects in the project and, if Zephyr's own permissions "
+                    "are turned on, Zephyr's permission to view tests (Zephyr caches permissions up to an hour)")
         if e.code in (401, 403):
             return f"{what} refused {token_name} (HTTP {e.code})"
         return f"{what} answered HTTP {e.code}"
@@ -425,6 +433,7 @@ def squad_dc_cases(jira, token, project, warn):
     jql = f'project = "{project}" AND issuetype = Test ORDER BY key'
     fields = "summary,description,status,priority,labels,components,issuelinks,updated"
     start, n = 0, 100
+    got_steps = False
     while start < MAX_CASES:
         params = urllib.parse.urlencode({"jql": jql, "fields": fields, "startAt": start, "maxResults": n})
         d = call(f"{jira}/rest/api/2/search?{params}", token, "Jira", "TRACKER_TOKEN")
@@ -441,7 +450,12 @@ def squad_dc_cases(jira, token, project, warn):
                     if isinstance(st, dict):
                         steps.append({"action": plain(st.get("step")), "data": plain(st.get("data")),
                                       "expected": plain(st.get("result"))})
+                got_steps = True
             except (urllib.error.URLError, OSError, ValueError) as e:
+                if not got_steps and isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
+                    # Refused from the first case on: every case would come
+                    # without its steps, so stop rather than write them so.
+                    raise Failed(f"the test steps were refused ({explain(e, 'Zephyr Squad', 'TRACKER_TOKEN')})") from None
                 warn(f"{iss.get('key')}: no steps ({explain(e, 'Zephyr Squad', 'TRACKER_TOKEN')}); the vault's copy is kept")
                 partial = True
             covers = []
@@ -492,6 +506,13 @@ def detect(jira, tracker_token, zephyr_token, project, tests_url):
         try:
             get(f"{jira}/rest/zapi/latest/moduleInfo", tracker_token, tries=1)
             return "squad-dc", ""
+        except urllib.error.HTTPError as e:
+            # Without Squad, Jira answers 404 here. A 403 is Squad itself
+            # refusing this call (moduleInfo can need more rights than reading
+            # tests does), so it is there: the pull says if the steps are refused too.
+            if e.code == 403:
+                return "squad-dc", ""
+            tried.append(explain(e, "Zephyr Squad (/rest/zapi)", "TRACKER_TOKEN"))
         except (urllib.error.URLError, OSError, ValueError) as e:
             tried.append(explain(e, "Zephyr Squad (/rest/zapi)", "TRACKER_TOKEN"))
     if not tried:

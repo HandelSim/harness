@@ -779,7 +779,10 @@ Cloud (`https://api.zephyrscale.smartbear.com/v2`, or the charter's
 with `TRACKER_TOKEN`, Scale Data Center (`<tracker_url>/rest/atm/1.0/testcase/search`,
 200 a page, paged until an empty one, the script inline; a case without it is
 fetched alone), then
-Squad Data Center (`/rest/zapi/latest/moduleInfo` answers; cases are Jira
+Squad Data Center (`/rest/zapi/latest/moduleInfo` answers, or refuses with 403,
+which only Squad itself does: it can need more rights than reading tests;
+steps refused from the first case on stop the pull with Zephyr's PERM_DENIED
+explained; cases are Jira
 issues of type Test from `/rest/api/2/search`, steps from
 `/rest/zapi/latest/teststep/<id>`, covers from the issue links). The Cloud
 API names folders, statuses and priorities by id (looked up once) and steps

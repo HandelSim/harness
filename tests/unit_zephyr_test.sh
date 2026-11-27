@@ -132,8 +132,19 @@ class H(BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "/guarded/jira/login.jsp?permissionViolation=true&os_destination=x")
             self.send_header("Content-Length", "0"); self.end_headers(); return
-        if p.startswith("/guarded/jira/rest/zapi/"):
-            return self.send(403, {})
+        # Squad that answers PERM_DENIED to moduleInfo (it can need more rights than reading tests)
+        denied = {"PERM_DENIED": "You do not have permissions to perform this operation. Please contact Project Administrator."}
+        if p.startswith("/guarded/jira/rest/zapi/") and state().get("no_zapi"):
+            return self.send(404, {})
+        if p == "/guarded/jira/rest/zapi/latest/moduleInfo":
+            return self.send(403, denied)
+        if p == "/guarded/jira/rest/zapi/latest/teststep/77":
+            if state().get("deny_steps"):
+                return self.send(403, denied)
+            return self.send(200, {"stepBeanCollection": [{"orderId": 1, "step": "Open it", "data": "", "result": "Opens"}]})
+        if p == "/guarded/jira/rest/api/2/search":
+            return self.send(200, {"issues": [{"id": "77", "key": "MISTPCD-5", "fields": {"summary": "Guarded case",
+                                   "issuelinks": [{"outwardIssue": {"key": "MISTPCD-1"}}]}}], "total": 1, "startAt": 0})
         if p == "/scale/rest/atm/1.0/testcase/search":
             cases = scale_cases()
             start, n = int(q.get("startAt", 0)), int(q.get("maxResults", 200))
@@ -253,10 +264,22 @@ out=$(TOK="" tp "$CV") && fail "Z3: no token should fail" || true
 [[ "$out" == *"no token"* ]] || fail "Z3: no token — $out"
 GV="$TMP_ROOT/guarded"
 mkvault "$GV" "http://127.0.0.1:$PORT/guarded/jira" "tests_project: 'MISTPCD'\n"
+echo '{"scale_n": 204, "no_zapi": 1}' > "$TMP_ROOT/mock.state"
 out=$(tp "$GV") && fail "Z3: a login-page redirect should fail" || true
 [[ "$out" == *"Zephyr Scale (/rest/atm/1.0) sent the request to Jira's login page (HTTP 302): the token was not accepted"* \
-   && "$out" != *"set tracker_url"* && "$out" == *"Zephyr Squad (/rest/zapi) refused TRACKER_TOKEN (HTTP 403)"* ]] \
+   && "$out" != *"set tracker_url"* && "$out" == *"Zephyr Squad (/rest/zapi) answered HTTP 404"* ]] \
     || fail "Z3: a redirect to the login page is the token, not the address — $out"
+# Squad answering PERM_DENIED to moduleInfo is Squad: detected, and the tests come.
+echo '{"scale_n": 204}' > "$TMP_ROOT/mock.state"
+out=$(tp "$GV") || fail "Z3: PERM_DENIED on moduleInfo should still find Squad — $out"
+[[ "$out" == *"1 cases from Zephyr Squad (Jira Data Center), project MISTPCD: 1 new"* ]] \
+    && grep -q '^Action: Open it$' "$GV/.raw/tests/MISTPCD-5.md" || fail "Z3: Squad behind PERM_DENIED — $out"
+# Steps refused from the first case on: stop, say why, keep the copy.
+echo '{"scale_n": 204, "deny_steps": 1}' > "$TMP_ROOT/mock.state"
+out=$(tp "$GV") && fail "Z3: refused steps should fail the pull" || true
+[[ "$out" == *"the test steps were refused (Zephyr Squad answered PERM_DENIED (HTTP 403)"*"Browse Projects"*"the vault's copy is kept"* ]] \
+    && grep -q '^Action: Open it$' "$GV/.raw/tests/MISTPCD-5.md" || fail "Z3: refused steps — $out"
+echo '{"scale_n": 204}' > "$TMP_ROOT/mock.state"
 JV="$TMP_ROOT/jcloud"
 mkvault "$JV" "https://example.atlassian.net" "tests_project: 'CL'\n"
 out=$(tp "$JV") && fail "Z3: Jira Cloud without ZEPHYR_TOKEN should fail" || true
