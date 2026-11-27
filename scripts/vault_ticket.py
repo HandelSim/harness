@@ -358,6 +358,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     (urllib keeps it); stop instead and say where it pointed."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        path = urllib.parse.urlparse(newurl).path
+        if re.search(r"/login(\.jsp|\.action)?$", path):
+            # Jira sends a request it did not take as logged in to its login
+            # page: the token, not the address, is what is wrong.
+            raise Redirected(f"sent the request to Jira's login page (HTTP {code}): the token was not "
+                             "accepted for this API (wrong or expired, not accepted by this app's API, "
+                             "or your user may not use it in this project)")
         raise Redirected(f"redirected (HTTP {code}) to {newurl}; not followed with the token, "
                          "set tracker_url to the address it points at")
 

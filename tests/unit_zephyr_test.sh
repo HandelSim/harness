@@ -128,6 +128,12 @@ class H(BaseHTTPRequestHandler):
             return self.send(404, {})
         if auth != "Bearer tok123":
             return self.send(401, {})
+        if p.startswith("/guarded/jira/rest/atm/"):   # Scale that does not take the token as logged in
+            self.send_response(302)
+            self.send_header("Location", "/guarded/jira/login.jsp?permissionViolation=true&os_destination=x")
+            self.send_header("Content-Length", "0"); self.end_headers(); return
+        if p.startswith("/guarded/jira/rest/zapi/"):
+            return self.send(403, {})
         if p == "/scale/rest/atm/1.0/testcase/search":
             cases = scale_cases()
             start, n = int(q.get("startAt", 0)), int(q.get("maxResults", 200))
@@ -245,6 +251,12 @@ CV="$TMP_ROOT/cloud"
 mkvault "$CV" "http://127.0.0.1:$PORT" "tests_project: 'CL'\ntests_url: 'http://127.0.0.1:$PORT/cloud/v2'\n"
 out=$(TOK="" tp "$CV") && fail "Z3: no token should fail" || true
 [[ "$out" == *"no token"* ]] || fail "Z3: no token — $out"
+GV="$TMP_ROOT/guarded"
+mkvault "$GV" "http://127.0.0.1:$PORT/guarded/jira" "tests_project: 'MISTPCD'\n"
+out=$(tp "$GV") && fail "Z3: a login-page redirect should fail" || true
+[[ "$out" == *"Zephyr Scale (/rest/atm/1.0) sent the request to Jira's login page (HTTP 302): the token was not accepted"* \
+   && "$out" != *"set tracker_url"* && "$out" == *"Zephyr Squad (/rest/zapi) refused TRACKER_TOKEN (HTTP 403)"* ]] \
+    || fail "Z3: a redirect to the login page is the token, not the address — $out"
 JV="$TMP_ROOT/jcloud"
 mkvault "$JV" "https://example.atlassian.net" "tests_project: 'CL'\n"
 out=$(tp "$JV") && fail "Z3: Jira Cloud without ZEPHYR_TOKEN should fail" || true
